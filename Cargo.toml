@@ -3,10 +3,11 @@
 
 [package]
 name = "dravr-tronc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Shared MCP server infrastructure for dravr-xxx microservices"
+readme = "README.md"
 repository = "https://github.com/dravr-ai/dravr-tronc"
 keywords = ["mcp", "json-rpc", "axum", "server"]
 categories = ["web-programming::http-server", "network-programming"]
