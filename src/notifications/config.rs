@@ -40,18 +40,12 @@ pub struct SlackConfig {
     pub signing_secret: Option<String>,
 }
 
-/// Email notification configuration
+/// Email notification configuration via the Resend API
 #[derive(Debug, Clone)]
 pub struct EmailConfig {
-    /// SMTP server hostname
-    pub smtp_host: String,
-    /// SMTP server port (default: 587 for STARTTLS)
-    pub smtp_port: u16,
-    /// SMTP username for authentication
-    pub smtp_username: String,
-    /// SMTP password for authentication
-    pub smtp_password: String,
-    /// Sender email address
+    /// Resend API key for authentication
+    pub resend_api_key: String,
+    /// Sender email address (e.g., "Pierre Alerts <alerts@dravr.ai>")
     pub from_address: String,
     /// Recipient email addresses for error alerts
     pub to_addresses: Vec<String>,
@@ -65,11 +59,8 @@ impl NotificationConfig {
     /// - `SLACK_ERROR_CHANNEL` — Channel for error alerts (required for Slack)
     /// - `SLACK_SIGNING_SECRET` — Signing secret for request verification
     ///
-    /// ## Email env vars
-    /// - `NOTIFY_SMTP_HOST` — SMTP server (required for email)
-    /// - `NOTIFY_SMTP_PORT` — SMTP port (default: 587)
-    /// - `NOTIFY_SMTP_USERNAME` — SMTP auth username (required for email)
-    /// - `NOTIFY_SMTP_PASSWORD` — SMTP auth password (required for email)
+    /// ## Email env vars (via Resend API)
+    /// - `RESEND_API_KEY` — Resend API key (required for email)
     /// - `NOTIFY_EMAIL_FROM` — Sender address (required for email)
     /// - `NOTIFY_EMAIL_TO` — Comma-separated recipient addresses (required for email)
     ///
@@ -135,24 +126,11 @@ impl SlackConfig {
 impl EmailConfig {
     /// Build from environment variables. Returns `None` if required vars are missing.
     fn from_env() -> Option<Self> {
-        let smtp_host = env::var("NOTIFY_SMTP_HOST")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let smtp_username = env::var("NOTIFY_SMTP_USERNAME")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let smtp_password = env::var("NOTIFY_SMTP_PASSWORD")
-            .ok()
-            .filter(|s| !s.is_empty())?;
+        let resend_api_key = env::var("RESEND_API_KEY").ok().filter(|s| !s.is_empty())?;
         let from_address = env::var("NOTIFY_EMAIL_FROM")
             .ok()
             .filter(|s| !s.is_empty())?;
         let to_addresses_str = env::var("NOTIFY_EMAIL_TO").ok().filter(|s| !s.is_empty())?;
-
-        let smtp_port: u16 = env::var("NOTIFY_SMTP_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(587);
 
         let to_addresses: Vec<String> = to_addresses_str
             .split(',')
@@ -165,10 +143,7 @@ impl EmailConfig {
         }
 
         Some(Self {
-            smtp_host,
-            smtp_port,
-            smtp_username,
-            smtp_password,
+            resend_api_key,
             from_address,
             to_addresses,
         })
@@ -184,7 +159,7 @@ mod tests {
         // Clear env vars that might be set
         env::remove_var("NOTIFY_BATCH_WINDOW_SECS");
         env::remove_var("SLACK_BOT_TOKEN");
-        env::remove_var("NOTIFY_SMTP_HOST");
+        env::remove_var("RESEND_API_KEY");
 
         let config = NotificationConfig::from_env();
         assert_eq!(config.batch_window, Duration::from_secs(5));
@@ -201,7 +176,7 @@ mod tests {
 
     #[test]
     fn email_config_requires_all_fields() {
-        env::remove_var("NOTIFY_SMTP_HOST");
+        env::remove_var("RESEND_API_KEY");
         assert!(EmailConfig::from_env().is_none());
     }
 }

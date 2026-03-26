@@ -1,22 +1,34 @@
-// ABOUTME: Email notification client using SMTP for sending error alerts
-// ABOUTME: Supports STARTTLS with configurable SMTP server credentials
+// ABOUTME: Email notification client using the Resend HTTP API for sending error alerts
+// ABOUTME: Fire-and-forget or awaitable email delivery to configured recipients
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-use lettre::message::header::ContentType;
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use reqwest::Client;
+use serde::Serialize;
 use tracing::warn;
 
 use super::EmailConfig;
 
-/// Email client for sending alert notifications via SMTP
+/// Resend API endpoint for sending emails
+const RESEND_API_URL: &str = "https://api.resend.com/emails";
+
+/// Email client for sending alert notifications via the Resend API
 #[derive(Clone)]
 pub struct EmailClient {
-    transport: AsyncSmtpTransport<Tokio1Executor>,
+    http: Client,
+    api_key: String,
     from_address: String,
     to_addresses: Vec<String>,
+}
+
+/// Resend API request payload
+#[derive(Serialize)]
+struct ResendPayload {
+    from: String,
+    to: Vec<String>,
+    subject: String,
+    text: String,
 }
 
 /// Result of an email send operation
@@ -24,27 +36,24 @@ pub struct EmailClient {
 pub enum EmailResult {
     /// Email sent successfully
     Ok,
-    /// Failed to build the email message
-    BuildError(String),
-    /// SMTP transport error
-    SendError(String),
+    /// Resend API returned an error
+    ApiError(String),
+    /// HTTP-level failure
+    HttpError(String),
 }
 
 impl EmailClient {
     /// Create a new email client from configuration
     ///
-    /// Establishes an SMTP connection with STARTTLS and credential authentication.
+    /// Uses the Resend HTTP API — no SMTP configuration needed.
     pub fn new(config: &EmailConfig) -> Result<Self, String> {
-        let creds = Credentials::new(config.smtp_username.clone(), config.smtp_password.clone());
-
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
-            .map_err(|e| format!("SMTP relay setup failed: {e}"))?
-            .port(config.smtp_port)
-            .credentials(creds)
-            .build();
+        if config.resend_api_key.is_empty() {
+            return Err("RESEND_API_KEY is empty".to_owned());
+        }
 
         Ok(Self {
-            transport,
+            http: Client::new(),
+            api_key: config.resend_api_key.clone(),
             from_address: config.from_address.clone(),
             to_addresses: config.to_addresses.clone(),
         })
@@ -54,62 +63,96 @@ impl EmailClient {
     ///
     /// Fire-and-forget: spawns a background task. Errors are logged, never propagated.
     pub fn send_alert(&self, subject: &str, body: &str) {
-        let transport = self.transport.clone();
+        let client = self.http.clone();
+        let api_key = self.api_key.clone();
         let from = self.from_address.clone();
         let recipients = self.to_addresses.clone();
         let subject = subject.to_owned();
         let body = body.to_owned();
 
         tokio::spawn(async move {
-            for to in &recipients {
-                let result = send_single_email(&transport, &from, to, &subject, &body).await;
-                if let EmailResult::BuildError(e) | EmailResult::SendError(e) = result {
-                    warn!(to = %to, error = %e, "Email alert failed");
-                }
+            let result =
+                send_via_resend(&client, &api_key, &from, &recipients, &subject, &body).await;
+            if let EmailResult::ApiError(e) | EmailResult::HttpError(e) = result {
+                warn!(error = %e, "Email alert via Resend failed");
             }
         });
     }
 
     /// Send an error alert email and return the result (awaitable)
-    pub async fn send_alert_await(&self, subject: &str, body: &str) -> Vec<EmailResult> {
-        let mut results = Vec::with_capacity(self.to_addresses.len());
-        for to in &self.to_addresses {
-            let result =
-                send_single_email(&self.transport, &self.from_address, to, subject, body).await;
-            results.push(result);
-        }
-        results
+    pub async fn send_alert_await(&self, subject: &str, body: &str) -> EmailResult {
+        send_via_resend(
+            &self.http,
+            &self.api_key,
+            &self.from_address,
+            &self.to_addresses,
+            subject,
+            body,
+        )
+        .await
     }
 }
 
-/// Send a single email to one recipient
-async fn send_single_email(
-    transport: &AsyncSmtpTransport<Tokio1Executor>,
+/// Send an email to all recipients via the Resend API
+async fn send_via_resend(
+    client: &Client,
+    api_key: &str,
     from: &str,
-    to: &str,
+    to: &[String],
     subject: &str,
     body: &str,
 ) -> EmailResult {
-    let email = match Message::builder()
-        .from(from.parse().unwrap_or_else(|_| {
-            "alerts@dravr.ai"
-                .parse()
-                .expect("valid fallback email address")
-        }))
-        .to(match to.parse() {
-            Ok(addr) => addr,
-            Err(e) => return EmailResult::BuildError(format!("invalid recipient {to}: {e}")),
-        })
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_owned())
-    {
-        Ok(m) => m,
-        Err(e) => return EmailResult::BuildError(e.to_string()),
+    let payload = ResendPayload {
+        from: from.to_owned(),
+        to: to.to_vec(),
+        subject: subject.to_owned(),
+        text: body.to_owned(),
     };
 
-    match transport.send(email).await {
-        Ok(_) => EmailResult::Ok,
-        Err(e) => EmailResult::SendError(e.to_string()),
+    let response = match client
+        .post(RESEND_API_URL)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return EmailResult::HttpError(e.to_string()),
+    };
+
+    if response.status().is_success() {
+        EmailResult::Ok
+    } else {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "no body".to_owned());
+        EmailResult::ApiError(format!("HTTP {status}: {body}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_client_rejects_empty_api_key() {
+        let config = EmailConfig {
+            resend_api_key: String::new(),
+            from_address: "alerts@dravr.ai".into(),
+            to_addresses: vec!["test@dravr.ai".into()],
+        };
+        assert!(EmailClient::new(&config).is_err());
+    }
+
+    #[test]
+    fn email_client_accepts_valid_config() {
+        let config = EmailConfig {
+            resend_api_key: "re_test_key".into(),
+            from_address: "alerts@dravr.ai".into(),
+            to_addresses: vec!["jf@dravr.ai".into(), "phil@dravr.ai".into()],
+        };
+        assert!(EmailClient::new(&config).is_ok());
     }
 }
