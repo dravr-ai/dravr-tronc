@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Bump Version & Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      prev_tag: ${{ steps.bump.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          VERSION="${major}.${minor}.${patch}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${CURRENT} → ${VERSION}"
+
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+          sed -i "0,/^version = \"${CURRENT}\"/s//version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Update lockfile
+        run: cargo generate-lockfile
+
+      - name: Generate changelog
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          PREV_TAG="${{ steps.bump.outputs.prev_tag }}"
+          DATE=$(date +%Y-%m-%d)
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          FEATURES=""
+          FIXES=""
+          OTHER=""
+
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            case "$msg" in
+              feat:*|feat\(*) FEATURES="${FEATURES}- ${msg}\n" ;;
+              fix:*|fix\(*)   FIXES="${FIXES}- ${msg}\n" ;;
+              docs:*|chore:*|test:*|ci:*|release:*) ;;
+              *) OTHER="${OTHER}- ${msg}\n" ;;
+            esac
+          done < <(git log "${RANGE}" --pretty=format:"%s" --no-merges)
+
+          BODY=""
+          [ -n "$FEATURES" ] && BODY="${BODY}### Added\n\n${FEATURES}\n"
+          [ -n "$FIXES" ]    && BODY="${BODY}### Fixed\n\n${FIXES}\n"
+          [ -n "$OTHER" ]    && BODY="${BODY}### Other\n\n${OTHER}\n"
+
+          HEADER="## [${VERSION}] — ${DATE}"
+
+          if [ -f CHANGELOG.md ]; then
+            TMPFILE=$(mktemp)
+            echo "# Changelog" > "$TMPFILE"
+            echo "" >> "$TMPFILE"
+            echo "$HEADER" >> "$TMPFILE"
+            echo "" >> "$TMPFILE"
+            echo -e "$BODY" >> "$TMPFILE"
+            tail -n +2 CHANGELOG.md >> "$TMPFILE"
+            mv "$TMPFILE" CHANGELOG.md
+          else
+            {
+              echo "# Changelog"
+              echo ""
+              echo "$HEADER"
+              echo ""
+              echo -e "$BODY"
+            } > CHANGELOG.md
+          fi
+
+      - name: Update README version
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          MAJOR_MINOR="${VERSION%.*}"
+          if [ -f README.md ]; then
+            sed -i "s/dravr-tronc = { version = \"[0-9]*\.[0-9]*\"/dravr-tronc = { version = \"${MAJOR_MINOR}\"/" README.md
+            sed -i "s/dravr-tronc = \"[0-9]*\.[0-9]*\"/dravr-tronc = \"${MAJOR_MINOR}\"/" README.md
+          fi
+
+      - name: Commit, tag, push
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          git add -A
+          git commit -m "release: v${VERSION}"
+          git tag "v${VERSION}"
+          git push origin main --tags
+
+  publish:
+    name: Publish to crates.io
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p dravr-tronc || echo "dravr-tronc already published, continuing..."
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          body_path: CHANGELOG.md
