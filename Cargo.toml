@@ -3,7 +3,7 @@
 
 [package]
 name = "dravr-tronc"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Shared MCP server infrastructure for dravr-xxx microservices"
@@ -12,17 +12,26 @@ repository = "https://github.com/dravr-ai/dravr-tronc"
 keywords = ["mcp", "json-rpc", "axum", "server"]
 categories = ["web-programming::http-server", "network-programming"]
 
+[features]
+default = []
+notifications = ["dep:reqwest", "dep:lettre", "dep:ring", "dep:hex", "dep:chrono"]
+
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+hex = { version = "0.4", optional = true }
+lettre = { version = "0.11", features = ["tokio1-rustls-tls", "smtp-transport", "builder"], default-features = false, optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+ring = { version = "0.17", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 
 [dev-dependencies]
 http = "1"

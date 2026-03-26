@@ -21,6 +21,8 @@
 
 pub mod error;
 pub mod mcp;
+#[cfg(feature = "notifications")]
+pub mod notifications;
 pub mod server;
 
 // Convenience re-exports
