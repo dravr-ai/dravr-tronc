@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2] — 2026-03-31
+
+### Fixed
+
+- fix: resolve error handling violations found by dravr-build-config validation
+
+
+
 ## [0.2.1] — 2026-03-26
 
 
