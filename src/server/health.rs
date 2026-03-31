@@ -99,21 +99,21 @@ mod tests {
     #[test]
     fn ok_serializes_without_empty_details() {
         let resp = HealthResponse::ok("svc", "1.0");
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.get("details").is_none());
     }
 
     #[test]
     fn ok_serializes_with_details_when_present() {
         let resp = HealthResponse::ok("svc", "1.0").with_detail("key", "val");
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert_eq!(json["details"]["key"], "val");
     }
 
     #[test]
     fn degraded_serializes_correctly() {
         let resp = HealthResponse::degraded("svc", "1.0");
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert_eq!(json["status"], "degraded");
         assert_eq!(json["service"], "svc");
     }

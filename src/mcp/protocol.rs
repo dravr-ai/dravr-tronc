@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn serialize_success_response() {
         let resp = JsonRpcResponse::success(Some(Value::from(1)), serde_json::json!({"ok": true}));
-        let json = serde_json::to_string(&resp).expect("serialize");
+        let json = serde_json::to_string(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.contains("\"result\""));
         assert!(!json.contains("\"error\""));
     }
@@ -237,7 +237,7 @@ mod tests {
             crate::error::PARSE_ERROR,
             "bad json".to_owned(),
         );
-        let json = serde_json::to_string(&resp).expect("serialize");
+        let json = serde_json::to_string(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.contains("\"error\""));
         assert!(json.contains("-32700"));
         assert!(!json.contains("\"result\""));
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn deserialize_request_with_params() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"test"}}"#;
-        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize");
+        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert_eq!(req.method, "tools/call");
         assert!(req.params.is_some());
     }
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn deserialize_request_without_params() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
-        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize");
+        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert_eq!(req.method, "tools/list");
         assert!(req.params.is_none());
     }
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn deserialize_notification_has_no_id() {
         let raw = r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#;
-        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize");
+        let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert!(req.id.is_none());
     }
 
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn success_response_omits_error_field() {
         let resp = JsonRpcResponse::success(Some(Value::from(1)), Value::Null);
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.get("error").is_none());
         assert!(json.get("result").is_some());
     }
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn error_response_omits_result_field() {
         let resp = JsonRpcResponse::error(Some(Value::from(1)), -1, "fail".to_owned());
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.get("result").is_none());
         assert!(json.get("error").is_some());
     }
@@ -310,7 +310,7 @@ mod tests {
                 version: "0.1.0".to_owned(),
             },
         };
-        let json = serde_json::to_value(&result).expect("serialize");
+        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
         assert!(json.get("protocolVersion").is_some());
         assert!(json.get("serverInfo").is_some());
         assert!(json.get("protocol_version").is_none());
@@ -323,7 +323,7 @@ mod tests {
             "capabilities": {},
             "clientInfo": { "name": "test-client", "version": "1.0" }
         }"#;
-        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize");
+        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert_eq!(params.protocol_version, "2024-11-05");
         assert_eq!(params.client_info.name, "test-client");
         assert_eq!(params.client_info.version.as_deref(), Some("1.0"));
@@ -336,7 +336,7 @@ mod tests {
             "capabilities": {},
             "clientInfo": { "name": "minimal" }
         }"#;
-        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize");
+        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert!(params.client_info.version.is_none());
     }
 
@@ -352,7 +352,7 @@ mod tests {
                 }
             }),
         };
-        let json = serde_json::to_value(&def).expect("serialize");
+        let json = serde_json::to_value(&def).expect("serialize"); // Safe: test assertion
         assert_eq!(json["name"], "test_tool");
         assert!(json.get("inputSchema").is_some());
         assert!(json.get("input_schema").is_none());
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn call_tool_params_arguments_default_to_none() {
         let raw = r#"{"name": "my_tool"}"#;
-        let params: CallToolParams = serde_json::from_str(raw).expect("deserialize");
+        let params: CallToolParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert_eq!(params.name, "my_tool");
         assert!(params.arguments.is_none());
     }
@@ -369,14 +369,14 @@ mod tests {
     #[test]
     fn call_tool_result_error_serializes_is_error() {
         let result = CallToolResult::error("fail".to_owned());
-        let json = serde_json::to_value(&result).expect("serialize");
+        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
         assert_eq!(json["isError"], true);
     }
 
     #[test]
     fn call_tool_result_text_omits_is_error() {
         let result = CallToolResult::text("ok".to_owned());
-        let json = serde_json::to_value(&result).expect("serialize");
+        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
         assert!(json.get("isError").is_none());
     }
 
@@ -396,8 +396,8 @@ mod tests {
                 },
             ],
         };
-        let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json["tools"].as_array().expect("array").len(), 2);
+        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
+        assert_eq!(json["tools"].as_array().expect("array").len(), 2); // Safe: test assertion
     }
 
     #[test]

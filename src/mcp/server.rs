@@ -235,8 +235,8 @@ mod tests {
                 "clientInfo": { "name": "test-client" }
             }
         }"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let result = resp.result.expect("result");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "test-server");
         assert_eq!(result["serverInfo"]["version"], "0.1.0");
@@ -246,7 +246,7 @@ mod tests {
     async fn handle_initialize_without_params() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 1, "method": "initialize"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -255,9 +255,9 @@ mod tests {
     async fn handle_tools_list() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let result = resp.result.expect("result");
-        let tools = result["tools"].as_array().expect("tools array");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "ping_tool");
     }
@@ -271,8 +271,8 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "ping_tool", "arguments": {} }
         }"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let result = resp.result.expect("result");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
         assert_eq!(result["content"][0]["text"], "pong");
     }
 
@@ -285,12 +285,12 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "nonexistent" }
         }"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let result = resp.result.expect("result");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
         assert_eq!(result["isError"], true);
         assert!(result["content"][0]["text"]
             .as_str()
-            .expect("text")
+            .expect("text") // Safe: test assertion
             .contains("Unknown tool"));
     }
 
@@ -298,8 +298,8 @@ mod tests {
     async fn handle_tools_call_missing_params() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 5, "method": "tools/call"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let err = resp.error.expect("error");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
@@ -307,7 +307,7 @@ mod tests {
     async fn handle_ping() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 6, "method": "ping"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -316,8 +316,8 @@ mod tests {
     async fn handle_unknown_method() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 7, "method": "bogus/method"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let err = resp.error.expect("error");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, METHOD_NOT_FOUND);
         assert!(err.message.contains("bogus/method"));
     }
@@ -328,8 +328,8 @@ mod tests {
         let resp = server
             .handle_raw("not json at all")
             .await
-            .expect("response");
-        let err = resp.error.expect("error");
+            .expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, crate::error::PARSE_ERROR);
     }
 
@@ -337,8 +337,8 @@ mod tests {
     async fn handle_wrong_jsonrpc_version() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "1.0", "id": 8, "method": "ping"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let err = resp.error.expect("error");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, INVALID_REQUEST);
     }
 
@@ -354,7 +354,7 @@ mod tests {
     async fn response_id_matches_request_id() {
         let server = make_server();
         let raw = r#"{"jsonrpc": "2.0", "id": 999, "method": "ping"}"#;
-        let resp = server.handle_raw(raw).await.expect("response");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.id, Some(Value::from(999)));
     }
 
@@ -367,8 +367,8 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "ping_tool" }
         }"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let result = resp.result.expect("result");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
         assert_eq!(result["content"][0]["text"], "pong");
     }
 
@@ -381,8 +381,8 @@ mod tests {
             "method": "tools/call",
             "params": "not an object"
         }"#;
-        let resp = server.handle_raw(raw).await.expect("response");
-        let err = resp.error.expect("error");
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, INVALID_PARAMS);
     }
 }

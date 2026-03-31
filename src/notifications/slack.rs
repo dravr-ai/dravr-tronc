@@ -256,7 +256,10 @@ mod tests {
         let body = b"test_body";
 
         // Compute expected signature
-        let basestring = format!("v0:{timestamp}:{}", std::str::from_utf8(body).unwrap());
+        let basestring = format!(
+            "v0:{timestamp}:{}",
+            std::str::from_utf8(body).expect("test body is valid UTF-8") // Safe: test assertion
+        );
         let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
         let tag = hmac::sign(&key, basestring.as_bytes());
         let signature = format!("v0={}", hex::encode(tag.as_ref()));

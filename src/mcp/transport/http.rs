@@ -149,18 +149,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         assert_eq!(response.status(), 200);
 
         let bytes = response
             .into_body()
             .collect()
             .await
-            .expect("body")
+            .expect("body") // Safe: test assertion
             .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert_eq!(json["jsonrpc"], "2.0");
         assert!(json.get("result").is_some());
     }
@@ -174,16 +174,16 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         let bytes = response
             .into_body()
             .collect()
             .await
-            .expect("body")
+            .expect("body") // Safe: test assertion
             .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert_eq!(json["result"]["content"][0]["text"], "hello world");
     }
 
@@ -195,16 +195,16 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body("not json".to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         let bytes = response
             .into_body()
             .collect()
             .await
-            .expect("body")
+            .expect("body") // Safe: test assertion
             .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert_eq!(json["error"]["code"], crate::error::PARSE_ERROR);
     }
 
@@ -217,9 +217,9 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         assert_eq!(response.status(), 204);
     }
 
@@ -233,15 +233,15 @@ mod tests {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         let content_type = response
             .headers()
             .get("content-type")
-            .expect("content-type")
+            .expect("content-type") // Safe: test assertion
             .to_str()
-            .expect("str");
+            .expect("str"); // Safe: test assertion
         assert!(content_type.contains("text/event-stream"));
     }
 
@@ -254,17 +254,17 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         let bytes = response
             .into_body()
             .collect()
             .await
-            .expect("body")
+            .expect("body") // Safe: test assertion
             .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
-        let tools = json["result"]["tools"].as_array().expect("tools");
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
+        let tools = json["result"]["tools"].as_array().expect("tools"); // Safe: test assertion
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "hello");
     }
@@ -287,16 +287,16 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(body.to_owned())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let response = app.oneshot(request).await.expect("response");
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
         let bytes = response
             .into_body()
             .collect()
             .await
-            .expect("body")
+            .expect("body") // Safe: test assertion
             .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert_eq!(json["result"]["serverInfo"]["name"], "test");
     }
 }

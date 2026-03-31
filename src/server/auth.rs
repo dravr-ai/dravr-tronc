@@ -92,9 +92,9 @@ mod tests {
         let req = HttpRequest::builder()
             .uri("/test")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 200);
     }
 
@@ -106,9 +106,9 @@ mod tests {
         let req = HttpRequest::builder()
             .uri("/test")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 200);
         std::env::remove_var(ENV);
     }
@@ -122,9 +122,9 @@ mod tests {
             .uri("/test")
             .header("authorization", "Bearer secret-key-123")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 200);
         std::env::remove_var(ENV);
     }
@@ -138,13 +138,13 @@ mod tests {
             .uri("/test")
             .header("authorization", "Bearer wrong-key")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 401);
 
-        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes(); // Safe: test assertion
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert_eq!(json["error"]["type"], "authentication_error");
         std::env::remove_var(ENV);
     }
@@ -157,9 +157,9 @@ mod tests {
         let req = HttpRequest::builder()
             .uri("/test")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 401);
         std::env::remove_var(ENV);
     }
@@ -173,16 +173,16 @@ mod tests {
             .uri("/test")
             .header("authorization", "Basic dXNlcjpwYXNz")
             .body(Body::empty())
-            .expect("request");
+            .expect("request"); // Safe: test assertion
 
-        let resp = app.oneshot(req).await.expect("response");
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 401);
 
-        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes(); // Safe: test assertion
+        let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
         assert!(json["error"]["message"]
             .as_str()
-            .expect("msg")
+            .expect("msg") // Safe: test assertion
             .contains("Bearer"));
         std::env::remove_var(ENV);
     }

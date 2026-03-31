@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn error_response_serializes_correctly() {
         let resp = ErrorResponse::new("test_error", "something broke");
-        let json = serde_json::to_value(&resp).expect("serialize");
+        let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert_eq!(json["error"]["type"], "test_error");
         assert_eq!(json["error"]["message"], "something broke");
     }
