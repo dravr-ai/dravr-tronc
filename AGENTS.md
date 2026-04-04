@@ -1,17 +1,5 @@
 # dravr-tronc — Agent Instructions
 
-## Mandatory Session Setup (ALL AI Agents)
-
-**Run these commands at the START OF EVERY SESSION:**
-
-```bash
-# 1. Initialize shared build config (required for validation)
-git submodule update --init --recursive
-
-# 2. Set git hooks
-git config core.hooksPath .build/hooks
-```
-
 ## Mandatory Pre-Push Validation
 
 **Before EVERY push, run:**
