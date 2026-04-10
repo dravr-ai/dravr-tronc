@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3] — 2026-04-10
+
+### Other
+
+- build: prune tokio features and remove unused transitive deps
+
+
+
 ## [0.2.2] — 2026-03-31
 
 ### Fixed
