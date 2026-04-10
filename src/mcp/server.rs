@@ -1,5 +1,8 @@
 // ABOUTME: Generic MCP server that routes JSON-RPC requests to protocol handlers and tools
 // ABOUTME: Implements initialize, tools/list, tools/call, and ping — parameterized over state S
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use std::sync::Arc;
 
@@ -7,7 +10,9 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::error::{INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND};
+use crate::error::{
+    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+};
 use crate::mcp::protocol::{
     CallToolParams, InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse,
     ServerCapabilities, ServerInfo, ToolsCapability, ToolsListResult, PROTOCOL_VERSION,
@@ -52,7 +57,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             Err(e) => {
                 return Some(JsonRpcResponse::error(
                     None,
-                    crate::error::PARSE_ERROR,
+                    PARSE_ERROR,
                     format!("Parse error: {e}"),
                 ));
             }
@@ -188,7 +193,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::protocol::CallToolResult;
+    use crate::mcp::protocol::{CallToolResult, ToolDefinition};
     use crate::mcp::tool::McpTool;
     use serde_json::json;
 
@@ -198,8 +203,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpTool<TestState> for PingTool {
-        fn definition(&self) -> crate::mcp::protocol::ToolDefinition {
-            crate::mcp::protocol::ToolDefinition {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
                 name: "ping_tool".to_owned(),
                 description: "Returns pong".to_owned(),
                 input_schema: json!({"type": "object"}),
@@ -330,7 +335,7 @@ mod tests {
             .await
             .expect("response"); // Safe: test assertion
         let err = resp.error.expect("error"); // Safe: test assertion
-        assert_eq!(err.code, crate::error::PARSE_ERROR);
+        assert_eq!(err.code, PARSE_ERROR);
     }
 
     #[tokio::test]

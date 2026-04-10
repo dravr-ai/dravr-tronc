@@ -1,9 +1,13 @@
 // ABOUTME: Integration tests exercising the full MCP stack end-to-end
 // ABOUTME: Tests protocol compliance, tool dispatch, HTTP transport, and auth middleware together
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dravr_tronc::error::ErrorResponse;
 use dravr_tronc::mcp::protocol::{CallToolResult, ToolDefinition};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolRegistry};
@@ -278,7 +282,7 @@ fn health_response_builder_chain() {
 
 #[test]
 fn error_response_structure() {
-    let resp = dravr_tronc::error::ErrorResponse::new("quota_exceeded", "daily limit reached");
+    let resp = ErrorResponse::new("quota_exceeded", "daily limit reached");
     let json = serde_json::to_value(&resp).expect("serialize");
     assert_eq!(json["error"]["type"], "quota_exceeded");
     assert_eq!(json["error"]["message"], "daily limit reached");

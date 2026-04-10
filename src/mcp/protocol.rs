@@ -1,5 +1,8 @@
 // ABOUTME: MCP JSON-RPC 2.0 protocol types for request/response handling
 // ABOUTME: Defines wire format for initialize, tools/list, tools/call, and error responses
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -221,6 +224,7 @@ impl CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::PARSE_ERROR;
 
     #[test]
     fn serialize_success_response() {
@@ -232,11 +236,7 @@ mod tests {
 
     #[test]
     fn serialize_error_response() {
-        let resp = JsonRpcResponse::error(
-            Some(Value::from(1)),
-            crate::error::PARSE_ERROR,
-            "bad json".to_owned(),
-        );
+        let resp = JsonRpcResponse::error(Some(Value::from(1)), PARSE_ERROR, "bad json".to_owned());
         let json = serde_json::to_string(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.contains("\"error\""));
         assert!(json.contains("-32700"));

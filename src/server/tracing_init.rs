@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::io;
+
+use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -20,12 +23,12 @@ pub fn init(transport: &str) {
     if transport == "stdio" {
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(fmt::layer().with_writer(io::stderr))
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(fmt::layer())
             .init();
     }
 }
@@ -58,7 +61,7 @@ pub fn init_with_notifications(transport: &str) {
     if transport == "stdio" {
         let registry = tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+            .with(fmt::layer().with_writer(io::stderr));
 
         if has_channels {
             let error_layer = ErrorNotificationLayer::new(config, slack, email);
@@ -69,7 +72,7 @@ pub fn init_with_notifications(transport: &str) {
     } else {
         let registry = tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer());
+            .with(fmt::layer());
 
         if has_channels {
             let error_layer = ErrorNotificationLayer::new(config, slack, email);

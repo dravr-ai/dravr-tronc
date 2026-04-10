@@ -5,11 +5,12 @@
 // Copyright (c) 2026 dravr.ai
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::time::{self, Instant as TokioInstant};
 use tracing::field::{Field, Visit};
 use tracing::{warn, Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -72,7 +73,7 @@ impl EventVisitor {
 }
 
 impl Visit for EventVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         let val = format!("{value:?}");
         if field.name() == "message" {
             self.message = val;
@@ -178,13 +179,13 @@ impl Dispatcher {
             batch.push(first_event);
 
             // Collect more events within the batch window
-            let deadline = tokio::time::Instant::now() + self.config.batch_window;
+            let deadline = TokioInstant::now() + self.config.batch_window;
             loop {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(TokioInstant::now());
                 if remaining.is_zero() {
                     break;
                 }
-                match tokio::time::timeout(remaining, self.receiver.recv()).await {
+                match time::timeout(remaining, self.receiver.recv()).await {
                     Ok(Some(event)) => batch.push(event),
                     Ok(None) => return, // Channel closed
                     Err(_) => break,    // Timeout — batch window elapsed

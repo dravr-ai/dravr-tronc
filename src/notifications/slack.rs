@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::fmt;
+use std::str;
+
 use reqwest::Client;
 use ring::hmac;
 use serde_json::Value;
@@ -55,8 +58,8 @@ pub enum SignatureError {
     NotConfigured,
 }
 
-impl std::fmt::Display for SignatureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingHeader(h) => write!(f, "missing header: {h}"),
             Self::TimestampExpired(age) => write!(f, "timestamp too old ({age}s)"),
@@ -160,7 +163,7 @@ impl SlackClient {
         }
 
         // Compute HMAC-SHA256 using Slack v0 scheme
-        let body_str = std::str::from_utf8(body).unwrap_or("");
+        let body_str = str::from_utf8(body).unwrap_or("");
         let basestring = format!("v0:{timestamp}:{body_str}");
         let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
         let tag = hmac::sign(&key, basestring.as_bytes());
@@ -258,7 +261,7 @@ mod tests {
         // Compute expected signature
         let basestring = format!(
             "v0:{timestamp}:{}",
-            std::str::from_utf8(body).expect("test body is valid UTF-8") // Safe: test assertion
+            str::from_utf8(body).expect("test body is valid UTF-8") // Safe: test assertion
         );
         let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
         let tag = hmac::sign(&key, basestring.as_bytes());

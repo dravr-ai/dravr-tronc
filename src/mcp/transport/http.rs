@@ -1,16 +1,21 @@
 // ABOUTME: HTTP transport implementing MCP Streamable HTTP with JSON and SSE responses
 // ABOUTME: Serves a POST /mcp endpoint that accepts JSON-RPC and responds via JSON or event stream
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use std::convert::Infallible;
+use std::error::Error;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::stream;
+use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
 use crate::mcp::protocol::{JsonRpcResponse, PROTOCOL_VERSION};
@@ -34,11 +39,11 @@ pub async fn serve<S: Send + Sync + 'static>(
     server: Arc<McpServer<S>>,
     host: &str,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let app = mcp_router(server);
 
     let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("Failed to bind {addr}: {e}"))?;
 
@@ -66,7 +71,7 @@ pub async fn handle_mcp_post<S: Send + Sync + 'static>(
 ) -> Response {
     let Some(response) = server.handle_raw(&body).await else {
         // Notification — no response needed
-        return axum::http::StatusCode::NO_CONTENT.into_response();
+        return StatusCode::NO_CONTENT.into_response();
     };
 
     debug!(method = "mcp", "Handled HTTP MCP request");
@@ -101,7 +106,8 @@ fn respond_sse(response: &JsonRpcResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::protocol::CallToolResult;
+    use crate::error::PARSE_ERROR;
+    use crate::mcp::protocol::{CallToolResult, ToolDefinition};
     use crate::mcp::tool::{McpTool, ToolRegistry};
     use http::Request;
     use http_body_util::BodyExt;
@@ -115,8 +121,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpTool<TestState> for HelloTool {
-        fn definition(&self) -> crate::mcp::protocol::ToolDefinition {
-            crate::mcp::protocol::ToolDefinition {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
                 name: "hello".to_owned(),
                 description: "Says hello".to_owned(),
                 input_schema: json!({"type": "object"}),
@@ -205,7 +211,7 @@ mod tests {
             .expect("body") // Safe: test assertion
             .to_bytes();
         let json: Value = serde_json::from_slice(&bytes).expect("json"); // Safe: test assertion
-        assert_eq!(json["error"]["code"], crate::error::PARSE_ERROR);
+        assert_eq!(json["error"]["code"], PARSE_ERROR);
     }
 
     #[tokio::test]
