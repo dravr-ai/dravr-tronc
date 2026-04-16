@@ -148,7 +148,7 @@ jobs:
           cargo publish -p dravr-tronc || echo "dravr-tronc already published, continuing..."
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
