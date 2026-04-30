@@ -373,7 +373,7 @@ impl Dispatcher {
 
     /// Remove send timestamps older than 1 minute
     fn prune_recent_sends(&mut self, now: Instant) {
-        let one_minute = Duration::from_secs(60);
+        let one_minute = Duration::from_mins(1);
         self.recent_sends
             .retain(|ts| now.duration_since(*ts) < one_minute);
     }
