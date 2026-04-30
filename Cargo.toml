@@ -15,6 +15,17 @@ categories = ["web-programming::http-server", "network-programming"]
 [features]
 default = []
 notifications = ["dep:reqwest", "dep:ring", "dep:hex", "dep:chrono"]
+# OTLP-based distributed tracing export. When enabled, `tracing_init::init`
+# also wires a `tracing-opentelemetry` layer that exports spans via OTLP
+# (gRPC) to whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at —
+# a self-hosted Tempo/Jaeger, Honeycomb, or the GCP managed OTel collector
+# fronting Cloud Trace on Cloud Run.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 async-trait = "0.1"
@@ -23,6 +34,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = { version = "0.4", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 ring = { version = "0.17", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +44,7 @@ serde_json = "1"
 subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "signal", "time"] }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 
 [dev-dependencies]
