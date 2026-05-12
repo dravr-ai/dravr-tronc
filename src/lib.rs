@@ -1,5 +1,8 @@
 // ABOUTME: Root library for dravr-tronc shared MCP server infrastructure
 // ABOUTME: Re-exports protocol types, server, transports, auth, health, CLI, and tracing modules
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 //! # dravr-tronc
 //!
@@ -23,6 +26,8 @@ pub mod error;
 pub mod mcp;
 #[cfg(feature = "notifications")]
 pub mod notifications;
+#[cfg(feature = "notifications")]
+pub mod notify;
 pub mod server;
 
 // Convenience re-exports
