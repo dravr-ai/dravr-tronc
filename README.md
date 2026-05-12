@@ -16,7 +16,7 @@ Building an MCP server in Rust means writing the same boilerplate every time: JS
 
 ```toml
 [dependencies]
-dravr-tronc = "0.2"
+dravr-tronc = "0.3"
 ```
 
 ### 1. Define your state and tools
