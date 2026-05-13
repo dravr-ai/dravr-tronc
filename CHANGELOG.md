@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1] — 2026-05-13
+
+### Other
+
+- style(notify): rustfmt formatter cleanup Formatting-only follow-up to the 8b06475 commit; behaviour unchanged.
+
+
+
 ## [0.3.0] — 2026-05-12
 
 
