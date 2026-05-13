@@ -430,9 +430,7 @@ fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
 
     let mut filtered: Vec<(&String, &String)> = fields
         .iter()
-        .filter(|(k, _)| {
-            k.as_str() != "message" && !FIELD_DENYLIST.contains(&k.as_str())
-        })
+        .filter(|(k, _)| k.as_str() != "message" && !FIELD_DENYLIST.contains(&k.as_str()))
         .collect();
 
     filtered.sort_by_key(|(k, _)| (field_priority(k), k.as_str()));
