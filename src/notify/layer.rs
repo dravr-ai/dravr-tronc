@@ -338,20 +338,119 @@ where
     }
 }
 
-/// Format one event as a single Slack line: `*{event}* — k1=v1, k2=v2`.
-/// Keys are sorted so two identical events render identically (helps with
-/// human dedup and snapshot tests).
-fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
-    let mut keys: Vec<&String> = fields.keys().collect();
-    keys.sort();
-    let pairs: Vec<String> = keys
-        .into_iter()
-        .map(|k| format!("{k}={}", fields[k]))
-        .collect();
-    if pairs.is_empty() {
-        format!("*{event_name}*")
+/// Field names that the visitor inherits from enclosing request spans
+/// but operators don't want to see in Slack. axum/tower instruments the
+/// HTTP request span with `method`/`uri`/`version` and the `OAuth2`
+/// password grant adds `grant_type`/`username`; the `id` and `route`
+/// keys come from route-handler `Path<_>` extractors and the project's
+/// instrument convention. They're useful in Cloud Logging but pure
+/// noise on Slack.
+const FIELD_DENYLIST: &[&str] = &[
+    "uri",
+    "method",
+    "version",
+    "host",
+    "grant_type",
+    "username",
+    "route",
+    "id",
+    "x-request-id",
+];
+
+/// Field-key priority for the rendered line: lower number renders first.
+/// Event-specific fields lead so the actionable signal is at the front;
+/// `tenant_id` / `user_id` trail because they're on every event and
+/// operators scan for them last.
+fn field_priority(key: &str) -> u8 {
+    match key {
+        "tenant_id" => 90,
+        "user_id" => 91,
+        _ => 50,
+    }
+}
+
+/// Pretty-print a `*_ms` field value as a humanised duration. Falls back
+/// to the raw value when the field doesn't parse as a `u64` (e.g. a
+/// negative i64 or a Debug-rendered struct).
+fn format_value(key: &str, value: &str) -> String {
+    if key.ends_with("_ms") {
+        if let Ok(ms) = value.parse::<u64>() {
+            return format_duration_ms(ms);
+        }
+    }
+    value.to_owned()
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs = ms / 1000;
+    let rem_ms = ms % 1000;
+    if secs < 60 {
+        if rem_ms == 0 {
+            format!("{secs}s")
+        } else {
+            format!("{secs}.{rem_ms:03}s")
+        }
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
     } else {
-        format!("*{event_name}* — {}", pairs.join(", "))
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        }
+    }
+}
+
+/// Format one event for Slack:
+///
+/// ```text
+/// *event.name* — <tracing message body>
+/// key1=value1, key2=value2, … tenant_id=…, user_id=…
+/// ```
+///
+/// The tracing macro's message body is lifted out of the field map and
+/// rendered as the headline so the most-readable text leads. Fields are
+/// denylist-filtered to drop HTTP / OAuth plumbing inherited from the
+/// enclosing request span, then ordered by [`field_priority`] so
+/// event-specific data lands first and `tenant_id`/`user_id` trail.
+/// `*_ms` values are humanised via [`format_duration_ms`].
+fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
+    let message = fields.get("message").map(String::as_str);
+
+    let mut filtered: Vec<(&String, &String)> = fields
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != "message" && !FIELD_DENYLIST.contains(&k.as_str())
+        })
+        .collect();
+
+    filtered.sort_by_key(|(k, _)| (field_priority(k), k.as_str()));
+
+    let pairs: Vec<String> = filtered
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", format_value(k, v)))
+        .collect();
+
+    let head = match message {
+        Some(msg) if !msg.is_empty() => format!("*{event_name}* — {msg}"),
+        _ => format!("*{event_name}*"),
+    };
+
+    if pairs.is_empty() {
+        head
+    } else {
+        format!("{head}\n{}", pairs.join(", "))
     }
 }
 
@@ -573,18 +672,87 @@ mod tests {
     }
 
     #[test]
-    fn format_line_sorts_fields_deterministically() {
+    fn format_line_sorts_event_specific_fields_alphabetically() {
         let mut fields = HashMap::new();
         fields.insert("zeta".to_owned(), "z".to_owned());
         fields.insert("alpha".to_owned(), "a".to_owned());
         let line = format_line("evt", &fields);
-        assert_eq!(line, "*evt* — alpha=a, zeta=z");
+        assert_eq!(line, "*evt*\nalpha=a, zeta=z");
     }
 
     #[test]
     fn format_line_with_no_fields_renders_event_only() {
         let line = format_line("evt", &HashMap::new());
         assert_eq!(line, "*evt*");
+    }
+
+    #[test]
+    fn format_line_lifts_message_to_headline() {
+        let mut fields = HashMap::new();
+        fields.insert("message".to_owned(), "user authenticated".to_owned());
+        fields.insert("user_id".to_owned(), "abc".to_owned());
+        let line = format_line("user.login", &fields);
+        assert_eq!(line, "*user.login* — user authenticated\nuser_id=abc");
+    }
+
+    #[test]
+    fn format_line_drops_http_plumbing_fields() {
+        let mut fields = HashMap::new();
+        fields.insert("uri".to_owned(), "/oauth/token".to_owned());
+        fields.insert("method".to_owned(), "POST".to_owned());
+        fields.insert("version".to_owned(), "HTTP/1.1".to_owned());
+        fields.insert("grant_type".to_owned(), "password".to_owned());
+        fields.insert("username".to_owned(), "x@y".to_owned());
+        fields.insert("route".to_owned(), "oauth2_token".to_owned());
+        fields.insert("id".to_owned(), "some-uuid".to_owned());
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        let line = format_line("user.login", &fields);
+        assert_eq!(line, "*user.login*\nuser_id=u1");
+    }
+
+    #[test]
+    fn format_line_buries_identity_fields_after_event_specific() {
+        let mut fields = HashMap::new();
+        fields.insert("coach_slug".to_owned(), "marathon".to_owned());
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        fields.insert("tenant_id".to_owned(), "t1".to_owned());
+        let line = format_line("coach.selected", &fields);
+        assert_eq!(
+            line,
+            "*coach.selected*\ncoach_slug=marathon, tenant_id=t1, user_id=u1"
+        );
+    }
+
+    #[test]
+    fn format_line_humanises_latency_ms() {
+        let mut fields = HashMap::new();
+        fields.insert("latency_ms".to_owned(), "120011".to_owned());
+        fields.insert("model".to_owned(), "claude-opus".to_owned());
+        let line = format_line("embacle.call_completed", &fields);
+        assert_eq!(
+            line,
+            "*embacle.call_completed*\nlatency_ms=2m, model=claude-opus"
+        );
+    }
+
+    #[test]
+    fn format_line_passes_through_unparseable_ms_value() {
+        let mut fields = HashMap::new();
+        fields.insert("latency_ms".to_owned(), "not-a-number".to_owned());
+        let line = format_line("evt", &fields);
+        assert_eq!(line, "*evt*\nlatency_ms=not-a-number");
+    }
+
+    #[test]
+    fn format_duration_ms_covers_each_bucket() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+        assert_eq!(format_duration_ms(1_000), "1s");
+        assert_eq!(format_duration_ms(1_500), "1.500s");
+        assert_eq!(format_duration_ms(60_000), "1m");
+        assert_eq!(format_duration_ms(90_000), "1m 30s");
+        assert_eq!(format_duration_ms(3_600_000), "1h");
+        assert_eq!(format_duration_ms(3_661_000), "1h 1m");
     }
 
     #[test]
