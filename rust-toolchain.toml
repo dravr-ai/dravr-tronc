@@ -1,0 +1,5 @@
+# ABOUTME: Rust toolchain configuration for the dravr-tronc crate
+# ABOUTME: Specifies the Rust version used for building and development
+
+[toolchain]
+channel = "1.96.0"
