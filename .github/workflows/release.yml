@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Configure git
         run: |
@@ -139,7 +139,7 @@ jobs:
         with:
           ref: v${{ needs.version.outputs.version }}
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Publish to crates.io
         env:
