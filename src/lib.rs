@@ -22,6 +22,16 @@
 //! let server = Arc::new(McpServer::new("my-server", "0.1.0", registry, state));
 //! ```
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::str_to_string
+    )
+)]
+
 pub mod error;
 pub mod mcp;
 #[cfg(feature = "notifications")]
