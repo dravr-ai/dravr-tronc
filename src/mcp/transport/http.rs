@@ -107,7 +107,7 @@ fn respond_sse(response: &JsonRpcResponse) -> Response {
 mod tests {
     use super::*;
     use crate::error::PARSE_ERROR;
-    use crate::mcp::protocol::{CallToolResult, ToolDefinition};
+    use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolRegistry};
     use http::Request;
     use http_body_util::BodyExt;
@@ -121,11 +121,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpTool<TestState> for HelloTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
+        fn definition(&self) -> Tool {
+            Tool {
                 name: "hello".to_owned(),
                 description: "Says hello".to_owned(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }
         }
 
@@ -133,8 +134,8 @@ mod tests {
             &self,
             _state: &Arc<RwLock<TestState>>,
             _arguments: Value,
-        ) -> CallToolResult {
-            CallToolResult::text("hello world".to_owned())
+        ) -> ToolResponse {
+            ToolResponse::text("hello world".to_owned())
         }
     }
 

@@ -1,5 +1,8 @@
 // ABOUTME: Generic McpTool trait and ToolRegistry for MCP tool discovery and dispatch
 // ABOUTME: Parameterized over state type S so each project provides its own ServerState
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::mcp::protocol::{CallToolResult, ToolDefinition};
+use crate::mcp::schema::{Tool, ToolResponse};
 
 /// Trait implemented by each MCP tool exposed by a server
 ///
@@ -17,10 +20,10 @@ use crate::mcp::protocol::{CallToolResult, ToolDefinition};
 #[async_trait]
 pub trait McpTool<S: Send + Sync>: Send + Sync {
     /// Return the tool's MCP definition (name, description, input schema)
-    fn definition(&self) -> ToolDefinition;
+    fn definition(&self) -> Tool;
 
     /// Execute the tool with the given arguments against the shared server state
-    async fn execute(&self, state: &Arc<RwLock<S>>, arguments: Value) -> CallToolResult;
+    async fn execute(&self, state: &Arc<RwLock<S>>, arguments: Value) -> ToolResponse;
 }
 
 /// Registry mapping tool names to their handler implementations
@@ -62,7 +65,7 @@ impl<S: Send + Sync> ToolRegistry<S> {
     }
 
     /// List all registered tool definitions for `tools/list` responses
-    pub fn list_definitions(&self) -> Vec<ToolDefinition> {
+    pub fn list_definitions(&self) -> Vec<Tool> {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
@@ -72,10 +75,10 @@ impl<S: Send + Sync> ToolRegistry<S> {
         name: &str,
         state: &Arc<RwLock<S>>,
         arguments: Value,
-    ) -> CallToolResult {
+    ) -> ToolResponse {
         match self.tools.get(name) {
             Some(tool) => tool.execute(state, arguments).await,
-            None => CallToolResult::error(format!("Unknown tool: {name}")),
+            None => ToolResponse::error(format!("Unknown tool: {name}")),
         }
     }
 }
@@ -93,8 +96,8 @@ mod tests {
 
     #[async_trait]
     impl McpTool<DummyState> for EchoTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
+        fn definition(&self) -> Tool {
+            Tool {
                 name: "echo".to_owned(),
                 description: "Echoes the input".to_owned(),
                 input_schema: json!({
@@ -103,6 +106,7 @@ mod tests {
                         "message": { "type": "string" }
                     }
                 }),
+                annotations: None,
             }
         }
 
@@ -110,12 +114,12 @@ mod tests {
             &self,
             _state: &Arc<RwLock<DummyState>>,
             arguments: Value,
-        ) -> CallToolResult {
+        ) -> ToolResponse {
             let msg = arguments
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(empty)");
-            CallToolResult::text(format!("echo: {msg}"))
+            ToolResponse::text(format!("echo: {msg}"))
         }
     }
 
@@ -123,11 +127,12 @@ mod tests {
 
     #[async_trait]
     impl McpTool<DummyState> for CounterTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
+        fn definition(&self) -> Tool {
+            Tool {
                 name: "counter".to_owned(),
                 description: "Returns the counter value".to_owned(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }
         }
 
@@ -135,9 +140,9 @@ mod tests {
             &self,
             state: &Arc<RwLock<DummyState>>,
             _arguments: Value,
-        ) -> CallToolResult {
+        ) -> ToolResponse {
             let guard = state.read().await;
-            CallToolResult::text(format!("counter: {}", guard.counter))
+            ToolResponse::text(format!("counter: {}", guard.counter))
         }
     }
 
@@ -193,8 +198,8 @@ mod tests {
         let result = registry
             .execute("echo", &state, json!({"message": "hello"}))
             .await;
-        assert!(result.is_error.is_none());
-        assert_eq!(result.content[0].text, "echo: hello");
+        assert!(!result.is_error);
+        assert_eq!(result.content[0].as_text(), Some("echo: hello"));
     }
 
     #[tokio::test]
@@ -204,7 +209,7 @@ mod tests {
 
         let state = make_state();
         let result = registry.execute("counter", &state, json!({})).await;
-        assert_eq!(result.content[0].text, "counter: 42");
+        assert_eq!(result.content[0].as_text(), Some("counter: 42"));
     }
 
     #[tokio::test]
@@ -212,8 +217,11 @@ mod tests {
         let registry = ToolRegistry::<DummyState>::new();
         let state = make_state();
         let result = registry.execute("nonexistent", &state, json!({})).await;
-        assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("Unknown tool"));
+        assert!(result.is_error);
+        assert!(result.content[0]
+            .as_text()
+            .expect("text") // Safe: test assertion
+            .contains("Unknown tool"));
     }
 
     #[test]

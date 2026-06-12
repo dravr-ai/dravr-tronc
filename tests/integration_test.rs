@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dravr_tronc::error::ErrorResponse;
-use dravr_tronc::mcp::protocol::{CallToolResult, ToolDefinition};
+use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolRegistry};
 use dravr_tronc::mcp::transport::http::mcp_router;
@@ -31,8 +31,8 @@ struct GreetTool;
 
 #[async_trait]
 impl McpTool<AppState> for GreetTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+    fn definition(&self) -> Tool {
+        Tool {
             name: "greet".to_owned(),
             description: "Greet a person".to_owned(),
             input_schema: json!({
@@ -42,16 +42,17 @@ impl McpTool<AppState> for GreetTool {
                 },
                 "required": ["name"]
             }),
+            annotations: None,
         }
     }
 
-    async fn execute(&self, state: &Arc<RwLock<AppState>>, arguments: Value) -> CallToolResult {
+    async fn execute(&self, state: &Arc<RwLock<AppState>>, arguments: Value) -> ToolResponse {
         let name = arguments
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("stranger");
         let guard = state.read().await;
-        CallToolResult::text(format!("{} {name}", guard.greeting))
+        ToolResponse::text(format!("{} {name}", guard.greeting))
     }
 }
 
@@ -59,8 +60,8 @@ struct UppercaseTool;
 
 #[async_trait]
 impl McpTool<AppState> for UppercaseTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+    fn definition(&self) -> Tool {
+        Tool {
             name: "uppercase".to_owned(),
             description: "Convert text to uppercase".to_owned(),
             input_schema: json!({
@@ -69,12 +70,13 @@ impl McpTool<AppState> for UppercaseTool {
                     "text": { "type": "string" }
                 }
             }),
+            annotations: None,
         }
     }
 
-    async fn execute(&self, _state: &Arc<RwLock<AppState>>, arguments: Value) -> CallToolResult {
+    async fn execute(&self, _state: &Arc<RwLock<AppState>>, arguments: Value) -> ToolResponse {
         let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        CallToolResult::text(text.to_uppercase())
+        ToolResponse::text(text.to_uppercase())
     }
 }
 
@@ -113,7 +115,7 @@ async fn full_mcp_handshake_sequence() {
         .await
         .expect("response");
     let init_result = init_resp.result.expect("result");
-    assert_eq!(init_result["protocolVersion"], "2024-11-05");
+    assert_eq!(init_result["protocolVersion"], "2025-11-25");
     assert_eq!(init_result["serverInfo"]["name"], "integration-test");
     assert!(init_result["capabilities"]["tools"].is_object());
 

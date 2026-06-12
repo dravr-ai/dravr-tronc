@@ -1,5 +1,8 @@
 // ABOUTME: Shared error types for REST API and JSON-RPC error responses
 // ABOUTME: Provides ErrorResponse for HTTP errors and JSON-RPC error code constants
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 dravr.ai
 
 use serde::Serialize;
 
@@ -21,6 +24,32 @@ pub const INVALID_PARAMS: i32 = -32_602;
 
 /// JSON-RPC internal error
 pub const INTERNAL_ERROR: i32 = -32_603;
+
+/// Implementation-defined server-error range start (JSON-RPC 2.0 reserves
+/// -32000..=-32099 for application-defined server errors).
+pub const SERVER_ERROR_START: i32 = -32_000;
+
+/// Implementation-defined server-error range end.
+pub const SERVER_ERROR_END: i32 = -32_099;
+
+/// Authentication required or token invalid. Implementation-defined server
+/// error (within the -32000..=-32099 range) paired with an HTTP 401 on the
+/// transport layer for unauthenticated MCP requests.
+pub const UNAUTHORIZED: i32 = -32_001;
+
+/// A required client capability was not declared (modern MCP `-32003`).
+///
+/// `MissingRequiredClientCapabilityError` (revision 2026-07-28):
+/// `data.requiredCapabilities` lists the missing capabilities; paired with
+/// HTTP 400 on the transport layer.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32_003;
+
+/// The request's declared protocol version is unsupported (modern MCP `-32004`).
+///
+/// `UnsupportedProtocolVersionError` (revision 2026-07-28): `data.supported`
+/// lists the server's versions and `data.requested` echoes the client's;
+/// paired with HTTP 400 on the transport layer.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32_004;
 
 // ============================================================================
 // REST API Error Response

@@ -1,222 +1,256 @@
-// ABOUTME: MCP JSON-RPC 2.0 protocol types for request/response handling
-// ABOUTME: Defines wire format for initialize, tools/list, tools/call, and error responses
+// ABOUTME: Canonical JSON-RPC 2.0 wire types shared by all MCP transports
+// ABOUTME: Request/response/error structs with a metadata extension field and redacted Debug
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+//! JSON-RPC 2.0 foundation for the MCP protocol.
+//!
+//! These are the protocol-agnostic wire types every MCP transport speaks. MCP
+//! schema types (`initialize`, `tools/*`, capabilities) layer on top in
+//! [`crate::mcp::schema`]; the standard error-code constants live in
+//! [`crate::error`].
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt;
 
-/// MCP protocol version supported by this server
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// JSON-RPC 2.0 version string.
+pub const JSONRPC_VERSION: &str = "2.0";
 
-// ============================================================================
-// JSON-RPC Messages
-// ============================================================================
+/// Default MCP protocol revision advertised by the server (current stable spec).
+///
+/// The modern (stateless) revision lives at
+/// [`crate::mcp::modern::PROTOCOL_VERSION_2026_07_28`]; era detection on the
+/// dispatch path decides which one a given request speaks.
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
-/// Incoming JSON-RPC request from MCP client
-#[derive(Debug, Deserialize)]
+/// JSON-RPC 2.0 request.
+///
+/// Carries the protocol-agnostic envelope plus MCP/A2A transport extensions
+/// (`auth` bearer token, forwarded `headers`, free-form `metadata`).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
-    /// Protocol version marker (always "2.0", validated by JSON-RPC clients)
+    /// JSON-RPC version (always `"2.0"`).
     pub jsonrpc: String,
-    /// Request identifier (None for notifications)
-    pub id: Option<Value>,
-    /// Method name
-    pub method: String,
-    /// Method parameters
-    #[serde(default)]
-    pub params: Option<Value>,
-}
 
-/// Outgoing JSON-RPC response to MCP client
-#[derive(Debug, Serialize)]
-pub struct JsonRpcResponse {
-    /// Always "2.0"
-    pub jsonrpc: String,
-    /// Matching request identifier
+    /// Method name to invoke.
+    pub method: String,
+
+    /// Optional parameters for the method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+
+    /// Request identifier (absent for notifications).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Value>,
-    /// Success payload
+
+    /// Authorization header value (bearer token) — MCP/A2A transport extension.
+    #[serde(rename = "auth", skip_serializing_if = "Option::is_none", default)]
+    pub auth_token: Option<String>,
+
+    /// Forwarded HTTP headers for tenant context and other metadata — MCP extension.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub headers: Option<HashMap<String, Value>>,
+
+    /// Protocol-specific metadata (additional extensions, not part of the spec).
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub metadata: HashMap<String, String>,
+}
+
+// Custom Debug that redacts the bearer token so it never reaches logs.
+impl fmt::Debug for JsonRpcRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonRpcRequest")
+            .field("jsonrpc", &self.jsonrpc)
+            .field("method", &self.method)
+            .field("params", &self.params)
+            .field("id", &self.id)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|token| {
+                    // Show first 10 + last 8 characters, or "[REDACTED]" if short.
+                    if token.len() > 20 {
+                        format!("{}...{}", &token[..10], &token[token.len() - 8..])
+                    } else {
+                        "[REDACTED]".to_owned()
+                    }
+                }),
+            )
+            .field("headers", &self.headers)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+/// JSON-RPC 2.0 response. Exactly one of `result` or `error` is present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcResponse {
+    /// JSON-RPC version (always `"2.0"`).
+    pub jsonrpc: String,
+
+    /// Result of the method call (mutually exclusive with `error`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    /// Error payload
+
+    /// Error information (mutually exclusive with `result`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+
+    /// Request identifier for correlation.
+    pub id: Option<Value>,
 }
 
-/// JSON-RPC error object
-#[derive(Debug, Serialize)]
+/// JSON-RPC 2.0 error object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
-    /// Numeric error code
+    /// Error code (see [`crate::error`] for the standard constants).
     pub code: i32,
-    /// Human-readable error message
+
+    /// Human-readable error message.
     pub message: String,
-    /// Additional error data
+
+    /// Additional error information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
-impl JsonRpcResponse {
-    /// Build a success response with the given result
-    pub fn success(id: Option<Value>, result: Value) -> Self {
+impl JsonRpcRequest {
+    /// Create a new request with a default id of `1`.
+    #[must_use]
+    pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
-            id,
-            result: Some(result),
-            error: None,
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: method.into(),
+            params,
+            id: Some(Value::Number(1.into())),
+            auth_token: None,
+            headers: None,
+            metadata: HashMap::new(),
         }
     }
 
-    /// Build an error response with the given code and message
-    pub fn error(id: Option<Value>, code: i32, message: String) -> Self {
+    /// Create a new request with a specific id.
+    #[must_use]
+    pub fn with_id(method: impl Into<String>, params: Option<Value>, id: Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: method.into(),
+            params,
+            id: Some(id),
+            auth_token: None,
+            headers: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Create a notification (no id, no response expected).
+    #[must_use]
+    pub fn notification(method: impl Into<String>, params: Option<Value>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: method.into(),
+            params,
+            id: None,
+            auth_token: None,
+            headers: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Attach a metadata key/value to the request.
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Look up a metadata value by key.
+    #[must_use]
+    pub fn get_metadata(&self, key: &str) -> Option<&String> {
+        self.metadata.get(key)
+    }
+}
+
+impl JsonRpcResponse {
+    /// Build a success response carrying the given result.
+    #[must_use]
+    pub fn success(id: Option<Value>, result: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            result: Some(result),
+            error: None,
             id,
+        }
+    }
+
+    /// Build an error response with the given code and message.
+    #[must_use]
+    pub fn error(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
             result: None,
             error: Some(JsonRpcError {
                 code,
-                message,
+                message: message.into(),
                 data: None,
             }),
-        }
-    }
-}
-
-// ============================================================================
-// MCP Initialize
-// ============================================================================
-
-/// Parameters for the `initialize` request
-#[derive(Debug, Deserialize)]
-pub struct InitializeParams {
-    /// Protocol version requested by the client
-    #[serde(rename = "protocolVersion")]
-    pub protocol_version: String,
-    /// Client capabilities
-    #[serde(default)]
-    pub capabilities: Value,
-    /// Client identification
-    #[serde(rename = "clientInfo")]
-    pub client_info: ClientInfo,
-}
-
-/// Client identification sent during initialization
-#[derive(Debug, Deserialize)]
-pub struct ClientInfo {
-    /// Client name
-    pub name: String,
-    /// Client version
-    #[serde(default)]
-    pub version: Option<String>,
-}
-
-/// Result of a successful `initialize` response
-#[derive(Debug, Serialize)]
-pub struct InitializeResult {
-    /// Protocol version the server supports
-    #[serde(rename = "protocolVersion")]
-    pub protocol_version: String,
-    /// Server capabilities
-    pub capabilities: ServerCapabilities,
-    /// Server identification
-    #[serde(rename = "serverInfo")]
-    pub server_info: ServerInfo,
-}
-
-/// Server identification
-#[derive(Debug, Serialize)]
-pub struct ServerInfo {
-    /// Server name
-    pub name: String,
-    /// Server version
-    pub version: String,
-}
-
-/// Server capability declarations
-#[derive(Debug, Serialize)]
-pub struct ServerCapabilities {
-    /// Tool support (presence signals tools are available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<ToolsCapability>,
-}
-
-/// Marker type indicating the server supports MCP tools
-#[derive(Debug, Serialize)]
-pub struct ToolsCapability {}
-
-// ============================================================================
-// MCP Tools
-// ============================================================================
-
-/// Tool definition exposed via `tools/list`
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    /// Unique tool name
-    pub name: String,
-    /// Human-readable tool description
-    pub description: String,
-    /// JSON Schema describing the tool's input
-    #[serde(rename = "inputSchema")]
-    pub input_schema: Value,
-}
-
-/// Result of a `tools/list` call
-#[derive(Debug, Serialize)]
-pub struct ToolsListResult {
-    /// Available tool definitions
-    pub tools: Vec<ToolDefinition>,
-}
-
-/// Parameters for a `tools/call` request
-#[derive(Debug, Deserialize)]
-pub struct CallToolParams {
-    /// Name of the tool to invoke
-    pub name: String,
-    /// Tool arguments
-    #[serde(default)]
-    pub arguments: Option<Value>,
-}
-
-/// Result of a `tools/call` invocation
-#[derive(Debug, Serialize)]
-pub struct CallToolResult {
-    /// Response content parts
-    pub content: Vec<ContentPart>,
-    /// Whether this result represents an error
-    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
-}
-
-/// A content part within a tool result
-#[derive(Debug, Serialize)]
-pub struct ContentPart {
-    /// Content type (always "text" for now)
-    #[serde(rename = "type")]
-    pub content_type: String,
-    /// Text content
-    pub text: String,
-}
-
-impl CallToolResult {
-    /// Build a successful text result
-    pub fn text(content: String) -> Self {
-        Self {
-            content: vec![ContentPart {
-                content_type: "text".to_owned(),
-                text: content,
-            }],
-            is_error: None,
+            id,
         }
     }
 
-    /// Build an error result with the given message
-    pub fn error(message: String) -> Self {
+    /// Build an error response carrying additional structured `data`.
+    #[must_use]
+    pub fn error_with_data(
+        id: Option<Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
         Self {
-            content: vec![ContentPart {
-                content_type: "text".to_owned(),
-                text: message,
-            }],
-            is_error: Some(true),
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
+            }),
+            id,
+        }
+    }
+
+    /// Whether this is a success response.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.error.is_none() && self.result.is_some()
+    }
+
+    /// Whether this is an error response.
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+impl JsonRpcError {
+    /// Create a new error.
+    #[must_use]
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// Create an error carrying additional structured `data`.
+    #[must_use]
+    pub fn with_data(code: i32, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
         }
     }
 }
@@ -236,11 +270,24 @@ mod tests {
 
     #[test]
     fn serialize_error_response() {
-        let resp = JsonRpcResponse::error(Some(Value::from(1)), PARSE_ERROR, "bad json".to_owned());
+        let resp = JsonRpcResponse::error(Some(Value::from(1)), PARSE_ERROR, "bad json");
         let json = serde_json::to_string(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.contains("\"error\""));
         assert!(json.contains("-32700"));
         assert!(!json.contains("\"result\""));
+    }
+
+    #[test]
+    fn error_with_data_carries_payload() {
+        let resp = JsonRpcResponse::error_with_data(
+            Some(Value::from(1)),
+            -32_004,
+            "unsupported version",
+            serde_json::json!({"supported": ["2025-11-25"]}),
+        );
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, -32_004);
+        assert_eq!(err.data.expect("data")["supported"][0], "2025-11-25"); // Safe: test assertion
     }
 
     #[test]
@@ -267,19 +314,12 @@ mod tests {
     }
 
     #[test]
-    fn call_tool_result_text() {
-        let result = CallToolResult::text("hello".to_owned());
-        assert!(result.is_error.is_none());
-        assert_eq!(result.content.len(), 1);
-        assert_eq!(result.content[0].text, "hello");
-        assert_eq!(result.content[0].content_type, "text");
-    }
-
-    #[test]
-    fn call_tool_result_error() {
-        let result = CallToolResult::error("oops".to_owned());
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(result.content[0].text, "oops");
+    fn debug_redacts_long_auth_token() {
+        let mut req = JsonRpcRequest::new("ping", None);
+        req.auth_token = Some("abcdefghij_secret_middle_part_klmnopqr".to_owned());
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("secret_middle_part"));
+        assert!(debug.contains("..."));
     }
 
     #[test]
@@ -292,116 +332,22 @@ mod tests {
 
     #[test]
     fn error_response_omits_result_field() {
-        let resp = JsonRpcResponse::error(Some(Value::from(1)), -1, "fail".to_owned());
+        let resp = JsonRpcResponse::error(Some(Value::from(1)), -1, "fail");
         let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert!(json.get("result").is_none());
         assert!(json.get("error").is_some());
     }
 
     #[test]
-    fn initialize_result_serializes_with_camel_case() {
-        let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_owned(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {}),
-            },
-            server_info: ServerInfo {
-                name: "test".to_owned(),
-                version: "0.1.0".to_owned(),
-            },
-        };
-        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
-        assert!(json.get("protocolVersion").is_some());
-        assert!(json.get("serverInfo").is_some());
-        assert!(json.get("protocol_version").is_none());
+    fn is_success_and_is_error_are_exclusive() {
+        let ok = JsonRpcResponse::success(None, Value::Null);
+        assert!(ok.is_success());
+        assert!(!ok.is_error());
+
+        let err = JsonRpcResponse::error(None, INTERNAL_ERR, "x");
+        assert!(err.is_error());
+        assert!(!err.is_success());
     }
 
-    #[test]
-    fn initialize_params_deserializes_camel_case() {
-        let raw = r#"{
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "1.0" }
-        }"#;
-        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
-        assert_eq!(params.protocol_version, "2024-11-05");
-        assert_eq!(params.client_info.name, "test-client");
-        assert_eq!(params.client_info.version.as_deref(), Some("1.0"));
-    }
-
-    #[test]
-    fn initialize_params_client_version_optional() {
-        let raw = r#"{
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "minimal" }
-        }"#;
-        let params: InitializeParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
-        assert!(params.client_info.version.is_none());
-    }
-
-    #[test]
-    fn tool_definition_serializes_input_schema() {
-        let def = ToolDefinition {
-            name: "test_tool".to_owned(),
-            description: "A test".to_owned(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                }
-            }),
-        };
-        let json = serde_json::to_value(&def).expect("serialize"); // Safe: test assertion
-        assert_eq!(json["name"], "test_tool");
-        assert!(json.get("inputSchema").is_some());
-        assert!(json.get("input_schema").is_none());
-    }
-
-    #[test]
-    fn call_tool_params_arguments_default_to_none() {
-        let raw = r#"{"name": "my_tool"}"#;
-        let params: CallToolParams = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
-        assert_eq!(params.name, "my_tool");
-        assert!(params.arguments.is_none());
-    }
-
-    #[test]
-    fn call_tool_result_error_serializes_is_error() {
-        let result = CallToolResult::error("fail".to_owned());
-        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
-        assert_eq!(json["isError"], true);
-    }
-
-    #[test]
-    fn call_tool_result_text_omits_is_error() {
-        let result = CallToolResult::text("ok".to_owned());
-        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
-        assert!(json.get("isError").is_none());
-    }
-
-    #[test]
-    fn tools_list_result_serializes_array() {
-        let result = ToolsListResult {
-            tools: vec![
-                ToolDefinition {
-                    name: "a".to_owned(),
-                    description: "tool a".to_owned(),
-                    input_schema: serde_json::json!({}),
-                },
-                ToolDefinition {
-                    name: "b".to_owned(),
-                    description: "tool b".to_owned(),
-                    input_schema: serde_json::json!({}),
-                },
-            ],
-        };
-        let json = serde_json::to_value(&result).expect("serialize"); // Safe: test assertion
-        assert_eq!(json["tools"].as_array().expect("array").len(), 2); // Safe: test assertion
-    }
-
-    #[test]
-    fn protocol_version_is_expected() {
-        assert_eq!(PROTOCOL_VERSION, "2024-11-05");
-    }
+    const INTERNAL_ERR: i32 = -32_603;
 }

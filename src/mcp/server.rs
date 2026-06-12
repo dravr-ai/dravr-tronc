@@ -13,9 +13,9 @@ use tracing::debug;
 use crate::error::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
 };
-use crate::mcp::protocol::{
-    CallToolParams, InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    ServerCapabilities, ServerInfo, ToolsCapability, ToolsListResult, PROTOCOL_VERSION,
+use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
+use crate::mcp::schema::{
+    InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall,
 };
 use crate::mcp::tool::ToolRegistry;
 
@@ -105,26 +105,22 @@ impl<S: Send + Sync + 'static> McpServer<S> {
     /// Handle `initialize` — parse client info and return server capabilities
     fn handle_initialize(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
         if let Some(params) = params {
-            if let Ok(init) = serde_json::from_value::<InitializeParams>(params) {
+            if let Ok(init) = serde_json::from_value::<InitializeRequest>(params) {
                 debug!(
                     client = %init.client_info.name,
-                    version = ?init.client_info.version,
+                    version = %init.client_info.version,
                     protocol = %init.protocol_version,
                     "MCP client connected"
                 );
             }
         }
 
-        let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_owned(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {}),
-            },
-            server_info: ServerInfo {
-                name: self.name.clone(),
-                version: self.version.clone(),
-            },
-        };
+        let result = InitializeResponse::new(
+            PROTOCOL_VERSION.to_owned(),
+            ServerInfo::new(self.name.clone(), self.version.clone()),
+            ServerCapabilities::tools_only(),
+            None,
+        );
 
         match serde_json::to_value(result) {
             Ok(val) => JsonRpcResponse::success(id, val),
@@ -136,12 +132,12 @@ impl<S: Send + Sync + 'static> McpServer<S> {
 
     /// Handle `tools/list` — return all registered tool definitions
     fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
-        let result = ToolsListResult {
-            tools: self.tools.list_definitions(),
-        };
-
-        match serde_json::to_value(result) {
-            Ok(val) => JsonRpcResponse::success(id, val),
+        match serde_json::to_value(self.tools.list_definitions()) {
+            Ok(tools) => {
+                let mut result = serde_json::Map::new();
+                result.insert("tools".to_owned(), tools);
+                JsonRpcResponse::success(id, Value::Object(result))
+            }
             Err(e) => {
                 JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Serialization error: {e}"))
             }
@@ -150,7 +146,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
 
     /// Handle `tools/call` — dispatch to the named tool handler
     async fn handle_tools_call(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-        let call_params: CallToolParams = match params {
+        let call: ToolCall = match params {
             Some(p) => match serde_json::from_value(p) {
                 Ok(cp) => cp,
                 Err(e) => {
@@ -170,14 +166,11 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             }
         };
 
-        let arguments = call_params
+        let arguments = call
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-        let result = self
-            .tools
-            .execute(&call_params.name, &self.state, arguments)
-            .await;
+        let result = self.tools.execute(&call.name, &self.state, arguments).await;
 
         match serde_json::to_value(result) {
             Ok(val) => JsonRpcResponse::success(id, val),
@@ -193,7 +186,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::protocol::{CallToolResult, ToolDefinition};
+    use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::McpTool;
     use serde_json::json;
 
@@ -203,11 +196,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpTool<TestState> for PingTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
+        fn definition(&self) -> Tool {
+            Tool {
                 name: "ping_tool".to_owned(),
                 description: "Returns pong".to_owned(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }
         }
 
@@ -215,8 +209,8 @@ mod tests {
             &self,
             _state: &Arc<RwLock<TestState>>,
             _arguments: Value,
-        ) -> CallToolResult {
-            CallToolResult::text("pong".to_owned())
+        ) -> ToolResponse {
+            ToolResponse::text("pong".to_owned())
         }
     }
 
@@ -242,7 +236,7 @@ mod tests {
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         let result = resp.result.expect("result"); // Safe: test assertion
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], "test-server");
         assert_eq!(result["serverInfo"]["version"], "0.1.0");
     }

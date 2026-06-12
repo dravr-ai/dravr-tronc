@@ -31,7 +31,6 @@ pub mod notify;
 pub mod server;
 
 // Convenience re-exports
-pub use mcp::protocol;
 pub use mcp::server::McpServer;
 pub use mcp::tool::{McpTool, ToolRegistry};
-pub use mcp::transport;
+pub use mcp::{modern, protocol, schema, transport};
