@@ -217,15 +217,14 @@ mod tests {
             }
         });
 
-        match ModernRequestMeta::from_params(Some(&params)) {
-            ModernMeta::Modern(meta) => {
-                assert_eq!(meta.protocol_version, "2026-07-28");
-                assert_eq!(meta.client_info.name, "ExampleClient");
-                assert_eq!(meta.client_info.version, "1.0.0");
-                assert_eq!(meta.log_level.as_deref(), Some("info"));
-                assert!(meta.client_capabilities.get("tools").is_some());
-            }
-            _ => panic!("expected a well-formed modern request"), // Safe: test assertion
+        let outcome = ModernRequestMeta::from_params(Some(&params));
+        assert!(matches!(outcome, ModernMeta::Modern(_)));
+        if let ModernMeta::Modern(meta) = outcome {
+            assert_eq!(meta.protocol_version, "2026-07-28");
+            assert_eq!(meta.client_info.name, "ExampleClient");
+            assert_eq!(meta.client_info.version, "1.0.0");
+            assert_eq!(meta.log_level.as_deref(), Some("info"));
+            assert!(meta.client_capabilities.get("tools").is_some());
         }
     }
 
