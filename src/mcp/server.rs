@@ -22,7 +22,7 @@ use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PRO
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall,
 };
-use crate::mcp::tool::ToolRegistry;
+use crate::mcp::tool::{ToolContext, ToolRegistry};
 
 /// The protocol revisions a default [`McpServer`] advertises, in preference
 /// order: the modern stateless era first, then the current legacy revision.
@@ -326,7 +326,13 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-        let result = self.tools.execute(&call.name, &self.state, arguments).await;
+        // The generic server resolves no identity; hosts that authenticate
+        // build a populated context and dispatch through the registry directly.
+        let ctx = ToolContext::default();
+        let result = self
+            .tools
+            .execute(&call.name, &self.state, &ctx, arguments)
+            .await;
 
         match serde_json::to_value(result) {
             Ok(val) => JsonRpcResponse::success(id, val),
@@ -364,6 +370,7 @@ mod tests {
         async fn execute(
             &self,
             _state: &Arc<RwLock<TestState>>,
+            _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
             ToolResponse::text("pong".to_owned())

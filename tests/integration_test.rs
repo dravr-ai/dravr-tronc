@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use dravr_tronc::error::ErrorResponse;
 use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
-use dravr_tronc::mcp::tool::{McpTool, ToolRegistry};
+use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
 use dravr_tronc::mcp::transport::http::mcp_router;
 use dravr_tronc::server::health::HealthResponse;
 use http::Request;
@@ -46,7 +46,12 @@ impl McpTool<AppState> for GreetTool {
         }
     }
 
-    async fn execute(&self, state: &Arc<RwLock<AppState>>, arguments: Value) -> ToolResponse {
+    async fn execute(
+        &self,
+        state: &Arc<RwLock<AppState>>,
+        _ctx: &ToolContext,
+        arguments: Value,
+    ) -> ToolResponse {
         let name = arguments
             .get("name")
             .and_then(|v| v.as_str())
@@ -74,7 +79,12 @@ impl McpTool<AppState> for UppercaseTool {
         }
     }
 
-    async fn execute(&self, _state: &Arc<RwLock<AppState>>, arguments: Value) -> ToolResponse {
+    async fn execute(
+        &self,
+        _state: &Arc<RwLock<AppState>>,
+        _ctx: &ToolContext,
+        arguments: Value,
+    ) -> ToolResponse {
         let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
         ToolResponse::text(text.to_uppercase())
     }

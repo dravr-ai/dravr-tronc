@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::error::PARSE_ERROR;
     use crate::mcp::schema::{Tool, ToolResponse};
-    use crate::mcp::tool::{McpTool, ToolRegistry};
+    use crate::mcp::tool::{McpTool, ToolContext, ToolRegistry};
     use http::Request;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -133,6 +133,7 @@ mod tests {
         async fn execute(
             &self,
             _state: &Arc<RwLock<TestState>>,
+            _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
             ToolResponse::text("hello world".to_owned())

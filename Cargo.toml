@@ -30,6 +30,7 @@ otel = [
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
+bitflags = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
