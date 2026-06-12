@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+pub mod auth;
 pub mod modern;
 pub mod protocol;
 pub mod schema;

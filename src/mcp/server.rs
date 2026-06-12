@@ -15,6 +15,7 @@ use crate::error::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
     UNSUPPORTED_PROTOCOL_VERSION,
 };
+use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::modern::{
     DiscoverResult, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_2026_07_28,
 };
@@ -46,6 +47,8 @@ pub struct McpServer<S: Send + Sync> {
     capabilities: ServerCapabilities,
     instructions: Option<String>,
     supported_versions: Vec<String>,
+    auth_hook: Option<Arc<dyn AuthHook<S>>>,
+    allowed_origins: Vec<String>,
 }
 
 impl<S: Send + Sync + 'static> McpServer<S> {
@@ -68,6 +71,8 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             capabilities: ServerCapabilities::tools_only(),
             instructions: None,
             supported_versions: default_supported_versions(),
+            auth_hook: None,
+            allowed_origins: Vec::new(),
         }
     }
 
@@ -93,6 +98,41 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         self
     }
 
+    /// Install a host authentication hook for the HTTP transport. With a hook,
+    /// the transport authenticates every request (rejecting with 401/403); with
+    /// none, every request runs as the default anonymous context.
+    #[must_use]
+    pub fn with_auth_hook(mut self, auth_hook: Arc<dyn AuthHook<S>>) -> Self {
+        self.auth_hook = Some(auth_hook);
+        self
+    }
+
+    /// Restrict the `Origin`s the HTTP transport accepts. An empty list (the
+    /// default) or one containing `"*"` allows any origin; a request whose
+    /// `Origin` header is present and not listed is rejected with 403.
+    #[must_use]
+    pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.allowed_origins = origins;
+        self
+    }
+
+    /// The `Origin` allowlist the HTTP transport enforces.
+    pub fn allowed_origins(&self) -> &[String] {
+        &self.allowed_origins
+    }
+
+    /// Authenticate a request via the configured [`AuthHook`], or yield the
+    /// default anonymous [`ToolContext`] when no hook is installed.
+    ///
+    /// # Errors
+    /// Returns the hook's [`AuthError`] (401/403) when authentication fails.
+    pub async fn authenticate(&self, request: &JsonRpcRequest) -> Result<ToolContext, AuthError> {
+        match &self.auth_hook {
+            Some(hook) => hook.authenticate(request, &self.state).await,
+            None => Ok(ToolContext::default()),
+        }
+    }
+
     /// Route a raw JSON string to the appropriate MCP handler
     ///
     /// Parses the string as a `JsonRpcRequest`, dispatches it, and returns
@@ -111,13 +151,27 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         self.handle_request(request).await
     }
 
-    /// Route a parsed JSON-RPC request to the appropriate MCP handler
+    /// Route a parsed JSON-RPC request under the default anonymous context.
+    ///
+    /// Convenience for transports without authentication (e.g. stdio). See
+    /// [`Self::handle_request_with_context`] for the authenticated path.
+    pub async fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.handle_request_with_context(request, &ToolContext::default())
+            .await
+    }
+
+    /// Route a parsed JSON-RPC request, dispatching tool calls under the given
+    /// per-call [`ToolContext`] (resolved by the transport's auth hook).
     ///
     /// Performs era detection on each request: one carrying modern per-request
     /// `_meta` (revision 2026-07-28) is served statelessly via
     /// [`Self::process_modern`]; otherwise it follows the legacy
     /// `initialize`/session path. Returns `None` for notifications (no id).
-    pub async fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    pub async fn handle_request_with_context(
+        &self,
+        request: JsonRpcRequest,
+        ctx: &ToolContext,
+    ) -> Option<JsonRpcResponse> {
         // Validate JSON-RPC protocol version
         if request.jsonrpc != JSONRPC_VERSION {
             return Some(JsonRpcResponse::error(
@@ -138,19 +192,22 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             ModernMeta::Malformed(reason) => {
                 JsonRpcResponse::error(request.id, INVALID_PARAMS, reason)
             }
-            ModernMeta::Modern(meta) => self.process_modern(request, *meta).await,
-            ModernMeta::Legacy => self.process_legacy(request).await,
+            ModernMeta::Modern(meta) => self.process_modern(request, *meta, ctx).await,
+            ModernMeta::Legacy => self.process_legacy(request, ctx).await,
         };
 
         Some(response)
     }
 
     /// Dispatch a legacy (`initialize`/session) request.
-    async fn process_legacy(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn process_legacy(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request.id, request.params.as_ref()),
             "tools/list" => self.handle_tools_list(request.id),
-            "tools/call" => self.handle_tools_call(request.id, request.params).await,
+            "tools/call" => {
+                self.handle_tools_call(request.id, request.params, ctx)
+                    .await
+            }
             "server/discover" => self.handle_server_discover(request.id),
             "ping" => JsonRpcResponse::success(request.id, Value::Object(serde_json::Map::new())),
             method => {
@@ -175,6 +232,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         &self,
         request: JsonRpcRequest,
         meta: ModernRequestMeta,
+        ctx: &ToolContext,
     ) -> JsonRpcResponse {
         if !self.supports_version(&meta.protocol_version) {
             return self.unsupported_version_error(request.id, &meta.protocol_version);
@@ -183,7 +241,10 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         let response = match request.method.as_str() {
             "server/discover" => self.handle_server_discover(request.id),
             "tools/list" => self.handle_tools_list(request.id),
-            "tools/call" => self.handle_tools_call(request.id, request.params).await,
+            "tools/call" => {
+                self.handle_tools_call(request.id, request.params, ctx)
+                    .await
+            }
             method => {
                 debug!(method, "Unknown modern MCP method");
                 JsonRpcResponse::error(
@@ -300,8 +361,13 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         }
     }
 
-    /// Handle `tools/call` — dispatch to the named tool handler
-    async fn handle_tools_call(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
+    /// Handle `tools/call` — dispatch to the named tool handler under `ctx`
+    async fn handle_tools_call(
+        &self,
+        id: Option<Value>,
+        params: Option<Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
         let call: ToolCall = match params {
             Some(p) => match serde_json::from_value(p) {
                 Ok(cp) => cp,
@@ -326,12 +392,9 @@ impl<S: Send + Sync + 'static> McpServer<S> {
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-        // The generic server resolves no identity; hosts that authenticate
-        // build a populated context and dispatch through the registry directly.
-        let ctx = ToolContext::default();
         let result = self
             .tools
-            .execute(&call.name, &self.state, &ctx, arguments)
+            .execute(&call.name, &self.state, ctx, arguments)
             .await;
 
         match serde_json::to_value(result) {

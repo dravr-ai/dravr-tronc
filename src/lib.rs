@@ -31,6 +31,7 @@ pub mod notify;
 pub mod server;
 
 // Convenience re-exports
+pub use mcp::auth::{AuthError, AuthHook};
 pub use mcp::server::McpServer;
 pub use mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
-pub use mcp::{modern, protocol, schema, transport};
+pub use mcp::{auth, modern, protocol, schema, transport};
