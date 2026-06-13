@@ -15,7 +15,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION};
+
+/// `notifications/progress` method string.
+const METHOD_PROGRESS: &str = "notifications/progress";
+/// `notifications/cancelled` method string.
+const METHOD_CANCELLED: &str = "notifications/cancelled";
+/// `notifications/oauth_completed` method string.
+const METHOD_OAUTH_COMPLETED: &str = "notifications/oauth_completed";
 
 /// MCP request wire frame (alias for the canonical JSON-RPC request).
 pub type McpRequest = JsonRpcRequest;
@@ -180,6 +187,17 @@ pub enum Content {
         /// MIME type of the resource.
         #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+    },
+    /// Progress update for a long-running operation.
+    #[serde(rename = "progress")]
+    Progress {
+        /// Token identifying the operation.
+        #[serde(rename = "progressToken")]
+        progress_token: String,
+        /// Current progress value.
+        progress: f64,
+        /// Optional total for computing a percentage.
+        total: Option<f64>,
     },
 }
 
@@ -401,6 +419,375 @@ impl InitializeResponse {
             instructions,
         }
     }
+}
+
+/// A typed tool schema (`tools/list` entry with a structured input schema).
+///
+/// The raw-`Value` [`Tool`] suits arbitrary tools; `ToolSchema` is the typed
+/// variant for servers that describe inputs with [`JsonSchema`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSchema {
+    /// Tool name identifier.
+    pub name: String,
+    /// Human-readable tool description.
+    pub description: String,
+    /// JSON Schema for the tool's input parameters.
+    #[serde(rename = "inputSchema")]
+    pub input_schema: JsonSchema,
+    /// Optional behavioral annotations (MCP 2025-11-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+impl ToolSchema {
+    /// Create a tool schema without annotations.
+    #[must_use]
+    pub fn without_annotations(
+        name: String,
+        description: String,
+        input_schema: JsonSchema,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            input_schema,
+            annotations: None,
+        }
+    }
+
+    /// Create a tool schema with behavioral annotations (MCP 2025-11-25).
+    #[must_use]
+    pub fn with_annotations(
+        name: String,
+        description: String,
+        input_schema: JsonSchema,
+        annotations: ToolAnnotations,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            input_schema,
+            annotations: Some(annotations),
+        }
+    }
+}
+
+/// A (typed) JSON Schema definition for tool inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonSchema {
+    /// Schema type (e.g. `"object"`, `"string"`).
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Property definitions for object schemas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<HashMap<String, PropertySchema>>,
+    /// Names of required properties.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+}
+
+/// A JSON Schema property definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PropertySchema {
+    /// Property type (e.g. `"string"`, `"number"`, `"boolean"`).
+    #[serde(rename = "type")]
+    pub property_type: String,
+    /// Human-readable property description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Item schema for array-type properties (JSON Schema `items`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<Self>>,
+    /// Nested property definitions for object-type properties.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<HashMap<String, Self>>,
+    /// Required fields for object-type properties.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+}
+
+/// Notification for progress on a long-running operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressNotification {
+    /// JSON-RPC version (`"2.0"`).
+    pub jsonrpc: String,
+    /// Method name (`notifications/progress`).
+    pub method: String,
+    /// Progress parameters.
+    pub params: ProgressParams,
+}
+
+/// Parameters for a progress notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressParams {
+    /// Token identifying the operation being tracked.
+    #[serde(rename = "progressToken")]
+    pub progress_token: String,
+    /// Current progress value.
+    pub progress: f64,
+    /// Optional total for percentage calculation.
+    pub total: Option<f64>,
+    /// Optional human-readable progress message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ProgressNotification {
+    /// Create a progress notification.
+    #[must_use]
+    pub fn new(
+        progress_token: String,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: METHOD_PROGRESS.to_owned(),
+            params: ProgressParams {
+                progress_token,
+                progress,
+                total,
+                message,
+            },
+        }
+    }
+
+    /// Create a cancellation notification.
+    #[must_use]
+    pub fn cancelled(progress_token: String, message: Option<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: METHOD_CANCELLED.to_owned(),
+            params: ProgressParams {
+                progress_token,
+                progress: 0.0,
+                total: None,
+                message,
+            },
+        }
+    }
+}
+
+/// Notification that an OAuth flow completed, for MCP clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCompletedNotification {
+    /// JSON-RPC version (`"2.0"`).
+    pub jsonrpc: String,
+    /// Method name (`notifications/oauth_completed`).
+    pub method: String,
+    /// OAuth completion parameters.
+    pub params: OAuthCompletedParams,
+}
+
+/// Parameters for an OAuth completion notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCompletedParams {
+    /// Provider name (e.g. `"strava"`).
+    pub provider: String,
+    /// Whether the flow completed successfully.
+    pub success: bool,
+    /// Human-readable status message.
+    pub message: String,
+    /// User id when authentication succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+impl OAuthCompletedNotification {
+    /// Create an OAuth completion notification.
+    #[must_use]
+    pub fn new(provider: String, success: bool, message: String, user_id: Option<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: METHOD_OAUTH_COMPLETED.to_owned(),
+            params: OAuthCompletedParams {
+                provider,
+                success,
+                message,
+                user_id,
+            },
+        }
+    }
+}
+
+/// Request to create a message via the client's LLM (MCP sampling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMessageRequest {
+    /// Messages to send to the LLM.
+    pub messages: Vec<PromptMessage>,
+    /// Optional model preferences.
+    #[serde(rename = "modelPreferences", skip_serializing_if = "Option::is_none")]
+    pub model_preferences: Option<ModelPreferences>,
+    /// Optional system prompt.
+    #[serde(rename = "systemPrompt", skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Whether to include context from MCP servers.
+    #[serde(rename = "includeContext", skip_serializing_if = "Option::is_none")]
+    pub include_context: Option<String>,
+    /// Maximum tokens to generate.
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: i32,
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Stop sequences.
+    #[serde(rename = "stopSequences", skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Additional metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Result of a create-message (sampling) request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMessageResult {
+    /// Role of the message (usually `"assistant"`).
+    pub role: String,
+    /// Generated message content.
+    pub content: MessageContent,
+    /// Model that was used.
+    pub model: String,
+    /// Stop reason for completion.
+    #[serde(rename = "stopReason", skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+/// Message content wrapper for sampling results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageContent {
+    /// Content type (usually `"text"`).
+    #[serde(rename = "type")]
+    pub content_type: String,
+    /// Text content.
+    pub text: String,
+}
+
+/// Model preferences for sampling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelPreferences {
+    /// Model hints in preference order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<ModelHint>>,
+    /// Cost priority (0.0–1.0; 1.0 prefers cheaper models).
+    #[serde(rename = "costPriority", skip_serializing_if = "Option::is_none")]
+    pub cost_priority: Option<f64>,
+    /// Speed priority (0.0–1.0; 1.0 prefers faster models).
+    #[serde(rename = "speedPriority", skip_serializing_if = "Option::is_none")]
+    pub speed_priority: Option<f64>,
+    /// Intelligence priority (0.0–1.0; 1.0 prefers more capable models).
+    #[serde(
+        rename = "intelligencePriority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub intelligence_priority: Option<f64>,
+}
+
+/// A hint for model selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelHint {
+    /// Model name (e.g. `"claude-3-5-sonnet"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A prompt message for the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptMessage {
+    /// Role of the sender.
+    pub role: String,
+    /// Message content.
+    pub content: Content,
+}
+
+impl PromptMessage {
+    /// Create a user message.
+    #[must_use]
+    pub fn user(content: Content) -> Self {
+        Self {
+            role: "user".to_owned(),
+            content,
+        }
+    }
+
+    /// Create an assistant message.
+    #[must_use]
+    pub fn assistant(content: Content) -> Self {
+        Self {
+            role: "assistant".to_owned(),
+            content,
+        }
+    }
+}
+
+/// Request for completion (auto-complete) suggestions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteRequest {
+    /// Reference to the item being completed.
+    #[serde(rename = "ref")]
+    pub ref_: CompletionReference,
+    /// The argument currently being completed.
+    pub argument: ArgumentValue,
+}
+
+/// A reference to the completion context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionReference {
+    /// Type of reference.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Name of the tool/resource/prompt.
+    pub name: String,
+}
+
+/// The argument value being completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArgumentValue {
+    /// Name of the argument.
+    pub name: String,
+    /// Current value being typed.
+    pub value: String,
+}
+
+/// Result of a completion request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteResult {
+    /// Completion suggestions.
+    pub completion: Completion,
+}
+
+impl Default for CompleteResult {
+    fn default() -> Self {
+        Self {
+            completion: Completion {
+                values: vec![],
+                total: Some(0),
+                has_more: Some(false),
+            },
+        }
+    }
+}
+
+/// A list of completion suggestions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Completion {
+    /// Suggested completion values.
+    pub values: Vec<String>,
+    /// Total number of possible completions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    /// Whether more completions are available.
+    #[serde(rename = "hasMore", skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+}
+
+/// A root directory entry (MCP roots).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Root {
+    /// URI of the root directory.
+    pub uri: String,
+    /// Human-readable name.
+    pub name: String,
 }
 
 #[cfg(test)]
