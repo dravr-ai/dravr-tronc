@@ -32,7 +32,7 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 /// Returns a `Router` that can be merged into a larger application router
 /// or served standalone. The router is parameterized over the MCP server's
 /// state type.
-pub fn mcp_router<S: Send + Sync + 'static>(server: Arc<McpServer<S>>) -> Router {
+pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp_post::<S>))
         .with_state(server)
@@ -41,7 +41,7 @@ pub fn mcp_router<S: Send + Sync + 'static>(server: Arc<McpServer<S>>) -> Router
 /// Start a standalone HTTP server serving only the `/mcp` endpoint
 ///
 /// Binds to the given host and port, serves until shutdown.
-pub async fn serve<S: Send + Sync + 'static>(
+pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     host: &str,
     port: u16,
@@ -71,7 +71,7 @@ pub async fn serve<S: Send + Sync + 'static>(
 /// Enforces the `Origin` allowlist (403), authenticates via the server's hook
 /// (401 + `WWW-Authenticate` on rejection, per RFC 9728), then dispatches under
 /// the resolved per-call context and renders the response as JSON or SSE.
-pub async fn handle_mcp_post<S: Send + Sync + 'static>(
+pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     headers: HeaderMap,
     body: String,
@@ -185,7 +185,6 @@ mod tests {
     use http::Request;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     struct TestState;
@@ -205,7 +204,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _state: &Arc<RwLock<TestState>>,
+            _state: &Arc<TestState>,
             _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
@@ -216,7 +215,7 @@ mod tests {
     fn make_app() -> Router {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(HelloTool));
-        let state = Arc::new(RwLock::new(TestState));
+        let state = Arc::new(TestState);
         let server = Arc::new(McpServer::new("test", "0.1.0", registry, state));
         mcp_router(server)
     }
@@ -240,7 +239,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _state: &Arc<RwLock<TestState>>,
+            _state: &Arc<TestState>,
             _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
@@ -257,7 +256,7 @@ mod tests {
         async fn authenticate(
             &self,
             request: &JsonRpcRequest,
-            _state: &Arc<RwLock<TestState>>,
+            _state: &Arc<TestState>,
         ) -> Result<ToolContext, AuthError> {
             match request.auth_token.as_deref() {
                 Some("admin") => Ok(ToolContext::new().with_user("u1").as_admin(true)),
@@ -273,7 +272,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(HelloTool));
         registry.register(Box::new(AdminTool));
-        let state = Arc::new(RwLock::new(TestState));
+        let state = Arc::new(TestState);
         let server = Arc::new(
             McpServer::new("test", "0.1.0", registry, state)
                 .with_auth_hook(Arc::new(TestAuthHook))

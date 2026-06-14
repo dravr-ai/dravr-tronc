@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::error::{
@@ -36,13 +35,16 @@ fn default_supported_versions() -> Vec<String> {
 
 /// MCP server that dispatches JSON-RPC requests to the appropriate handler
 ///
-/// Generic over `S` — the project-specific server state type.
+/// Generic over `S` — the project-specific server state type, shared as
+/// `Arc<S>`. `S` is `?Sized`, so a host may parameterize it with a resource
+/// façade trait object (`dyn HostRuntime`); a host needing interior mutability
+/// parameterizes `S` with it (e.g. `RwLock<Inner>`).
 /// Owns the shared state and tool registry. Transport layers feed parsed
 /// requests into `handle_request` and send the returned responses.
-pub struct McpServer<S: Send + Sync> {
+pub struct McpServer<S: Send + Sync + ?Sized> {
     name: String,
     version: String,
-    state: Arc<RwLock<S>>,
+    state: Arc<S>,
     tools: ToolRegistry<S>,
     capabilities: ServerCapabilities,
     instructions: Option<String>,
@@ -51,7 +53,7 @@ pub struct McpServer<S: Send + Sync> {
     allowed_origins: Vec<String>,
 }
 
-impl<S: Send + Sync + 'static> McpServer<S> {
+impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Create a server with the given name, version, tool registry, and shared state
     ///
     /// Defaults to advertising tool support only, no instructions, and the
@@ -61,7 +63,7 @@ impl<S: Send + Sync + 'static> McpServer<S> {
         name: impl Into<String>,
         version: impl Into<String>,
         tools: ToolRegistry<S>,
-        state: Arc<RwLock<S>>,
+        state: Arc<S>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -432,7 +434,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _state: &Arc<RwLock<TestState>>,
+            _state: &Arc<TestState>,
             _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
@@ -443,7 +445,7 @@ mod tests {
     fn make_server() -> McpServer<TestState> {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(PingTool));
-        let state = Arc::new(RwLock::new(TestState));
+        let state = Arc::new(TestState);
         McpServer::new("test-server", "0.1.0", registry, state)
     }
 

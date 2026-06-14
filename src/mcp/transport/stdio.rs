@@ -20,7 +20,7 @@ use crate::mcp::server::McpServer;
 /// (configure tracing accordingly) to avoid polluting the protocol channel.
 ///
 /// Blocks until stdin is closed or an I/O error occurs.
-pub async fn run<S: Send + Sync + 'static>(
+pub async fn run<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stdin = BufReader::new(io::stdin());

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bitflags::bitflags;
 use serde_json::Value;
-use tokio::sync::RwLock;
 
 use crate::mcp::schema::{Tool, ToolResponse};
 
@@ -104,10 +103,14 @@ impl ToolContext {
 
 /// Trait implemented by each MCP tool exposed by a server
 ///
-/// Generic over `S` — the project-specific server state type.
-/// Each project defines its own `ServerState` and implements tools against it.
+/// Generic over `S` — the project-specific server state type, shared as
+/// `Arc<S>`. `S` is `?Sized`, so a host may parameterize it with an unsized
+/// trait object (e.g. a resource façade `dyn HostRuntime`) rather than a
+/// concrete struct. The shared state is handed to `execute` immutably; a host
+/// that needs interior mutability parameterizes `S` with it (e.g.
+/// `S = RwLock<Inner>`, yielding `Arc<RwLock<Inner>>`).
 #[async_trait]
-pub trait McpTool<S: Send + Sync>: Send + Sync {
+pub trait McpTool<S: Send + Sync + ?Sized>: Send + Sync {
     /// Return the tool's MCP definition (name, description, input schema)
     fn definition(&self) -> Tool;
 
@@ -120,30 +123,25 @@ pub trait McpTool<S: Send + Sync>: Send + Sync {
     }
 
     /// Execute the tool against the shared server state and per-call context
-    async fn execute(
-        &self,
-        state: &Arc<RwLock<S>>,
-        ctx: &ToolContext,
-        arguments: Value,
-    ) -> ToolResponse;
+    async fn execute(&self, state: &Arc<S>, ctx: &ToolContext, arguments: Value) -> ToolResponse;
 }
 
 /// Registry mapping tool names to their handler implementations
 ///
 /// Tools are registered at server startup and looked up by name
 /// when `tools/call` requests arrive from the MCP client.
-pub struct ToolRegistry<S: Send + Sync> {
+pub struct ToolRegistry<S: Send + Sync + ?Sized> {
     tools: HashMap<String, Box<dyn McpTool<S>>>,
     categories: HashMap<String, Vec<String>>,
 }
 
-impl<S: Send + Sync> Default for ToolRegistry<S> {
+impl<S: Send + Sync + ?Sized> Default for ToolRegistry<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S: Send + Sync> ToolRegistry<S> {
+impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
     /// Create an empty registry
     pub fn new() -> Self {
         Self {
@@ -217,7 +215,7 @@ impl<S: Send + Sync> ToolRegistry<S> {
     pub async fn execute(
         &self,
         name: &str,
-        state: &Arc<RwLock<S>>,
+        state: &Arc<S>,
         ctx: &ToolContext,
         arguments: Value,
     ) -> ToolResponse {
@@ -266,7 +264,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _state: &Arc<RwLock<DummyState>>,
+            _state: &Arc<DummyState>,
             _ctx: &ToolContext,
             arguments: Value,
         ) -> ToolResponse {
@@ -293,12 +291,11 @@ mod tests {
 
         async fn execute(
             &self,
-            state: &Arc<RwLock<DummyState>>,
+            state: &Arc<DummyState>,
             _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
-            let guard = state.read().await;
-            ToolResponse::text(format!("counter: {}", guard.counter))
+            ToolResponse::text(format!("counter: {}", state.counter))
         }
     }
 
@@ -321,7 +318,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _state: &Arc<RwLock<DummyState>>,
+            _state: &Arc<DummyState>,
             _ctx: &ToolContext,
             _arguments: Value,
         ) -> ToolResponse {
@@ -329,8 +326,8 @@ mod tests {
         }
     }
 
-    fn make_state() -> Arc<RwLock<DummyState>> {
-        Arc::new(RwLock::new(DummyState { counter: 42 }))
+    fn make_state() -> Arc<DummyState> {
+        Arc::new(DummyState { counter: 42 })
     }
 
     #[test]

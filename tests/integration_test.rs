@@ -16,7 +16,6 @@ use dravr_tronc::server::health::HealthResponse;
 use http::Request;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 // ============================================================================
@@ -48,7 +47,7 @@ impl McpTool<AppState> for GreetTool {
 
     async fn execute(
         &self,
-        state: &Arc<RwLock<AppState>>,
+        state: &Arc<AppState>,
         _ctx: &ToolContext,
         arguments: Value,
     ) -> ToolResponse {
@@ -56,8 +55,7 @@ impl McpTool<AppState> for GreetTool {
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("stranger");
-        let guard = state.read().await;
-        ToolResponse::text(format!("{} {name}", guard.greeting))
+        ToolResponse::text(format!("{} {name}", state.greeting))
     }
 }
 
@@ -81,7 +79,7 @@ impl McpTool<AppState> for UppercaseTool {
 
     async fn execute(
         &self,
-        _state: &Arc<RwLock<AppState>>,
+        _state: &Arc<AppState>,
         _ctx: &ToolContext,
         arguments: Value,
     ) -> ToolResponse {
@@ -94,9 +92,9 @@ fn make_server() -> Arc<McpServer<AppState>> {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(GreetTool));
     registry.register(Box::new(UppercaseTool));
-    let state = Arc::new(RwLock::new(AppState {
+    let state = Arc::new(AppState {
         greeting: "Hello".to_owned(),
-    }));
+    });
     Arc::new(McpServer::new("integration-test", "0.0.1", registry, state))
 }
 
@@ -171,9 +169,9 @@ async fn full_mcp_handshake_sequence() {
 async fn tool_reads_shared_state() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(GreetTool));
-    let state = Arc::new(RwLock::new(AppState {
+    let state = Arc::new(AppState {
         greeting: "Bonjour".to_owned(),
-    }));
+    });
     let server = Arc::new(McpServer::new("test", "0.1", registry, state));
 
     let resp = server

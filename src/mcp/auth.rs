@@ -16,7 +16,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 
 use crate::mcp::protocol::JsonRpcRequest;
 use crate::mcp::tool::ToolContext;
@@ -47,11 +46,11 @@ pub enum AuthError {
 /// every request as the default (anonymous) context, which suits stdio or a
 /// trusted-network deployment.
 #[async_trait]
-pub trait AuthHook<S: Send + Sync>: Send + Sync {
+pub trait AuthHook<S: Send + Sync + ?Sized>: Send + Sync {
     /// Authenticate a request, yielding its per-call context or a rejection.
     async fn authenticate(
         &self,
         request: &JsonRpcRequest,
-        state: &Arc<RwLock<S>>,
+        state: &Arc<S>,
     ) -> Result<ToolContext, AuthError>;
 }
