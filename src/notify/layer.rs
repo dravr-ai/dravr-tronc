@@ -18,14 +18,14 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use super::provider::RoutingProvider;
+use super::provider::{AnalyticsProvider, RoutingProvider};
 use super::rule::RoutingRule;
 use super::state::{
     build_dedup_key, BatchBuffer, BatchBuffers, BatchedLine, DedupMap, SharedBatchBuffers,
     SpanFields,
 };
 use super::visit::NotifyVisitor;
-use crate::notifications::SlackClient;
+use crate::notifications::{PostHogClient, SlackClient};
 
 /// Tracing target the layer filters on. Events whose target differs are
 /// ignored — they're regular application logs, not notify-channel pings.
@@ -83,6 +83,10 @@ pub struct NotifyLayer<R: RoutingProvider> {
 
 struct LayerInner<R: RoutingProvider> {
     slack: Arc<SlackClient>,
+    /// Per-event `PostHog` capture policy. `None` = Slack-only layer.
+    analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
+    /// `PostHog` transport. Paired with `analytics_provider`; both must be set.
+    posthog: Option<Arc<PostHogClient>>,
     provider: Arc<R>,
     environment: String,
     default_rule: Option<RoutingRule>,
@@ -118,6 +122,8 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             environment,
             default_rule: None,
             flush_tick: DEFAULT_FLUSH_TICK,
+            analytics_provider: None,
+            posthog: None,
         }
     }
 
@@ -212,6 +218,23 @@ impl<R: RoutingProvider> NotifyLayer<R> {
         let blocks = single_line_blocks(event_name, line);
         self.inner.slack.post_message(channel, &blocks);
     }
+
+    /// Fan one notify event out to the `PostHog` analytics sink when both an
+    /// [`AnalyticsProvider`] and a [`PostHogClient`] are configured.
+    ///
+    /// Independent of the Slack routing rules: analytics captures every
+    /// catalogued event, so the sampling / dedup / env filtering that keeps
+    /// Slack quiet never suppresses a capture. The provider returns `None` to
+    /// skip an event — unknown, or consent withheld for a product event.
+    fn capture_analytics(&self, event_name: &str, fields: &HashMap<String, String>) {
+        let (Some(provider), Some(posthog)) = (&self.inner.analytics_provider, &self.inner.posthog)
+        else {
+            return;
+        };
+        if let Some(capture) = provider.capture_for(event_name, fields) {
+            posthog.capture(&capture.distinct_id, event_name, capture.properties);
+        }
+    }
 }
 
 /// Builder for [`NotifyLayer`].
@@ -221,6 +244,8 @@ pub struct NotifyLayerBuilder<R: RoutingProvider> {
     environment: String,
     default_rule: Option<RoutingRule>,
     flush_tick: Duration,
+    analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
+    posthog: Option<Arc<PostHogClient>>,
 }
 
 impl<R: RoutingProvider> NotifyLayerBuilder<R> {
@@ -239,10 +264,26 @@ impl<R: RoutingProvider> NotifyLayerBuilder<R> {
         self
     }
 
+    /// Attach a `PostHog` analytics sink. The `provider` resolves per-event
+    /// capture decisions (tier / consent / `distinct_id`) the layer itself
+    /// can't see; the `posthog` client is the transport. Without this, the
+    /// layer routes to Slack only.
+    pub fn with_analytics(
+        mut self,
+        provider: Arc<dyn AnalyticsProvider>,
+        posthog: Arc<PostHogClient>,
+    ) -> Self {
+        self.analytics_provider = Some(provider);
+        self.posthog = Some(posthog);
+        self
+    }
+
     /// Finalise the layer and spawn the background batch flusher.
     pub fn build(self) -> NotifyLayer<R> {
         let inner = Arc::new(LayerInner {
             slack: self.slack,
+            analytics_provider: self.analytics_provider,
+            posthog: self.posthog,
             provider: self.provider,
             environment: self.environment,
             default_rule: self.default_rule,
@@ -334,6 +375,7 @@ where
             merged.insert(k, v);
         }
 
+        self.capture_analytics(&event_name, &merged);
         self.dispatch(&event_name, &merged);
     }
 }
@@ -515,7 +557,7 @@ fn format_batch(event_name: &str, lines: &[BatchedLine]) -> String {
 mod tests {
     use super::*;
     use crate::notifications::SlackConfig;
-    use crate::notify::provider::StaticRoutingProvider;
+    use crate::notify::provider::{AnalyticsCapture, StaticRoutingProvider};
     use tokio::time::sleep;
 
     fn dummy_slack() -> Arc<SlackClient> {
@@ -531,6 +573,73 @@ mod tests {
         env: &str,
     ) -> NotifyLayer<StaticRoutingProvider> {
         NotifyLayer::new(dummy_slack(), Arc::new(provider), env.to_owned())
+    }
+
+    /// Test `AnalyticsProvider` that counts `capture_for` calls and optionally
+    /// returns a capture, so the layer's analytics fan-out can be asserted
+    /// without a live `PostHog` endpoint.
+    struct CountingAnalytics {
+        calls: Arc<AtomicU64>,
+        capture: bool,
+    }
+
+    impl AnalyticsProvider for CountingAnalytics {
+        fn capture_for(
+            &self,
+            _event: &str,
+            _fields: &HashMap<String, String>,
+        ) -> Option<AnalyticsCapture> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.capture.then(|| AnalyticsCapture {
+                distinct_id: "u_test".to_owned(),
+                properties: serde_json::json!({ "channel": "web" }),
+            })
+        }
+    }
+
+    fn layer_with_analytics(
+        provider: Arc<CountingAnalytics>,
+    ) -> NotifyLayer<StaticRoutingProvider> {
+        // Unroutable host: the fire-and-forget capture send fails harmlessly.
+        let posthog = Arc::new(PostHogClient::with_host("phc_test", "http://127.0.0.1:1"));
+        NotifyLayer::builder(
+            dummy_slack(),
+            Arc::new(StaticRoutingProvider::new()),
+            "dev".into(),
+        )
+        .with_analytics(provider, posthog)
+        .build()
+    }
+
+    #[tokio::test]
+    async fn capture_analytics_is_noop_without_provider() {
+        // Slack-only layer: no analytics configured → no-op, no panic.
+        let layer = build_layer(StaticRoutingProvider::new(), "dev");
+        layer.capture_analytics("user.login", &HashMap::new());
+    }
+
+    #[tokio::test]
+    async fn capture_analytics_invokes_provider_when_configured() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let layer = layer_with_analytics(Arc::new(CountingAnalytics {
+            calls: Arc::clone(&calls),
+            capture: true,
+        }));
+        layer.capture_analytics("user.login", &HashMap::new());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_analytics_skips_when_provider_returns_none() {
+        // Provider declines (e.g. consent withheld): still consulted, but no
+        // capture is forwarded — the path must not panic.
+        let calls = Arc::new(AtomicU64::new(0));
+        let layer = layer_with_analytics(Arc::new(CountingAnalytics {
+            calls: Arc::clone(&calls),
+            capture: false,
+        }));
+        layer.capture_analytics("user.login", &HashMap::new());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

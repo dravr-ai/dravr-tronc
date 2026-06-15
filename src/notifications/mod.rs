@@ -10,6 +10,7 @@
 //!
 //! - [`SlackClient`]: Post and update Slack messages, verify request signatures
 //! - [`EmailClient`]: Send email alerts via SMTP
+//! - [`PostHogClient`]: Fire-and-forget `PostHog` capture-API analytics sink
 //! - [`ErrorNotificationLayer`]: A `tracing::Layer` that intercepts ERROR-level
 //!   events and dispatches them to configured channels with batching,
 //!   deduplication, and rate limiting.
@@ -17,9 +18,11 @@
 mod config;
 mod email;
 mod error_layer;
+mod posthog;
 mod slack;
 
 pub use config::{EmailConfig, NotificationConfig, SlackConfig};
 pub use email::EmailClient;
 pub use error_layer::ErrorNotificationLayer;
+pub use posthog::PostHogClient;
 pub use slack::SlackClient;
