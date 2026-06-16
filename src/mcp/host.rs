@@ -1,5 +1,5 @@
 // ABOUTME: Host-integration seams letting a host extend the generic MCP engine
-// ABOUTME: tool-list filtering, non-tool method handling, and tool-call pre/post hooks
+// ABOUTME: full tool dispatch (list + call) and non-tool method handling
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -7,18 +7,20 @@
 //! Host-integration seams for the MCP engine.
 //!
 //! The generic [`crate::mcp::server::McpServer`] natively serves `initialize`,
-//! `server/discover`, `ping`, `tools/list`, and `tools/call`. A host with richer
-//! needs installs these optional seams to extend that behaviour without the
-//! engine knowing anything host-specific:
+//! `server/discover`, `ping`, `tools/list`, and `tools/call` from its own
+//! [`crate::mcp::tool::ToolRegistry`]. A host with richer needs installs these
+//! optional seams to take over without the engine knowing anything
+//! host-specific:
 //!
-//! - [`ToolListProvider`] — replace the `tools/list` result with a per-caller
-//!   view (e.g. tenant-scoped or feature-flagged tool sets).
+//! - [`ToolDispatcher`] — own the entire tool surface. When installed it
+//!   replaces the built-in registry for both `tools/list` (e.g. per-tenant or
+//!   feature-flagged views) and `tools/call` (the host runs the whole call:
+//!   authorization beyond auth, quota, execution, usage, notifications).
 //! - [`MethodHandler`] — serve JSON-RPC methods the engine doesn't (e.g.
 //!   `resources/*`, `prompts/*`, `sampling/*`, `completion/*`, `roots/*`).
-//! - [`ToolCallHooks`] — run host logic around every `tools/call` (e.g. quota
-//!   gating before, usage recording / notification appending after).
 //!
-//! Each seam is optional; a server with none behaves exactly as before.
+//! Each seam is optional; a server with none behaves exactly as a registry-only
+//! server. See also [`crate::mcp::auth::AuthHook`] for the authentication seam.
 
 use std::sync::Arc;
 
@@ -29,16 +31,33 @@ use crate::mcp::protocol::JsonRpcResponse;
 use crate::mcp::schema::{Tool, ToolResponse};
 use crate::mcp::tool::ToolContext;
 
-/// Host-supplied `tools/list` view.
+/// Host-owned tool surface — replaces the built-in registry for `tools/list`
+/// and `tools/call` when installed.
 ///
-/// When installed, the engine asks the provider for the tool definitions
-/// visible to a caller instead of listing the whole registry. This lets a host
-/// scope the advertised tools per [`ToolContext`] — for example tenant-enabled
-/// subsets or feature-flagged tools the registry alone can't express.
+/// A host whose tool listing or execution needs more than the generic registry
+/// offers (per-caller views, quota gating, usage accounting, notification
+/// fan-out) implements this and installs it via
+/// [`crate::mcp::server::McpServer::with_tool_dispatcher`]. The engine then
+/// routes both tool methods here instead of to its own
+/// [`crate::mcp::tool::ToolRegistry`], keeping the host's tool catalog the
+/// single source of truth.
 #[async_trait]
-pub trait ToolListProvider<S: Send + Sync + ?Sized>: Send + Sync {
+pub trait ToolDispatcher<S: Send + Sync + ?Sized>: Send + Sync {
     /// Return the tool definitions to advertise for this caller.
     async fn list_tools(&self, state: &Arc<S>, ctx: &ToolContext) -> Vec<Tool>;
+
+    /// Execute a tool call end-to-end and return its response. The host owns
+    /// everything inside: authorization beyond authentication, quota checks,
+    /// the actual execution, usage recording, and response augmentation. An
+    /// unknown tool or a refusal is reported as an error [`ToolResponse`]
+    /// (`is_error = true`), not a transport error.
+    async fn call_tool(
+        &self,
+        name: &str,
+        state: &Arc<S>,
+        ctx: &ToolContext,
+        arguments: Value,
+    ) -> ToolResponse;
 }
 
 /// Host-supplied handler for methods the engine doesn't natively serve.
@@ -59,37 +78,4 @@ pub trait MethodHandler<S: Send + Sync + ?Sized>: Send + Sync {
         state: &Arc<S>,
         ctx: &ToolContext,
     ) -> Option<JsonRpcResponse>;
-}
-
-/// Host hooks that run around every `tools/call`.
-///
-/// [`Self::before`] runs prior to executing the named tool and may short-circuit
-/// the call (e.g. when a quota is exceeded) by returning `Err(response)` — that
-/// [`ToolResponse`] is returned to the caller and the tool never runs.
-/// [`Self::after`] runs once the tool produces a response and may augment it
-/// (e.g. record usage, append pending notifications) before it's sent.
-#[async_trait]
-pub trait ToolCallHooks<S: Send + Sync + ?Sized>: Send + Sync {
-    /// Run before the tool executes. `Ok(())` proceeds; `Err(response)`
-    /// short-circuits the call with the given response.
-    ///
-    /// # Errors
-    /// Returns the short-circuit [`ToolResponse`] when the call must not proceed.
-    async fn before(
-        &self,
-        name: &str,
-        state: &Arc<S>,
-        ctx: &ToolContext,
-        arguments: &Value,
-    ) -> Result<(), ToolResponse>;
-
-    /// Run after the tool produces `response`; returns the response to send,
-    /// optionally augmented.
-    async fn after(
-        &self,
-        name: &str,
-        state: &Arc<S>,
-        ctx: &ToolContext,
-        response: ToolResponse,
-    ) -> ToolResponse;
 }

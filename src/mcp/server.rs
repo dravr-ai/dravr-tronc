@@ -15,7 +15,7 @@ use crate::error::{
     UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
-use crate::mcp::host::{MethodHandler, ToolCallHooks, ToolListProvider};
+use crate::mcp::host::{MethodHandler, ToolDispatcher};
 use crate::mcp::modern::{
     DiscoverResult, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_2026_07_28,
 };
@@ -52,9 +52,8 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     supported_versions: Vec<String>,
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
-    tool_list_provider: Option<Arc<dyn ToolListProvider<S>>>,
+    tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
-    tool_call_hooks: Option<Arc<dyn ToolCallHooks<S>>>,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -79,9 +78,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             supported_versions: default_supported_versions(),
             auth_hook: None,
             allowed_origins: Vec::new(),
-            tool_list_provider: None,
+            tool_dispatcher: None,
             method_handler: None,
-            tool_call_hooks: None,
         }
     }
 
@@ -130,11 +128,12 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         &self.allowed_origins
     }
 
-    /// Install a host [`ToolListProvider`] that supplies the `tools/list` view
-    /// per caller. Without one, `tools/list` returns the whole registry.
+    /// Install a host [`ToolDispatcher`] that owns `tools/list` and `tools/call`
+    /// (per-caller views, quota, execution, usage). When installed it replaces
+    /// the built-in registry for both tool methods.
     #[must_use]
-    pub fn with_tool_list_provider(mut self, provider: Arc<dyn ToolListProvider<S>>) -> Self {
-        self.tool_list_provider = Some(provider);
+    pub fn with_tool_dispatcher(mut self, dispatcher: Arc<dyn ToolDispatcher<S>>) -> Self {
+        self.tool_dispatcher = Some(dispatcher);
         self
     }
 
@@ -144,14 +143,6 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     #[must_use]
     pub fn with_method_handler(mut self, handler: Arc<dyn MethodHandler<S>>) -> Self {
         self.method_handler = Some(handler);
-        self
-    }
-
-    /// Install host [`ToolCallHooks`] that run before/after every `tools/call`
-    /// (e.g. quota gating, usage recording, notification appending).
-    #[must_use]
-    pub fn with_tool_call_hooks(mut self, hooks: Arc<dyn ToolCallHooks<S>>) -> Self {
-        self.tool_call_hooks = Some(hooks);
         self
     }
 
@@ -400,8 +391,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Uses the host [`ToolListProvider`] when installed (e.g. for tenant
     /// scoping); otherwise lists every registered tool.
     async fn handle_tools_list(&self, id: Option<Value>, ctx: &ToolContext) -> JsonRpcResponse {
-        let definitions = match &self.tool_list_provider {
-            Some(provider) => provider.list_tools(&self.state, ctx).await,
+        let definitions = match &self.tool_dispatcher {
+            Some(dispatcher) => dispatcher.list_tools(&self.state, ctx).await,
             None => self.tools.list_definitions(),
         };
         match serde_json::to_value(definitions) {
@@ -447,23 +438,19 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-        // Host before-hook: may short-circuit the call (e.g. quota exceeded).
-        if let Some(hooks) = &self.tool_call_hooks {
-            if let Err(short_circuit) = hooks.before(&call.name, &self.state, ctx, &arguments).await
-            {
-                return Self::tool_response_result(id, &short_circuit);
+        // A host dispatcher owns the whole call (quota, exec, usage); otherwise
+        // execute against the built-in registry.
+        let result = match &self.tool_dispatcher {
+            Some(dispatcher) => {
+                dispatcher
+                    .call_tool(&call.name, &self.state, ctx, arguments)
+                    .await
             }
-        }
-
-        let result = self
-            .tools
-            .execute(&call.name, &self.state, ctx, arguments)
-            .await;
-
-        // Host after-hook: may augment the response (usage, notifications).
-        let result = match &self.tool_call_hooks {
-            Some(hooks) => hooks.after(&call.name, &self.state, ctx, result).await,
-            None => result,
+            None => {
+                self.tools
+                    .execute(&call.name, &self.state, ctx, arguments)
+                    .await
+            }
         };
 
         Self::tool_response_result(id, &result)
@@ -793,14 +780,14 @@ mod tests {
 
     // ---- Host-integration seams (host.rs) ----
 
-    use crate::mcp::host::{MethodHandler, ToolCallHooks, ToolListProvider};
+    use crate::mcp::host::{MethodHandler, ToolDispatcher};
 
-    /// Tenant-aware `tools/list` view: advertises a scoped tool only when the
-    /// caller carries a tenant, exercising the per-`ToolContext` provider path.
-    struct ScopedListProvider;
+    /// Host dispatcher that owns both tool methods: a tenant-scoped `tools/list`
+    /// view and a `tools/call` that routes entirely host-side (no registry).
+    struct ScopedDispatcher;
 
     #[async_trait::async_trait]
-    impl ToolListProvider<TestState> for ScopedListProvider {
+    impl ToolDispatcher<TestState> for ScopedDispatcher {
         async fn list_tools(&self, _state: &Arc<TestState>, ctx: &ToolContext) -> Vec<Tool> {
             if ctx.tenant_id.is_some() {
                 vec![Tool {
@@ -811,6 +798,19 @@ mod tests {
                 }]
             } else {
                 Vec::new()
+            }
+        }
+
+        async fn call_tool(
+            &self,
+            name: &str,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            match name {
+                "scoped_tool" => ToolResponse::text("dispatched".to_owned()),
+                other => ToolResponse::error(format!("quota exceeded for {other}")),
             }
         }
     }
@@ -836,51 +836,20 @@ mod tests {
         }
     }
 
-    /// Short-circuits `ping_tool` before execution; augments any other tool's
-    /// response after execution.
-    struct GatingHooks;
-
-    #[async_trait::async_trait]
-    impl ToolCallHooks<TestState> for GatingHooks {
-        async fn before(
-            &self,
-            name: &str,
-            _state: &Arc<TestState>,
-            _ctx: &ToolContext,
-            _arguments: &Value,
-        ) -> Result<(), ToolResponse> {
-            if name == "ping_tool" {
-                Err(ToolResponse::error("quota exceeded".to_owned()))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn after(
-            &self,
-            _name: &str,
-            _state: &Arc<TestState>,
-            _ctx: &ToolContext,
-            _response: ToolResponse,
-        ) -> ToolResponse {
-            ToolResponse::text("augmented".to_owned())
-        }
-    }
-
     #[tokio::test]
-    async fn tool_list_provider_overrides_registry_listing() {
-        let server = make_server().with_tool_list_provider(Arc::new(ScopedListProvider));
-        // No tenant in the default context → provider returns an empty list.
+    async fn dispatcher_list_empty_without_tenant() {
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
+        // No tenant in the default context → dispatcher returns an empty list.
         let raw = r#"{"jsonrpc": "2.0", "id": 30, "method": "tools/list"}"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         let result = resp.result.expect("result"); // Safe: test assertion
         let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
-        assert!(tools.is_empty(), "no tenant → provider yields no tools");
+        assert!(tools.is_empty(), "no tenant → dispatcher yields no tools");
     }
 
     #[tokio::test]
-    async fn tool_list_provider_sees_context() {
-        let server = make_server().with_tool_list_provider(Arc::new(ScopedListProvider));
+    async fn dispatcher_list_scoped_with_tenant() {
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
         let request: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc": "2.0", "id": 31, "method": "tools/list"}"#)
                 .expect("request"); // Safe: test assertion
@@ -916,11 +885,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_call_before_hook_short_circuits() {
-        let server = make_server().with_tool_call_hooks(Arc::new(GatingHooks));
+    async fn dispatcher_call_routes_host_side() {
+        // With a dispatcher installed, tools/call bypasses the registry entirely
+        // and runs the host's call_tool (here: echo for the known tool).
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
         let raw = r#"{
             "jsonrpc": "2.0",
             "id": 34,
+            "method": "tools/call",
+            "params": { "name": "scoped_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["content"][0]["text"], "dispatched");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_call_reports_host_error() {
+        // The dispatcher decides errors host-side (e.g. quota); even the registry's
+        // own `ping_tool` is invisible to the dispatcher path.
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 35,
             "method": "tools/call",
             "params": { "name": "ping_tool", "arguments": {} }
         }"#;
@@ -931,43 +918,5 @@ mod tests {
             .as_str()
             .expect("text") // Safe: test assertion
             .contains("quota exceeded"));
-    }
-
-    #[tokio::test]
-    async fn tool_call_after_hook_augments_response() {
-        // A tool that isn't gated by `before` so it reaches the after-hook.
-        struct EchoTool;
-        #[async_trait::async_trait]
-        impl McpTool<TestState> for EchoTool {
-            fn definition(&self) -> Tool {
-                Tool {
-                    name: "echo_tool".to_owned(),
-                    description: "echo".to_owned(),
-                    input_schema: json!({"type": "object"}),
-                    annotations: None,
-                }
-            }
-            async fn execute(
-                &self,
-                _state: &Arc<TestState>,
-                _ctx: &ToolContext,
-                _arguments: Value,
-            ) -> ToolResponse {
-                ToolResponse::text("original".to_owned())
-            }
-        }
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(EchoTool));
-        let server = McpServer::new("test-server", "0.1.0", registry, Arc::new(TestState))
-            .with_tool_call_hooks(Arc::new(GatingHooks));
-        let raw = r#"{
-            "jsonrpc": "2.0",
-            "id": 35,
-            "method": "tools/call",
-            "params": { "name": "echo_tool", "arguments": {} }
-        }"#;
-        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
-        let result = resp.result.expect("result"); // Safe: test assertion
-        assert_eq!(result["content"][0]["text"], "augmented");
     }
 }
