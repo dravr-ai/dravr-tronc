@@ -15,12 +15,13 @@ use crate::error::{
     UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
+use crate::mcp::host::{MethodHandler, ToolCallHooks, ToolListProvider};
 use crate::mcp::modern::{
     DiscoverResult, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_2026_07_28,
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{
-    InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall,
+    InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
 };
 use crate::mcp::tool::{ToolContext, ToolRegistry};
 
@@ -51,6 +52,9 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     supported_versions: Vec<String>,
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
+    tool_list_provider: Option<Arc<dyn ToolListProvider<S>>>,
+    method_handler: Option<Arc<dyn MethodHandler<S>>>,
+    tool_call_hooks: Option<Arc<dyn ToolCallHooks<S>>>,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -75,6 +79,9 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             supported_versions: default_supported_versions(),
             auth_hook: None,
             allowed_origins: Vec::new(),
+            tool_list_provider: None,
+            method_handler: None,
+            tool_call_hooks: None,
         }
     }
 
@@ -121,6 +128,31 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// The `Origin` allowlist the HTTP transport enforces.
     pub fn allowed_origins(&self) -> &[String] {
         &self.allowed_origins
+    }
+
+    /// Install a host [`ToolListProvider`] that supplies the `tools/list` view
+    /// per caller. Without one, `tools/list` returns the whole registry.
+    #[must_use]
+    pub fn with_tool_list_provider(mut self, provider: Arc<dyn ToolListProvider<S>>) -> Self {
+        self.tool_list_provider = Some(provider);
+        self
+    }
+
+    /// Install a host [`MethodHandler`] for methods the engine doesn't natively
+    /// serve (`resources/*`, `prompts/*`, `sampling/*`, …). Unknown methods are
+    /// offered to it before falling through to method-not-found.
+    #[must_use]
+    pub fn with_method_handler(mut self, handler: Arc<dyn MethodHandler<S>>) -> Self {
+        self.method_handler = Some(handler);
+        self
+    }
+
+    /// Install host [`ToolCallHooks`] that run before/after every `tools/call`
+    /// (e.g. quota gating, usage recording, notification appending).
+    #[must_use]
+    pub fn with_tool_call_hooks(mut self, hooks: Arc<dyn ToolCallHooks<S>>) -> Self {
+        self.tool_call_hooks = Some(hooks);
+        self
     }
 
     /// Authenticate a request via the configured [`AuthHook`], or yield the
@@ -205,20 +237,16 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     async fn process_legacy(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request.id, request.params.as_ref()),
-            "tools/list" => self.handle_tools_list(request.id),
+            "tools/list" => self.handle_tools_list(request.id, ctx).await,
             "tools/call" => {
                 self.handle_tools_call(request.id, request.params, ctx)
                     .await
             }
             "server/discover" => self.handle_server_discover(request.id),
             "ping" => JsonRpcResponse::success(request.id, Value::Object(serde_json::Map::new())),
-            method => {
-                debug!(method, "Unknown MCP method");
-                JsonRpcResponse::error(
-                    request.id,
-                    METHOD_NOT_FOUND,
-                    format!("Method not found: {method}"),
-                )
+            other => {
+                self.handle_unknown_method(other, request.id, request.params, ctx)
+                    .await
             }
         }
     }
@@ -242,18 +270,14 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
         let response = match request.method.as_str() {
             "server/discover" => self.handle_server_discover(request.id),
-            "tools/list" => self.handle_tools_list(request.id),
+            "tools/list" => self.handle_tools_list(request.id, ctx).await,
             "tools/call" => {
                 self.handle_tools_call(request.id, request.params, ctx)
                     .await
             }
-            method => {
-                debug!(method, "Unknown modern MCP method");
-                JsonRpcResponse::error(
-                    request.id,
-                    METHOD_NOT_FOUND,
-                    format!("Method not found: {method}"),
-                )
+            other => {
+                self.handle_unknown_method(other, request.id, request.params, ctx)
+                    .await
             }
         };
 
@@ -349,9 +373,38 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
     }
 
-    /// Handle `tools/list` — return all registered tool definitions
-    fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
-        match serde_json::to_value(self.tools.list_definitions()) {
+    /// Offer a method the engine doesn't natively serve to the host
+    /// [`MethodHandler`], falling through to method-not-found when there is no
+    /// handler or it declines the method.
+    async fn handle_unknown_method(
+        &self,
+        method: &str,
+        id: Option<Value>,
+        params: Option<Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
+        if let Some(handler) = &self.method_handler {
+            if let Some(response) = handler
+                .handle(method, id.clone(), params, &self.state, ctx)
+                .await
+            {
+                return response;
+            }
+        }
+        debug!(method, "Unknown MCP method");
+        JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Method not found: {method}"))
+    }
+
+    /// Handle `tools/list` — return the tool definitions visible to the caller.
+    ///
+    /// Uses the host [`ToolListProvider`] when installed (e.g. for tenant
+    /// scoping); otherwise lists every registered tool.
+    async fn handle_tools_list(&self, id: Option<Value>, ctx: &ToolContext) -> JsonRpcResponse {
+        let definitions = match &self.tool_list_provider {
+            Some(provider) => provider.list_tools(&self.state, ctx).await,
+            None => self.tools.list_definitions(),
+        };
+        match serde_json::to_value(definitions) {
             Ok(tools) => {
                 let mut result = serde_json::Map::new();
                 result.insert("tools".to_owned(), tools);
@@ -394,11 +447,31 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
+        // Host before-hook: may short-circuit the call (e.g. quota exceeded).
+        if let Some(hooks) = &self.tool_call_hooks {
+            if let Err(short_circuit) = hooks.before(&call.name, &self.state, ctx, &arguments).await
+            {
+                return Self::tool_response_result(id, &short_circuit);
+            }
+        }
+
         let result = self
             .tools
             .execute(&call.name, &self.state, ctx, arguments)
             .await;
 
+        // Host after-hook: may augment the response (usage, notifications).
+        let result = match &self.tool_call_hooks {
+            Some(hooks) => hooks.after(&call.name, &self.state, ctx, result).await,
+            None => result,
+        };
+
+        Self::tool_response_result(id, &result)
+    }
+
+    /// Serialize a [`ToolResponse`] into a `tools/call` success response, or an
+    /// internal error if serialization fails.
+    fn tool_response_result(id: Option<Value>, result: &ToolResponse) -> JsonRpcResponse {
         match serde_json::to_value(result) {
             Ok(val) => JsonRpcResponse::success(id, val),
             Err(e) => JsonRpcResponse::error(
@@ -716,5 +789,185 @@ mod tests {
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    // ---- Host-integration seams (host.rs) ----
+
+    use crate::mcp::host::{MethodHandler, ToolCallHooks, ToolListProvider};
+
+    /// Tenant-aware `tools/list` view: advertises a scoped tool only when the
+    /// caller carries a tenant, exercising the per-`ToolContext` provider path.
+    struct ScopedListProvider;
+
+    #[async_trait::async_trait]
+    impl ToolListProvider<TestState> for ScopedListProvider {
+        async fn list_tools(&self, _state: &Arc<TestState>, ctx: &ToolContext) -> Vec<Tool> {
+            if ctx.tenant_id.is_some() {
+                vec![Tool {
+                    name: "scoped_tool".to_owned(),
+                    description: "tenant-scoped".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    annotations: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Serves `resources/list` and declines everything else (returns `None`).
+    struct ResourcesMethodHandler;
+
+    #[async_trait::async_trait]
+    impl MethodHandler<TestState> for ResourcesMethodHandler {
+        async fn handle(
+            &self,
+            method: &str,
+            id: Option<Value>,
+            _params: Option<Value>,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+        ) -> Option<JsonRpcResponse> {
+            if method == "resources/list" {
+                Some(JsonRpcResponse::success(id, json!({ "resources": [] })))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Short-circuits `ping_tool` before execution; augments any other tool's
+    /// response after execution.
+    struct GatingHooks;
+
+    #[async_trait::async_trait]
+    impl ToolCallHooks<TestState> for GatingHooks {
+        async fn before(
+            &self,
+            name: &str,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _arguments: &Value,
+        ) -> Result<(), ToolResponse> {
+            if name == "ping_tool" {
+                Err(ToolResponse::error("quota exceeded".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn after(
+            &self,
+            _name: &str,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _response: ToolResponse,
+        ) -> ToolResponse {
+            ToolResponse::text("augmented".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_list_provider_overrides_registry_listing() {
+        let server = make_server().with_tool_list_provider(Arc::new(ScopedListProvider));
+        // No tenant in the default context → provider returns an empty list.
+        let raw = r#"{"jsonrpc": "2.0", "id": 30, "method": "tools/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
+        assert!(tools.is_empty(), "no tenant → provider yields no tools");
+    }
+
+    #[tokio::test]
+    async fn tool_list_provider_sees_context() {
+        let server = make_server().with_tool_list_provider(Arc::new(ScopedListProvider));
+        let request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc": "2.0", "id": 31, "method": "tools/list"}"#)
+                .expect("request"); // Safe: test assertion
+        let ctx = ToolContext::new().with_tenant("tenant-1");
+        let resp = server
+            .handle_request_with_context(request, &ctx)
+            .await
+            .expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "scoped_tool");
+    }
+
+    #[tokio::test]
+    async fn method_handler_serves_non_tool_method() {
+        let server = make_server().with_method_handler(Arc::new(ResourcesMethodHandler));
+        let raw = r#"{"jsonrpc": "2.0", "id": 32, "method": "resources/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert!(result["resources"].is_array());
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn method_handler_declines_falls_through_to_method_not_found() {
+        let server = make_server().with_method_handler(Arc::new(ResourcesMethodHandler));
+        let raw = r#"{"jsonrpc": "2.0", "id": 33, "method": "prompts/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+        assert!(err.message.contains("prompts/list"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_before_hook_short_circuits() {
+        let server = make_server().with_tool_call_hooks(Arc::new(GatingHooks));
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "tools/call",
+            "params": { "name": "ping_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text") // Safe: test assertion
+            .contains("quota exceeded"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_after_hook_augments_response() {
+        // A tool that isn't gated by `before` so it reaches the after-hook.
+        struct EchoTool;
+        #[async_trait::async_trait]
+        impl McpTool<TestState> for EchoTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "echo_tool".to_owned(),
+                    description: "echo".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    annotations: None,
+                }
+            }
+            async fn execute(
+                &self,
+                _state: &Arc<TestState>,
+                _ctx: &ToolContext,
+                _arguments: Value,
+            ) -> ToolResponse {
+                ToolResponse::text("original".to_owned())
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let server = McpServer::new("test-server", "0.1.0", registry, Arc::new(TestState))
+            .with_tool_call_hooks(Arc::new(GatingHooks));
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 35,
+            "method": "tools/call",
+            "params": { "name": "echo_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["content"][0]["text"], "augmented");
     }
 }
