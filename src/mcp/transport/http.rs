@@ -18,7 +18,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use crate::error::PARSE_ERROR;
+use crate::error::{PARSE_ERROR, UNAUTHORIZED};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
@@ -111,15 +111,25 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     let ctx = match server.authenticate(&request).await {
         Ok(ctx) => ctx,
         Err(AuthError::Unauthorized { www_authenticate }) => {
+            // RFC 9728 401 + WWW-Authenticate, with a JSON-RPC error body so
+            // clients can parse the rejection (not a bare text body).
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, www_authenticate)],
-                "Unauthorized",
+                Json(JsonRpcResponse::error(
+                    None,
+                    UNAUTHORIZED,
+                    "Unauthorized".to_owned(),
+                )),
             )
                 .into_response();
         }
         Err(AuthError::Forbidden { reason }) => {
-            return (StatusCode::FORBIDDEN, reason).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
+            )
+                .into_response();
         }
     };
 
