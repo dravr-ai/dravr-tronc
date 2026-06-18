@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.3] — 2026-06-18
+
+### Added
+
+- feat(notify): NotifyEnricher seam (NotifyLayerBuilder::with_enricher) that mutates an event's merged fields once, before both the Slack and PostHog sinks — the host injects derived fields (e.g. a cache-resolved user_email, a display emoji) without each call site repeating them.
+
+### Changed
+
+- Immediate Slack posts render identity-led Block Kit: user_email leads, event signal follows, and *_id identifiers move to a muted context block (kept in full for correlation). `emoji` is lifted into the headline. Batched digests keep the compact single-line format. Additive and backward-compatible (enricher defaults to None).
+
+
+
 ## [0.3.1] — 2026-05-13
 
 ### Other

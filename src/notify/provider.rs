@@ -100,6 +100,29 @@ pub trait AnalyticsProvider: Send + Sync + 'static {
     ) -> Option<AnalyticsCapture>;
 }
 
+/// Mutates the merged field map of a notify event in place, once, before it is
+/// rendered to Slack and forwarded to `PostHog`.
+///
+/// The host implements this to inject fields the call sites don't carry —
+/// canonically resolving a `user_id` to a `user_email` from an in-process
+/// cache, or attaching a per-event display `emoji`. Both sinks then see the
+/// enriched map: Slack renders the added fields, and the [`AnalyticsProvider`]
+/// can promote them (or strip them) per its tier policy.
+///
+/// Like the other provider seams, `NotifyLayer` calls [`enrich`](Self::enrich)
+/// synchronously on the tracing thread for every emitted event, so
+/// implementations must be cheap, non-blocking, and thread-safe — resolve from
+/// memory, never from a network or database round-trip.
+///
+/// Two field keys are reserved by the renderer and consumed into the headline
+/// rather than shown as `key=value` pairs: `message` (the tracing body) and
+/// `emoji` (a leading icon). An enricher may set `emoji`; it should not set
+/// `message`.
+pub trait NotifyEnricher: Send + Sync + 'static {
+    /// Add or overwrite fields on `fields` for `event`. A no-op is allowed.
+    fn enrich(&self, event: &str, fields: &mut HashMap<String, String>);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

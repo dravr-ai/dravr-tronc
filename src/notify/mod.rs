@@ -58,5 +58,7 @@ mod state;
 mod visit;
 
 pub use layer::{NotifyLayer, NotifyLayerBuilder, NOTIFY_TARGET};
-pub use provider::{AnalyticsCapture, AnalyticsProvider, RoutingProvider, StaticRoutingProvider};
+pub use provider::{
+    AnalyticsCapture, AnalyticsProvider, NotifyEnricher, RoutingProvider, StaticRoutingProvider,
+};
 pub use rule::{BatchRule, DedupRule, RoutingRule};

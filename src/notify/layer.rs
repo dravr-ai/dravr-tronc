@@ -18,7 +18,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use super::provider::{AnalyticsProvider, RoutingProvider};
+use super::provider::{AnalyticsProvider, NotifyEnricher, RoutingProvider};
 use super::rule::RoutingRule;
 use super::state::{
     build_dedup_key, BatchBuffer, BatchBuffers, BatchedLine, DedupMap, SharedBatchBuffers,
@@ -87,6 +87,9 @@ struct LayerInner<R: RoutingProvider> {
     analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
     /// `PostHog` transport. Paired with `analytics_provider`; both must be set.
     posthog: Option<Arc<PostHogClient>>,
+    /// Per-event field enrichment applied before both sinks. `None` = no
+    /// enrichment; events render with exactly the fields the call sites carry.
+    enricher: Option<Arc<dyn NotifyEnricher>>,
     provider: Arc<R>,
     environment: String,
     default_rule: Option<RoutingRule>,
@@ -124,6 +127,7 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             flush_tick: DEFAULT_FLUSH_TICK,
             analytics_provider: None,
             posthog: None,
+            enricher: None,
         }
     }
 
@@ -153,12 +157,11 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             }
         }
 
-        let line = format_line(event_name, fields);
-
         if let Some(batch) = &rule.batch {
+            let line = format_line(event_name, fields);
             self.enqueue_batch(event_name, &rule.channel, batch.interval, line);
         } else {
-            self.post_immediate(&rule.channel, event_name, &line);
+            self.post_immediate(&rule.channel, event_name, fields);
         }
     }
 
@@ -214,8 +217,8 @@ impl<R: RoutingProvider> NotifyLayer<R> {
         });
     }
 
-    fn post_immediate(&self, channel: &str, event_name: &str, line: &str) {
-        let blocks = single_line_blocks(event_name, line);
+    fn post_immediate(&self, channel: &str, event_name: &str, fields: &HashMap<String, String>) {
+        let blocks = event_blocks(event_name, fields);
         self.inner.slack.post_message(channel, &blocks);
     }
 
@@ -246,6 +249,7 @@ pub struct NotifyLayerBuilder<R: RoutingProvider> {
     flush_tick: Duration,
     analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
     posthog: Option<Arc<PostHogClient>>,
+    enricher: Option<Arc<dyn NotifyEnricher>>,
 }
 
 impl<R: RoutingProvider> NotifyLayerBuilder<R> {
@@ -278,12 +282,23 @@ impl<R: RoutingProvider> NotifyLayerBuilder<R> {
         self
     }
 
+    /// Attach a [`NotifyEnricher`] that mutates every event's merged field map
+    /// before it reaches Slack and `PostHog`. The host uses this to inject
+    /// fields the call sites don't carry — e.g. a `user_email` resolved from an
+    /// in-process cache, or a display `emoji`. Without this, events render with
+    /// exactly the fields their call sites and enclosing spans provide.
+    pub fn with_enricher(mut self, enricher: Arc<dyn NotifyEnricher>) -> Self {
+        self.enricher = Some(enricher);
+        self
+    }
+
     /// Finalise the layer and spawn the background batch flusher.
     pub fn build(self) -> NotifyLayer<R> {
         let inner = Arc::new(LayerInner {
             slack: self.slack,
             analytics_provider: self.analytics_provider,
             posthog: self.posthog,
+            enricher: self.enricher,
             provider: self.provider,
             environment: self.environment,
             default_rule: self.default_rule,
@@ -375,6 +390,12 @@ where
             merged.insert(k, v);
         }
 
+        // Enrich once, before both sinks, so Slack and PostHog see the same
+        // host-derived fields (e.g. a `user_email` resolved from cache).
+        if let Some(enricher) = &self.inner.enricher {
+            enricher.enrich(&event_name, &mut merged);
+        }
+
         self.capture_analytics(&event_name, &merged);
         self.dispatch(&event_name, &merged);
     }
@@ -399,15 +420,54 @@ const FIELD_DENYLIST: &[&str] = &[
     "x-request-id",
 ];
 
+/// Field keys consumed into the headline rather than rendered as `key=value`
+/// pairs: the tracing `message` body and an optional leading `emoji` (set by a
+/// [`NotifyEnricher`](super::provider::NotifyEnricher)).
+const LIFTED_KEYS: &[&str] = &["message", "emoji"];
+
+fn is_lifted(key: &str) -> bool {
+    LIFTED_KEYS.contains(&key)
+}
+
+/// Whether a field is an opaque identifier (`*_id`) — `tenant_id`, `user_id`,
+/// `conversation_id`, `turn_id`, `session_id`, … . The immediate-post renderer
+/// demotes these to a muted Slack `context` block so the human-readable signal
+/// (`user_email`, `provider`, `persona`, latency, …) leads the message.
+fn is_id_field(key: &str) -> bool {
+    key.ends_with("_id")
+}
+
 /// Field-key priority for the rendered line: lower number renders first.
-/// Event-specific fields lead so the actionable signal is at the front;
-/// `tenant_id` / `user_id` trail because they're on every event and
-/// operators scan for them last.
+/// `user_email` leads (identity is the most-scanned field), then event-specific
+/// signal, then the `*_id` identifiers trail. Within the immediate-post layout
+/// the identifiers move to a context block entirely; this ordering still
+/// governs the batched-digest line and the order inside the context block.
 fn field_priority(key: &str) -> u8 {
-    match key {
-        "tenant_id" => 90,
-        "user_id" => 91,
-        _ => 50,
+    if key == "user_email" {
+        10
+    } else if is_id_field(key) {
+        90
+    } else {
+        50
+    }
+}
+
+/// Render the headline: an optional leading `emoji`, the bold event name, and
+/// the tracing `message` body when present.
+fn headline(event_name: &str, fields: &HashMap<String, String>) -> String {
+    let emoji = fields
+        .get("emoji")
+        .map(String::as_str)
+        .filter(|e| !e.is_empty());
+    let message = fields
+        .get("message")
+        .map(String::as_str)
+        .filter(|m| !m.is_empty());
+    match (emoji, message) {
+        (Some(e), Some(m)) => format!("{e} *{event_name}* — {m}"),
+        (Some(e), None) => format!("{e} *{event_name}*"),
+        (None, Some(m)) => format!("*{event_name}* — {m}"),
+        (None, None) => format!("*{event_name}*"),
     }
 }
 
@@ -454,25 +514,26 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-/// Format one event for Slack:
+/// Format one event as a single compact line for the batched digest:
 ///
 /// ```text
-/// *event.name* — <tracing message body>
-/// key1=value1, key2=value2, … tenant_id=…, user_id=…
+/// <emoji> *event.name* — <tracing message body>
+/// user_email=…, key1=value1, … tenant_id=…, user_id=…
 /// ```
 ///
-/// The tracing macro's message body is lifted out of the field map and
-/// rendered as the headline so the most-readable text leads. Fields are
-/// denylist-filtered to drop HTTP / OAuth plumbing inherited from the
-/// enclosing request span, then ordered by [`field_priority`] so
-/// event-specific data lands first and `tenant_id`/`user_id` trail.
-/// `*_ms` values are humanised via [`format_duration_ms`].
+/// The `message`/`emoji` keys are lifted into the headline. Remaining fields
+/// are denylist-filtered to drop HTTP / OAuth plumbing inherited from the
+/// enclosing request span, then ordered by [`field_priority`] so `user_email`
+/// leads, event-specific data follows, and `*_id` identifiers trail. `*_ms`
+/// values are humanised via [`format_duration_ms`]. The immediate (non-batched)
+/// path uses the richer two-block layout in [`event_blocks`] instead; this
+/// stays a single line so a digest of N events reads compactly.
 fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
-    let message = fields.get("message").map(String::as_str);
+    let head = headline(event_name, fields);
 
     let mut filtered: Vec<(&String, &String)> = fields
         .iter()
-        .filter(|(k, _)| k.as_str() != "message" && !FIELD_DENYLIST.contains(&k.as_str()))
+        .filter(|(k, _)| !is_lifted(k) && !FIELD_DENYLIST.contains(&k.as_str()))
         .collect();
 
     filtered.sort_by_key(|(k, _)| (field_priority(k), k.as_str()));
@@ -482,11 +543,6 @@ fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={}", format_value(k, v)))
         .collect();
 
-    let head = match message {
-        Some(msg) if !msg.is_empty() => format!("*{event_name}* — {msg}"),
-        _ => format!("*{event_name}*"),
-    };
-
     if pairs.is_empty() {
         head
     } else {
@@ -494,7 +550,67 @@ fn format_line(event_name: &str, fields: &HashMap<String, String>) -> String {
     }
 }
 
-/// Wrap a single line into Block Kit shape understood by `SlackClient::post_message`.
+/// Render one event as Block Kit for an immediate (non-batched) Slack post:
+///
+/// - a `section` block — the headline plus the human-readable signal fields
+///   (`user_email` first, then event-specific data), and
+/// - a muted `context` block — the `*_id` identifiers (`tenant_id`, `user_id`,
+///   `conversation_id`, …), kept in full for log correlation but visually
+///   demoted out of the way.
+///
+/// The context block is omitted when the event carries no identifier fields.
+fn event_blocks(event_name: &str, fields: &HashMap<String, String>) -> Value {
+    let renderable = |k: &str| !is_lifted(k) && !FIELD_DENYLIST.contains(&k);
+
+    let mut signal: Vec<(&String, &String)> = fields
+        .iter()
+        .filter(|(k, _)| renderable(k.as_str()) && !is_id_field(k.as_str()))
+        .collect();
+    signal.sort_by_key(|(k, _)| (field_priority(k), k.as_str()));
+    let signal_pairs: Vec<String> = signal
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", format_value(k, v)))
+        .collect();
+
+    let section_text = if signal_pairs.is_empty() {
+        headline(event_name, fields)
+    } else {
+        format!(
+            "{}\n{}",
+            headline(event_name, fields),
+            signal_pairs.join(", ")
+        )
+    };
+
+    let mut blocks = vec![serde_json::json!({
+        "type": "section",
+        "text": { "type": "mrkdwn", "text": section_text },
+        "block_id": format!("notify-{event_name}"),
+    })];
+
+    let mut ids: Vec<(&String, &String)> = fields
+        .iter()
+        .filter(|(k, _)| renderable(k.as_str()) && is_id_field(k.as_str()))
+        .collect();
+    ids.sort_by_key(|(k, _)| (field_priority(k), k.as_str()));
+    if !ids.is_empty() {
+        let id_text = ids
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        blocks.push(serde_json::json!({
+            "type": "context",
+            "elements": [ { "type": "mrkdwn", "text": id_text } ],
+        }));
+    }
+
+    Value::Array(blocks)
+}
+
+/// Wrap a single rendered line into Block Kit shape understood by
+/// `SlackClient::post_message`. Used by the batched-digest flush path; the
+/// immediate path uses the richer [`event_blocks`] layout.
 fn single_line_blocks(event_name: &str, line: &str) -> Value {
     serde_json::json!([{
         "type": "section",
@@ -557,8 +673,10 @@ fn format_batch(event_name: &str, lines: &[BatchedLine]) -> String {
 mod tests {
     use super::*;
     use crate::notifications::SlackConfig;
-    use crate::notify::provider::{AnalyticsCapture, StaticRoutingProvider};
+    use crate::notify::provider::{AnalyticsCapture, NotifyEnricher, StaticRoutingProvider};
     use tokio::time::sleep;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     fn dummy_slack() -> Arc<SlackClient> {
         Arc::new(SlackClient::new(&SlackConfig {
@@ -848,6 +966,140 @@ mod tests {
         fields.insert("latency_ms".to_owned(), "not-a-number".to_owned());
         let line = format_line("evt", &fields);
         assert_eq!(line, "*evt*\nlatency_ms=not-a-number");
+    }
+
+    #[test]
+    fn format_line_leads_with_user_email_then_trails_ids() {
+        let mut fields = HashMap::new();
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        fields.insert("tenant_id".to_owned(), "t1".to_owned());
+        fields.insert("provider".to_owned(), "strava".to_owned());
+        fields.insert("user_email".to_owned(), "jane@acme.com".to_owned());
+        let line = format_line("provider.fetch_started", &fields);
+        // Identity leads, event signal next, *_id identifiers trail.
+        assert_eq!(
+            line,
+            "*provider.fetch_started*\nuser_email=jane@acme.com, provider=strava, tenant_id=t1, user_id=u1"
+        );
+    }
+
+    #[test]
+    fn format_line_prepends_emoji_to_headline() {
+        let mut fields = HashMap::new();
+        fields.insert("message".to_owned(), "user authenticated".to_owned());
+        fields.insert("emoji".to_owned(), "🔑".to_owned());
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        let line = format_line("user.login", &fields);
+        // `emoji` is consumed into the headline, never shown as a key=value pair.
+        assert_eq!(line, "🔑 *user.login* — user authenticated\nuser_id=u1");
+    }
+
+    #[test]
+    fn event_blocks_splits_signal_section_from_muted_id_context() {
+        let mut fields = HashMap::new();
+        fields.insert("message".to_owned(), "user asked a question".to_owned());
+        fields.insert("emoji".to_owned(), "💬".to_owned());
+        fields.insert("persona".to_owned(), "casual".to_owned());
+        fields.insert("user_email".to_owned(), "jane@acme.com".to_owned());
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        fields.insert("tenant_id".to_owned(), "t1".to_owned());
+        fields.insert("conversation_id".to_owned(), "c1".to_owned());
+
+        let blocks = event_blocks("chat.question_asked", &fields);
+        let arr = blocks.as_array().expect("blocks is an array");
+        assert_eq!(arr.len(), 2, "expected a section + a context block");
+
+        let section = arr[0]["text"]["text"].as_str().expect("section text");
+        assert_eq!(
+            section,
+            "💬 *chat.question_asked* — user asked a question\nuser_email=jane@acme.com, persona=casual"
+        );
+        assert_eq!(arr[0]["type"], "section");
+
+        // Identifiers are demoted to the muted context block, kept in full.
+        assert_eq!(arr[1]["type"], "context");
+        let ctx = arr[1]["elements"][0]["text"]
+            .as_str()
+            .expect("context text");
+        assert_eq!(ctx, "conversation_id=c1  ·  tenant_id=t1  ·  user_id=u1");
+    }
+
+    #[test]
+    fn event_blocks_omits_context_when_no_id_fields() {
+        let mut fields = HashMap::new();
+        fields.insert("message".to_owned(), "circuit opened".to_owned());
+        fields.insert("provider".to_owned(), "cohere".to_owned());
+        let blocks = event_blocks("llm.circuit_opened", &fields);
+        let arr = blocks.as_array().expect("blocks is an array");
+        assert_eq!(arr.len(), 1, "no *_id fields → no context block");
+        assert_eq!(arr[0]["type"], "section");
+    }
+
+    #[test]
+    fn event_blocks_humanises_latency_in_section() {
+        let mut fields = HashMap::new();
+        fields.insert("latency_ms".to_owned(), "120011".to_owned());
+        fields.insert("model".to_owned(), "claude-opus".to_owned());
+        let blocks = event_blocks("embacle.call_completed", &fields);
+        let arr = blocks.as_array().expect("blocks is an array");
+        let section = arr[0]["text"]["text"].as_str().expect("section text");
+        assert_eq!(
+            section,
+            "*embacle.call_completed*\nlatency_ms=2m, model=claude-opus"
+        );
+    }
+
+    /// Shared log of `(event, fields)` the enricher observed, for assertions.
+    type SeenLog = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+    /// Records every `(event, fields)` it is handed and injects a `user_email`,
+    /// so a subscriber-driven test can assert the layer runs the enricher on the
+    /// merged span+event field map before the sinks see it.
+    struct RecordingEnricher {
+        seen: SeenLog,
+    }
+
+    impl NotifyEnricher for RecordingEnricher {
+        fn enrich(&self, event: &str, fields: &mut HashMap<String, String>) {
+            if let Ok(mut guard) = self.seen.lock() {
+                guard.push((event.to_owned(), fields.clone()));
+            }
+            fields.insert("user_email".to_owned(), "jane@acme.com".to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn enricher_runs_on_merged_fields_before_dispatch() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = NotifyLayer::builder(
+            dummy_slack(),
+            Arc::new(
+                StaticRoutingProvider::new().with_rule("user.login", RoutingRule::to_channel("#x")),
+            ),
+            "dev".into(),
+        )
+        .with_enricher(Arc::new(RecordingEnricher {
+            seen: Arc::clone(&seen),
+        }))
+        .build();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        with_default(subscriber, || {
+            let span = tracing::info_span!("req", user_id = "u1", tenant_id = "t1");
+            span.in_scope(|| {
+                tracing::info!(target: "notify", event = "user.login", "user authenticated");
+            });
+        });
+
+        let guard = seen.lock().expect("mutex not poisoned"); // Safe: test assertion
+        assert_eq!(guard.len(), 1, "enricher invoked exactly once");
+        let (event, fields) = &guard[0];
+        assert_eq!(event, "user.login");
+        // Span fields are merged in before the enricher runs.
+        assert_eq!(fields.get("user_id").map(String::as_str), Some("u1"));
+        assert_eq!(fields.get("tenant_id").map(String::as_str), Some("t1"));
+        // The enricher had not yet injected its own field when recording.
+        assert!(!fields.contains_key("user_email"));
     }
 
     #[test]
