@@ -1006,10 +1006,10 @@ mod tests {
         fields.insert("conversation_id".to_owned(), "c1".to_owned());
 
         let blocks = event_blocks("chat.question_asked", &fields);
-        let arr = blocks.as_array().expect("blocks is an array");
+        let arr = blocks.as_array().expect("blocks is an array"); // Safe: test asserts Slack block shape
         assert_eq!(arr.len(), 2, "expected a section + a context block");
 
-        let section = arr[0]["text"]["text"].as_str().expect("section text");
+        let section = arr[0]["text"]["text"].as_str().expect("section text"); // Safe: test asserts Slack block shape
         assert_eq!(
             section,
             "💬 *chat.question_asked* — user asked a question\nuser_email=jane@acme.com, persona=casual"
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(arr[1]["type"], "context");
         let ctx = arr[1]["elements"][0]["text"]
             .as_str()
-            .expect("context text");
+            .expect("context text"); // Safe: test asserts Slack block shape
         assert_eq!(ctx, "conversation_id=c1  ·  tenant_id=t1  ·  user_id=u1");
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
         fields.insert("message".to_owned(), "circuit opened".to_owned());
         fields.insert("provider".to_owned(), "cohere".to_owned());
         let blocks = event_blocks("llm.circuit_opened", &fields);
-        let arr = blocks.as_array().expect("blocks is an array");
+        let arr = blocks.as_array().expect("blocks is an array"); // Safe: test asserts Slack block shape
         assert_eq!(arr.len(), 1, "no *_id fields → no context block");
         assert_eq!(arr[0]["type"], "section");
     }
@@ -1041,8 +1041,8 @@ mod tests {
         fields.insert("latency_ms".to_owned(), "120011".to_owned());
         fields.insert("model".to_owned(), "claude-opus".to_owned());
         let blocks = event_blocks("embacle.call_completed", &fields);
-        let arr = blocks.as_array().expect("blocks is an array");
-        let section = arr[0]["text"]["text"].as_str().expect("section text");
+        let arr = blocks.as_array().expect("blocks is an array"); // Safe: test asserts Slack block shape
+        let section = arr[0]["text"]["text"].as_str().expect("section text"); // Safe: test asserts Slack block shape
         assert_eq!(
             section,
             "*embacle.call_completed*\nlatency_ms=2m, model=claude-opus"
