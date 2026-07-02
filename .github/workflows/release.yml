@@ -4,13 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: 'Version bump type'
-        required: true
+        description: 'Version bump type (ignored when tag is set)'
+        required: false
+        default: patch
         type: choice
         options:
           - patch
           - minor
           - major
+      tag:
+        description: 'Republish an existing tag to crates.io (e.g. v0.6.0) — skips the version bump'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -21,6 +27,7 @@ env:
 jobs:
   version:
     name: Bump Version & Tag
+    if: inputs.tag == ''
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
@@ -133,21 +140,38 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: version
+    # Runs after a fresh version bump OR standalone in tag-republish mode
+    # (where the version job is skipped).
+    if: always() && (needs.version.result == 'success' || inputs.tag != '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.version.outputs.version }}
+          ref: ${{ inputs.tag != '' && inputs.tag || format('v{0}', needs.version.outputs.version) }}
+          # clippy.toml is a symlink into the .build submodule; without it,
+          # cargo package fails on the dangling link (this silently broke
+          # every workflow publish before the 2026-07-02 fix).
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Pre-check the registry so re-runs are idempotent, but let a real
+        # publish failure fail the job — the old `|| echo` swallowed a
+        # broken publish for multiple releases while the workflow stayed green.
         run: |
-          cargo publish -p dravr-tronc || echo "dravr-tronc already published, continuing..."
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if curl -fsSL -H "User-Agent: dravr-tronc-release" \
+            "https://crates.io/api/v1/crates/dravr-tronc/${VERSION}" >/dev/null 2>&1; then
+            echo "dravr-tronc v${VERSION} already on crates.io — skipping publish"
+          else
+            cargo publish -p dravr-tronc
+          fi
 
       - name: Create GitHub Release
+        if: inputs.tag == ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.version.outputs.version }}
