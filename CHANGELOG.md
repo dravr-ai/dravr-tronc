@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0] — 2026-07-02
+
+### Added
+
+- feat(notifications): host identity in error digests (NotificationConfig.host) Alerts from processes sharing a service_name/environment (dev laptop vs deployed Cloud Run dev) were indistinguishable — an anonymous 'Environment: development' Slack digest cost a morning of sender archaeology. NotificationConfig gains host (DRAVR_NOTIFY_HOST -> K_REVISION -> HOSTNAME -> HOST env chain, None when unset; hosts that resolve better values set it explicitly), the Slack digest context line renders 'Host:' when present via the new pure context_line helper, and the email digest subject body carries the same identity. Tests cover the env chain and both context-line renderings.
+
+
+
 ## [0.5.3] — 2026-06-18
 
 ### Added
