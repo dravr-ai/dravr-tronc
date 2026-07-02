@@ -27,6 +27,12 @@ pub struct NotificationConfig {
     pub service_name: String,
     /// Environment label (development, staging, production)
     pub environment: String,
+    /// Host identity of the sending process (Cloud Run revision name or
+    /// machine hostname). Disambiguates alerts when several instances share
+    /// a `service_name`/`environment` — e.g. a dev laptop vs the deployed
+    /// dev service. `None` when no environment source provides one; hosts
+    /// that can resolve a better value set it explicitly after `from_env`.
+    pub host: Option<String>,
 }
 
 /// Slack notification configuration
@@ -70,6 +76,9 @@ impl NotificationConfig {
     /// - `NOTIFY_DEDUP_WINDOW_SECS` — Dedup window in seconds (default: 30)
     /// - `SERVICE_NAME` — Service identifier (default: "dravr-service")
     /// - `ENVIRONMENT` — Environment label (default: "development")
+    /// - `DRAVR_NOTIFY_HOST` — Explicit host identity override
+    /// - `K_REVISION` — Cloud Run revision name (set by the platform)
+    /// - `HOSTNAME` / `HOST` — Shell-provided machine-name fallbacks
     pub fn from_env() -> Self {
         let slack = SlackConfig::from_env();
         let email = EmailConfig::from_env();
@@ -91,6 +100,9 @@ impl NotificationConfig {
 
         let service_name = env::var("SERVICE_NAME").unwrap_or_else(|_| "dravr-service".into());
         let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into());
+        let host = ["DRAVR_NOTIFY_HOST", "K_REVISION", "HOSTNAME", "HOST"]
+            .iter()
+            .find_map(|var| env::var(var).ok().filter(|s| !s.is_empty()));
 
         Self {
             slack,
@@ -100,6 +112,7 @@ impl NotificationConfig {
             dedup_window: Duration::from_secs(dedup_window_secs),
             service_name,
             environment,
+            host,
         }
     }
 }
@@ -165,6 +178,33 @@ mod tests {
         assert_eq!(config.batch_window, Duration::from_secs(5));
         assert_eq!(config.max_messages_per_minute, 10);
         assert_eq!(config.dedup_window, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn host_resolution_chain() {
+        // Sequential phases in one test: these mutate shared process env,
+        // so splitting them into separate #[test]s would race under the
+        // parallel test runner.
+        env::remove_var("DRAVR_NOTIFY_HOST");
+        env::remove_var("K_REVISION");
+        env::remove_var("HOSTNAME");
+        env::remove_var("HOST");
+        assert_eq!(NotificationConfig::from_env().host, None);
+
+        env::set_var("K_REVISION", "some-revision-00042-abc");
+        assert_eq!(
+            NotificationConfig::from_env().host.as_deref(),
+            Some("some-revision-00042-abc")
+        );
+
+        env::set_var("DRAVR_NOTIFY_HOST", "explicit-host");
+        assert_eq!(
+            NotificationConfig::from_env().host.as_deref(),
+            Some("explicit-host")
+        );
+
+        env::remove_var("DRAVR_NOTIFY_HOST");
+        env::remove_var("K_REVISION");
     }
 
     #[test]

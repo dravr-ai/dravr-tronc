@@ -257,14 +257,14 @@ impl Dispatcher {
             }
         })];
 
-        // Environment context
+        // Environment + host context
         blocks.push(json!({
             "type": "context",
             "elements": [{
                 "type": "mrkdwn",
-                "text": format!(
-                    "*Environment:* {} | *Errors:* {}",
-                    self.config.environment,
+                "text": context_line(
+                    &self.config.environment,
+                    self.config.host.as_deref(),
                     entries.len()
                 )
             }]
@@ -344,9 +344,19 @@ impl Dispatcher {
             self.config.service_name,
         );
 
-        let mut body = format!(
-            "Error digest for {} ({})\n\n",
-            self.config.service_name, self.config.environment
+        let mut body = self.config.host.as_deref().map_or_else(
+            || {
+                format!(
+                    "Error digest for {} ({})\n\n",
+                    self.config.service_name, self.config.environment
+                )
+            },
+            |host| {
+                format!(
+                    "Error digest for {} ({} on {})\n\n",
+                    self.config.service_name, self.config.environment, host
+                )
+            },
         );
 
         for (_, event, count) in entries {
@@ -394,6 +404,16 @@ fn truncate_message(msg: &str, max_len: usize) -> String {
     }
 }
 
+/// Render the digest's context line: environment, optional host identity,
+/// and error count. The host disambiguates senders that share a
+/// `service_name`/`environment` (dev laptop vs deployed service).
+fn context_line(environment: &str, host: Option<&str>, error_count: usize) -> String {
+    host.map_or_else(
+        || format!("*Environment:* {environment} | *Errors:* {error_count}"),
+        |h| format!("*Environment:* {environment} | *Host:* {h} | *Errors:* {error_count}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +449,21 @@ mod tests {
         let visitor = EventVisitor::new();
         assert!(visitor.message.is_empty());
         assert!(visitor.fields.is_empty());
+    }
+
+    #[test]
+    fn context_line_includes_host_when_present() {
+        assert_eq!(
+            context_line("development", Some("phil-mbp.local"), 1),
+            "*Environment:* development | *Host:* phil-mbp.local | *Errors:* 1"
+        );
+    }
+
+    #[test]
+    fn context_line_omits_host_when_absent() {
+        assert_eq!(
+            context_line("production", None, 3),
+            "*Environment:* production | *Errors:* 3"
+        );
     }
 }
