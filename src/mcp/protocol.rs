@@ -71,8 +71,14 @@ impl fmt::Debug for JsonRpcRequest {
                 "auth_token",
                 &self.auth_token.as_ref().map(|token| {
                     // Show first 10 + last 8 characters, or "[REDACTED]" if short.
-                    if token.len() > 20 {
-                        format!("{}...{}", &token[..10], &token[token.len() - 8..])
+                    // Count and slice by chars (not bytes): a byte slice at index
+                    // 10 / len-8 panics when it lands mid-codepoint on a multibyte
+                    // token.
+                    let char_count = token.chars().count();
+                    if char_count > 20 {
+                        let first: String = token.chars().take(10).collect();
+                        let last: String = token.chars().skip(char_count - 8).collect();
+                        format!("{first}...{last}")
                     } else {
                         "[REDACTED]".to_owned()
                     }
@@ -320,6 +326,19 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(!debug.contains("secret_middle_part"));
         assert!(debug.contains("..."));
+    }
+
+    #[test]
+    fn debug_redacts_multibyte_auth_token_without_panic() {
+        // Regression: 24 multibyte chars. The old byte-slicing impl panicked
+        // because byte index 10 (and len-8) land mid-codepoint; char-safe
+        // slicing must elide the middle without panicking.
+        let mut req = JsonRpcRequest::new("ping", None);
+        req.auth_token = Some("あ".repeat(24));
+        let debug = format!("{req:?}");
+        assert!(debug.contains("..."));
+        // The full token must never appear — only the first 10 + last 8 chars.
+        assert!(!debug.contains(&"あ".repeat(24)));
     }
 
     #[test]

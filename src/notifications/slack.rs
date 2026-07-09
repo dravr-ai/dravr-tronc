@@ -10,6 +10,7 @@ use std::str;
 use reqwest::Client;
 use ring::hmac;
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use tracing::warn;
 
 use super::SlackConfig;
@@ -169,7 +170,10 @@ impl SlackClient {
         let tag = hmac::sign(&key, basestring.as_bytes());
         let expected = format!("v0={}", hex::encode(tag.as_ref()));
 
-        if signature == expected {
+        // Constant-time comparison to avoid leaking the expected HMAC via timing
+        // (mirrors the bearer-token check in `crate::server::auth`). Length is not
+        // secret, so the length-mismatch short-circuit in `ct_eq` is acceptable.
+        if signature.as_bytes().ct_eq(expected.as_bytes()).into() {
             Ok(())
         } else {
             Err(SignatureError::InvalidSignature)
@@ -278,6 +282,33 @@ mod tests {
         // We expect TimestampExpired since the timestamp is from 2009
         let result = client.verify_signature(timestamp, &signature, body);
         assert!(matches!(result, Err(SignatureError::TimestampExpired(_))));
+    }
+
+    #[test]
+    fn verify_signature_accepts_valid_with_fresh_timestamp() {
+        // Regression: the valid-signature path must accept a correctly computed
+        // HMAC when compared in constant time (ct_eq), not only reject bad ones.
+        let secret = "test_signing_secret";
+        let now = chrono::Utc::now().timestamp().to_string();
+        let body = b"payload=hello";
+
+        let basestring = format!(
+            "v0:{now}:{}",
+            str::from_utf8(body).expect("test body is valid UTF-8") // Safe: test assertion
+        );
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = hmac::sign(&key, basestring.as_bytes());
+        let signature = format!("v0={}", hex::encode(tag.as_ref()));
+
+        let config = SlackConfig {
+            bot_token: "xoxb-test".into(),
+            error_channel: "#errors".into(),
+            signing_secret: Some(secret.into()),
+        };
+        let client = SlackClient::new(&config);
+
+        let result = client.verify_signature(&now, &signature, body);
+        assert!(result.is_ok());
     }
 
     #[test]
