@@ -33,7 +33,7 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       prev_tag: ${{ steps.bump.outputs.prev_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -145,7 +145,7 @@ jobs:
     if: always() && (needs.version.result == 'success' || inputs.tag != '')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag != '' && inputs.tag || format('v{0}', needs.version.outputs.version) }}
           # clippy.toml is a symlink into the .build submodule; without it,
