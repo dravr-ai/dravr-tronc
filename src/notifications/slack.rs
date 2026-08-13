@@ -11,7 +11,7 @@ use reqwest::Client;
 use ring::hmac;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::SlackConfig;
 
@@ -23,6 +23,60 @@ const SLACK_CHAT_UPDATE_URL: &str = "https://slack.com/api/chat.update";
 
 /// Maximum age of a Slack request timestamp before rejection (5 minutes)
 const MAX_TIMESTAMP_AGE_SECS: u64 = 300;
+
+/// Slack API error codes that mean the delivery target is misconfigured
+///
+/// These never clear on their own — a renamed channel, an uninvited bot, or a
+/// revoked token stays broken until an operator changes configuration. Posting
+/// is fire-and-forget, so a `warn!` here is invisible: the caller believes it
+/// notified and nothing ever arrives. Escalating to `error!` routes the failure
+/// through `ErrorNotificationLayer` (which fires only on `Level::ERROR`) and out
+/// to the independent error channel, so a dead route announces itself instead of
+/// going quiet.
+///
+/// Transient codes (`ratelimited`, `service_unavailable`, `request_timeout`) are
+/// deliberately absent — they retry into success and would only add noise.
+const SLACK_MISCONFIGURED_TARGET_ERRORS: &[&str] = &[
+    "channel_not_found",
+    "is_archived",
+    "not_in_channel",
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "missing_scope",
+    "restricted_action",
+];
+
+/// Whether a Slack API error code indicates a misconfigured delivery target
+///
+/// See [`SLACK_MISCONFIGURED_TARGET_ERRORS`] for why these are treated apart
+/// from transient failures.
+fn is_misconfigured_target(api_error: &str) -> bool {
+    SLACK_MISCONFIGURED_TARGET_ERRORS.contains(&api_error)
+}
+
+/// Log a failed fire-and-forget Slack call at the severity its cause deserves
+///
+/// A misconfigured target is an operator-actionable outage of the notification
+/// path itself, so it logs at ERROR with the channel that failed. Everything
+/// else stays at WARN.
+fn log_delivery_failure(result: SlackResult, channel: &str, operation: &str) {
+    match result {
+        SlackResult::Ok => {}
+        SlackResult::ApiError(e) if is_misconfigured_target(&e) => {
+            error!(
+                error = %e,
+                channel = %channel,
+                operation = operation,
+                "Slack delivery target is misconfigured: notifications to this channel are being dropped"
+            );
+        }
+        SlackResult::ApiError(e) | SlackResult::HttpError(e) => {
+            warn!(error = %e, channel = %channel, operation = operation, "Slack {operation} failed");
+        }
+    }
+}
 
 /// Slack API client with bot token authentication
 ///
@@ -86,6 +140,7 @@ impl SlackClient {
     pub fn post_message(&self, channel: &str, blocks: &Value) {
         let token = self.bot_token.clone();
         let client = self.http.clone();
+        let channel = channel.to_owned();
         let payload = serde_json::json!({
             "channel": channel,
             "blocks": blocks,
@@ -94,9 +149,7 @@ impl SlackClient {
         tokio::spawn(async move {
             let result =
                 send_slack_request(&client, SLACK_POST_MESSAGE_URL, &token, &payload).await;
-            if let SlackResult::ApiError(e) | SlackResult::HttpError(e) = result {
-                warn!(error = %e, "Slack post_message failed");
-            }
+            log_delivery_failure(result, &channel, "post_message");
         });
     }
 
@@ -123,6 +176,7 @@ impl SlackClient {
     pub fn update_message(&self, channel: &str, message_ts: &str, blocks: &Value) {
         let token = self.bot_token.clone();
         let client = self.http.clone();
+        let channel = channel.to_owned();
         let payload = serde_json::json!({
             "channel": channel,
             "ts": message_ts,
@@ -131,9 +185,7 @@ impl SlackClient {
 
         tokio::spawn(async move {
             let result = send_slack_request(&client, SLACK_CHAT_UPDATE_URL, &token, &payload).await;
-            if let SlackResult::ApiError(e) | SlackResult::HttpError(e) = result {
-                warn!(error = %e, "Slack update_message failed");
-            }
+            log_delivery_failure(result, &channel, "update_message");
         });
     }
 
@@ -223,6 +275,50 @@ async fn send_slack_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_channel_is_a_misconfigured_target() {
+        // The exact outage this classifier exists for: renaming a Slack channel
+        // makes every post to the old #name return ok=false/channel_not_found,
+        // and fire-and-forget posting swallowed it at WARN.
+        assert!(is_misconfigured_target("channel_not_found"));
+    }
+
+    #[test]
+    fn operator_actionable_slack_errors_are_misconfigured_targets() {
+        for code in [
+            "channel_not_found",
+            "is_archived",
+            "not_in_channel",
+            "invalid_auth",
+            "not_authed",
+            "account_inactive",
+            "token_revoked",
+            "missing_scope",
+            "restricted_action",
+        ] {
+            assert!(
+                is_misconfigured_target(code),
+                "{code} must escalate to ERROR"
+            );
+        }
+        assert_eq!(SLACK_MISCONFIGURED_TARGET_ERRORS.len(), 9);
+    }
+
+    #[test]
+    fn transient_slack_errors_are_not_misconfigured_targets() {
+        // These clear on retry; escalating them would page on ordinary noise.
+        for code in [
+            "ratelimited",
+            "service_unavailable",
+            "request_timeout",
+            "fatal_error",
+            "internal_error",
+            "",
+        ] {
+            assert!(!is_misconfigured_target(code), "{code} must stay at WARN");
+        }
+    }
 
     #[test]
     fn signature_error_display() {

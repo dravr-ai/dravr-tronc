@@ -329,6 +329,11 @@ impl Dispatcher {
         if let super::slack::SlackResult::ApiError(e) | super::slack::SlackResult::HttpError(e) =
             result
         {
+            // Stays at WARN deliberately: this layer fires on Level::ERROR, so
+            // logging its own delivery failure at ERROR would re-enter here and
+            // spin. `post_message_await` is used (not `post_message`) precisely
+            // so the misconfigured-target escalation does not apply to the
+            // escalation path itself. Do not raise this to error!.
             warn!(error = %e, "Failed to send error digest to Slack");
         }
     }
