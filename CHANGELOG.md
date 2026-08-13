@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.1] — 2026-08-13
+
+### Fixed
+
+- fix(slack): a misconfigured channel pages instead of going quiet post_message/update_message are fire-and-forget, so a renamed channel dropped every notification at WARN with the caller believing it had notified (the dev- rename left notify-routing.yaml on #dravr-{events,pulse,signal,trace} and chat.postMessage answered channel_not_found until a human noticed the silence); operator-actionable codes (channel_not_found, is_archived, not_in_channel, auth/scope family) now log at ERROR with the failing channel so ErrorNotificationLayer routes them out the independent error channel, transient codes stay WARN, and the error layer's own digest failure stays WARN on post_message_await as the recursion break.
+- fix(security): constant-time Slack HMAC compare + char-safe token Debug redaction Slack sig uses subtle::ct_eq (was ==, timing leak) and JsonRpcRequest Debug slices the auth token by chars not bytes (was panic on multibyte); both covered by new regression tests.
+
+### Other
+
+- chore(register): ledger + weekly phase review
+- chore(register): point at dravr-carnet, the dravr-family register
+
+
+
 ## [0.6.0] — 2026-07-02
 
 ### Added
