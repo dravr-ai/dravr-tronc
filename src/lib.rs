@@ -33,6 +33,8 @@
 )]
 
 pub mod error;
+#[cfg(feature = "google-iam")]
+pub mod iam;
 pub mod mcp;
 #[cfg(feature = "notifications")]
 pub mod notifications;
