@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0] — 2026-08-17
+
+### Added
+
+- feat(iam): service-to-service auth without a shared secret
+
+### Fixed
+
+- fix: repair the SessionStart bootstrap guard for an empty .build
+
+
+
 ## [0.6.2] — 2026-08-13
 
 
