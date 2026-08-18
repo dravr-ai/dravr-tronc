@@ -48,5 +48,5 @@ mod token_source;
 mod verify;
 
 pub use error::IamError;
-pub use token_source::IdTokenSource;
+pub use token_source::{IdTokenSource, METADATA_HOST_ENV};
 pub use verify::{require_google_id_token, GoogleIdTokenVerifier, IdTokenClaims};

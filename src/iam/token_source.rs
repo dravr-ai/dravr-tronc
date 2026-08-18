@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::env;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -12,13 +13,27 @@ use tracing::debug;
 
 use super::error::IamError;
 
-/// Where a workload running on Google infrastructure asks for its own identity.
+/// Default metadata host, used when [`METADATA_HOST_ENV`] is unset.
 ///
 /// Only resolves inside Google infrastructure, which is the point: the token is
 /// minted by the platform for the attached service account, so nothing has to
 /// hold a signing key.
-const METADATA_IDENTITY_URL: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
+const DEFAULT_METADATA_HOST: &str = "metadata.google.internal";
+
+/// Overrides the metadata host.
+///
+/// `GCE_METADATA_HOST` is Google's own convention — their client libraries in
+/// every language read it — so honouring it is compatibility rather than a test
+/// seam. It is what makes this type usable off Google infrastructure at all: a
+/// caller with no metadata server cannot be exercised against a local one
+/// otherwise, and the alternative is a bypass in the client that exists only
+/// for tests and can therefore be wrong in production without anyone noticing.
+///
+/// Accepts `host` or `host:port`, matching the convention.
+pub const METADATA_HOST_ENV: &str = "GCE_METADATA_HOST";
+
+/// Path the identity token is served from, appended to the host.
+const IDENTITY_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/identity";
 
 /// How long a minted token is reused before another is fetched.
 ///
@@ -105,9 +120,18 @@ impl IdTokenSource {
 
     /// Ask the metadata server for a fresh token.
     async fn fetch(&self) -> Result<String, IamError> {
+        // Resolved per fetch rather than cached, so a host set after construction
+        // still applies — the constructor is often called before an environment
+        // is fully assembled.
+        let host = env::var(METADATA_HOST_ENV)
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| DEFAULT_METADATA_HOST.to_owned());
+        let url = format!("http://{host}{IDENTITY_PATH}");
+
         let response = self
             .http
-            .get(METADATA_IDENTITY_URL)
+            .get(&url)
             .query(&[("audience", self.audience.as_str()), ("format", "full")])
             .header("Metadata-Flavor", "Google")
             .send()

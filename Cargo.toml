@@ -55,6 +55,7 @@ tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 
 [dev-dependencies]
+serial_test = "3"
 http = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

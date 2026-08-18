@@ -14,15 +14,21 @@
     clippy::str_to_string
 )]
 
-use std::sync::Arc;
+use std::env;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::{middleware, Router};
-use dravr_tronc::iam::{require_google_id_token, GoogleIdTokenVerifier, IamError, IdTokenSource};
+use dravr_tronc::iam::{
+    require_google_id_token, GoogleIdTokenVerifier, IamError, IdTokenSource, METADATA_HOST_ENV,
+};
 use http_body_util::BodyExt;
 use reqwest::Client;
+use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 /// The audience these tests pin against — shape-identical to a Cloud Run URL.
@@ -175,4 +181,72 @@ async fn token_source_reports_metadata_absence_distinctly() {
         Err(other) => panic!("expected MetadataUnavailable off Google infra, got {other}"),
         Ok(_) => panic!("a token should not be obtainable in CI"),
     }
+}
+
+/// A token is fetched from `GCE_METADATA_HOST` when it is set.
+///
+/// This is the property that makes the type testable at all, and it is worth an
+/// end-to-end assertion rather than a unit check on URL construction: without
+/// it, any caller holding an `IdTokenSource` can only be exercised on Google
+/// infrastructure, so the alternative is a bypass inside the caller that exists
+/// solely for tests — a branch that can be wrong in production with nothing
+/// pointing at it.
+#[tokio::test]
+#[serial]
+async fn a_token_is_fetched_from_the_overridden_metadata_host() {
+    // A stand-in metadata server: answers the identity path with a JWT-shaped
+    // body and records what it was asked for.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("has an address");
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_writer = Arc::clone(&seen);
+
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0_u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            seen_writer.lock().expect("lock").push(request);
+            let token = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJ0ZXN0In0.c2ln";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{token}",
+                token.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    env::set_var(METADATA_HOST_ENV, addr.to_string());
+    let source = IdTokenSource::new("test-audience", Client::new());
+    let token = source.token().await;
+    env::remove_var(METADATA_HOST_ENV);
+
+    let token = token.expect("a token should come back from the overridden host");
+    assert_eq!(
+        token.split('.').count(),
+        3,
+        "the fetched token must be the three-segment JWT the server returned"
+    );
+
+    let request = seen
+        .lock()
+        .expect("lock")
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        request.contains("/computeMetadata/v1/instance/service-accounts/default/identity"),
+        "the identity path must be requested, got: {request}"
+    );
+    assert!(
+        request.contains("audience=test-audience"),
+        "the audience must be passed through, got: {request}"
+    );
+    // Lowercased: reqwest normalises header names on the wire.
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("metadata-flavor: google"),
+        "the required metadata header must be sent, got: {request}"
+    );
 }
