@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -11,17 +12,21 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::error::{
-    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
-    UNSUPPORTED_PROTOCOL_VERSION,
+    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
-use crate::mcp::host::{MethodHandler, ToolDispatcher};
+use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::modern::{
     DiscoverResult, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_2026_07_28,
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
+};
+use crate::mcp::tasks::{
+    method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
+    TaskManager, TaskOwner, TASKS_EXTENSION_ID,
 };
 use crate::mcp::tool::{ToolContext, ToolRegistry};
 
@@ -54,6 +59,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     allowed_origins: Vec<String>,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
+    task_manager: Option<Arc<TaskManager>>,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -80,6 +86,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             allowed_origins: Vec::new(),
             tool_dispatcher: None,
             method_handler: None,
+            task_manager: None,
         }
     }
 
@@ -144,6 +151,118 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     pub fn with_method_handler(mut self, handler: Arc<dyn MethodHandler<S>>) -> Self {
         self.method_handler = Some(handler);
         self
+    }
+
+    /// Enable the `io.modelcontextprotocol/tasks` extension, backed by the given
+    /// manager.
+    ///
+    /// Installing a manager makes the server serve `tasks/get`, `tasks/update`
+    /// and `tasks/cancel`, advertise the extension in `server/discover`, and
+    /// honour a [`CallToolOutcome::Task`] from the dispatcher. Without one the
+    /// extension is absent end-to-end: the methods report method-not-found and
+    /// a dispatcher returning a task handle is refused, so a half-configured
+    /// server cannot advertise a capability it will not serve.
+    #[must_use]
+    pub fn with_task_manager(mut self, manager: Arc<TaskManager>) -> Self {
+        self.task_manager = Some(manager);
+        self
+    }
+
+    /// The capabilities to advertise, with the tasks extension merged in when a
+    /// [`TaskManager`] is installed.
+    fn advertised_capabilities(&self) -> ServerCapabilities {
+        let mut capabilities = self.capabilities.clone();
+        if self.task_manager.is_some() {
+            capabilities
+                .extensions
+                .get_or_insert_with(HashMap::new)
+                .entry(TASKS_EXTENSION_ID.to_owned())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        }
+        capabilities
+    }
+
+    /// Build a `MissingRequiredClientCapabilityError` (-32021) naming what the
+    /// client failed to declare.
+    fn missing_capability_error(id: Option<Value>, capability: &str) -> JsonRpcResponse {
+        let data = serde_json::json!({ "requiredCapabilities": [capability] });
+        JsonRpcResponse::error_with_data(
+            id,
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
+            format!("Request requires the undeclared client capability '{capability}'"),
+            data,
+        )
+    }
+
+    /// Map a [`TaskError`] onto its JSON-RPC response.
+    ///
+    /// A task belonging to another owner is reported as absent, never as
+    /// forbidden, so a response cannot confirm that someone else's task exists.
+    fn task_error_response(id: Option<Value>, error: &TaskError) -> JsonRpcResponse {
+        match error {
+            TaskError::NotFound(_) | TaskError::InvalidState { .. } => {
+                JsonRpcResponse::error(id, INVALID_PARAMS, error.to_string())
+            }
+            TaskError::Store(_) => JsonRpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
+        }
+    }
+
+    /// Read the required `taskId` parameter from a `tasks/*` request.
+    fn task_id_param(params: Option<&Value>) -> Result<TaskId, String> {
+        params
+            .and_then(|p| p.get("taskId"))
+            .and_then(Value::as_str)
+            .map(TaskId::new)
+            .ok_or_else(|| "Missing required parameter 'taskId'".to_owned())
+    }
+
+    /// Serve `tasks/get`, `tasks/update` and `tasks/cancel`.
+    ///
+    /// Only reachable in the modern era and only when the caller declared the
+    /// extension — both gates are applied by [`Self::process_modern`].
+    async fn handle_task_method(
+        &self,
+        manager: &TaskManager,
+        method: &str,
+        id: Option<Value>,
+        params: Option<&Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
+        let task_id = match Self::task_id_param(params) {
+            Ok(task_id) => task_id,
+            Err(reason) => return JsonRpcResponse::error(id, INVALID_PARAMS, reason),
+        };
+        let owner = TaskOwner {
+            user_id: ctx.user_id.clone(),
+            tenant_id: ctx.tenant_id.clone(),
+        };
+
+        match method {
+            task_methods::TASKS_GET => match manager.get(&owner, &task_id).await {
+                Ok(task) => Self::success_or_error(id, &GetTaskResult::new(task)),
+                Err(e) => Self::task_error_response(id, &e),
+            },
+            task_methods::TASKS_UPDATE => {
+                if params.and_then(|p| p.get("inputResponses")).is_none() {
+                    return JsonRpcResponse::error(
+                        id,
+                        INVALID_PARAMS,
+                        "Missing required parameter 'inputResponses'".to_owned(),
+                    );
+                }
+                match manager.apply_input(&owner, &task_id).await {
+                    Ok(_) => Self::success_or_error(id, &TaskAck::new()),
+                    Err(e) => Self::task_error_response(id, &e),
+                }
+            }
+            task_methods::TASKS_CANCEL => match manager.cancel(&owner, &task_id).await {
+                Ok(_) => Self::success_or_error(id, &TaskAck::new()),
+                Err(e) => Self::task_error_response(id, &e),
+            },
+            other => {
+                JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Method not found: {other}"))
+            }
+        }
     }
 
     /// Authenticate a request via the configured [`AuthHook`], or yield the
@@ -229,8 +348,11 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request.id, request.params.as_ref()),
             "tools/list" => self.handle_tools_list(request.id, ctx).await,
+            // `allow_tasks: false` — the extension exists only in the modern
+            // era, so a legacy client can never be handed a task handle it has
+            // no contract for (and whose response would skip `resultType`).
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, ctx)
+                self.handle_tools_call(request.id, request.params, ctx, false)
                     .await
             }
             "server/discover" => self.handle_server_discover(request.id),
@@ -259,15 +381,44 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             return self.unsupported_version_error(request.id, &meta.protocol_version);
         }
 
+        // Capabilities are declared per request in this era; a server MUST NOT
+        // infer them from an earlier one. Carry this request's declaration into
+        // the context so dispatch can honour the extension opt-in.
+        let ctx = ctx
+            .clone()
+            .with_client_capabilities(meta.client_capabilities);
+        let declares_tasks = ctx.supports_tasks();
+
         let response = match request.method.as_str() {
             "server/discover" => self.handle_server_discover(request.id),
-            "tools/list" => self.handle_tools_list(request.id, ctx).await,
+            "tools/list" => self.handle_tools_list(request.id, &ctx).await,
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, ctx)
+                self.handle_tools_call(request.id, request.params, &ctx, declares_tasks)
                     .await
             }
+            method @ (task_methods::TASKS_GET
+            | task_methods::TASKS_UPDATE
+            | task_methods::TASKS_CANCEL) => match &self.task_manager {
+                // Serving a tasks/* method to a client that never declared the
+                // extension is exactly the -32021 case.
+                Some(manager) if declares_tasks => {
+                    self.handle_task_method(
+                        manager,
+                        method,
+                        request.id,
+                        request.params.as_ref(),
+                        &ctx,
+                    )
+                    .await
+                }
+                Some(_) => Self::missing_capability_error(request.id, TASKS_EXTENSION_ID),
+                None => {
+                    self.handle_unknown_method(method, request.id, request.params, &ctx)
+                        .await
+                }
+            },
             other => {
-                self.handle_unknown_method(other, request.id, request.params, ctx)
+                self.handle_unknown_method(other, request.id, request.params, &ctx)
                     .await
             }
         };
@@ -321,7 +472,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     fn handle_server_discover(&self, id: Option<Value>) -> JsonRpcResponse {
         let discover = DiscoverResult::new(
             self.supported_versions.clone(),
-            self.capabilities.clone(),
+            self.advertised_capabilities(),
             ServerInfo::new(self.name.clone(), self.version.clone()),
             self.instructions.clone(),
         );
@@ -408,11 +559,17 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     }
 
     /// Handle `tools/call` — dispatch to the named tool handler under `ctx`
+    /// Handle `tools/call`.
+    ///
+    /// `allow_tasks` is true only for a modern-era call whose client declared
+    /// the tasks extension; it gates whether the dispatcher's
+    /// [`CallToolOutcome::Task`] may be framed as a handle.
     async fn handle_tools_call(
         &self,
         id: Option<Value>,
         params: Option<Value>,
         ctx: &ToolContext,
+        allow_tasks: bool,
     ) -> JsonRpcResponse {
         let call: ToolCall = match params {
             Some(p) => match serde_json::from_value(p) {
@@ -439,21 +596,35 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
         // A host dispatcher owns the whole call (quota, exec, usage); otherwise
-        // execute against the built-in registry.
-        let result = match &self.tool_dispatcher {
+        // execute against the built-in registry, which is always synchronous.
+        let outcome = match &self.tool_dispatcher {
             Some(dispatcher) => {
                 dispatcher
-                    .call_tool(&call.name, &self.state, ctx, arguments)
+                    .call_tool_outcome(&call.name, &self.state, ctx, arguments)
                     .await
             }
-            None => {
+            None => CallToolOutcome::Immediate(Box::new(
                 self.tools
                     .execute(&call.name, &self.state, ctx, arguments)
-                    .await
-            }
+                    .await,
+            )),
         };
 
-        Self::tool_response_result(id, &result)
+        match outcome {
+            CallToolOutcome::Immediate(result) => Self::tool_response_result(id, &result),
+            // The specification forbids handing a task to a client that did not
+            // declare the extension, so a dispatcher that mints one anyway is a
+            // host bug — surface it rather than emitting a non-conformant reply.
+            CallToolOutcome::Task(task) if allow_tasks && self.task_manager.is_some() => {
+                Self::success_or_error(id, &CreateTaskResult::new(*task))
+            }
+            CallToolOutcome::Task(_) => JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                "Tool returned a task handle, but this call may not be answered asynchronously"
+                    .to_owned(),
+            ),
+        }
     }
 
     /// Serialize a [`ToolResponse`] into a `tools/call` success response, or an
@@ -488,6 +659,7 @@ mod tests {
                 name: "ping_tool".to_owned(),
                 description: "Returns pong".to_owned(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
                 annotations: None,
             }
         }
@@ -761,10 +933,34 @@ mod tests {
     #[tokio::test]
     async fn modern_malformed_meta_returns_invalid_params() {
         let server = make_server();
-        // protocolVersion present (modern) but clientInfo missing => malformed.
+        // protocolVersion present (modern) but clientCapabilities missing =>
+        // malformed. Capabilities are declared per request in this era and a
+        // server may not infer them from an earlier one, so their absence is
+        // genuinely unserviceable.
         let raw = r#"{
             "jsonrpc": "2.0",
             "id": 24,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": { "name": "C", "version": "1" }
+                }
+            }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn modern_meta_without_client_info_is_served() {
+        let server = make_server();
+        // `clientInfo` is optional in the specification. Rejecting a request
+        // that omits it made every client leaving it out unreachable.
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 25,
             "method": "tools/list",
             "params": {
                 "_meta": {
@@ -774,8 +970,11 @@ mod tests {
             }
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
-        let err = resp.error.expect("error"); // Safe: test assertion
-        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(resp.error.is_none(), "clientInfo is optional");
+        assert_eq!(
+            resp.result.expect("result")["resultType"], // Safe: test assertion
+            "complete"
+        );
     }
 
     // ---- Host-integration seams (host.rs) ----
@@ -794,6 +993,7 @@ mod tests {
                     name: "scoped_tool".to_owned(),
                     description: "tenant-scoped".to_owned(),
                     input_schema: json!({"type": "object"}),
+                    output_schema: None,
                     annotations: None,
                 }]
             } else {

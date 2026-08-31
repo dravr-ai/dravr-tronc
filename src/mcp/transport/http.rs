@@ -208,6 +208,7 @@ mod tests {
                 name: "hello".to_owned(),
                 description: "Says hello".to_owned(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
                 annotations: None,
             }
         }
@@ -239,6 +240,7 @@ mod tests {
                 name: "admin_op".to_owned(),
                 description: "Admin-only".to_owned(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
                 annotations: None,
             }
         }

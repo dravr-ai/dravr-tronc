@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.8.0] — 2026-08-31
+
+Protocol revision `2026-07-28` conformance. Breaking: `Tool`,
+`ToolSchema`, `ServerCapabilities`, `JsonSchema`, `PropertySchema` and
+`ToolContext` all gained fields, so exhaustive struct literals need updating —
+add `..Default::default()` (every one of these now derives `Default`). The two
+reserved error-code constants changed value.
+
+### Added
+
+- feat(mcp): implement the `io.modelcontextprotocol/tasks` extension (SEP-2663)
+  — durable task handles returned in lieu of a `tools/call` result and polled
+  via `tasks/get`, plus `tasks/update` and `tasks/cancel`. New `mcp::tasks`
+  module: the flat `CreateTaskResult`, the five-state lifecycle
+  (`working`/`input_required`/`completed`/`failed`/`cancelled`), a `TaskStore`
+  seam with an in-memory default, and `TaskManager`. Enabled per server with
+  `McpServer::with_task_manager`; without one the extension is absent
+  end-to-end rather than advertised-but-unserved.
+- feat(mcp): `ToolDispatcher::call_tool_outcome` — a defaulted trait method
+  returning `CallToolOutcome::{Immediate, Task}`, so an existing dispatcher
+  keeps its behaviour untouched.
+- feat(mcp): `ToolContext::client_capabilities` plus `supports_tasks` /
+  `declares_extension`, carrying the per-request capability declaration the
+  extension's opt-in requires.
+- feat(mcp): `ServerCapabilities::extensions` — the specified reverse-DNS
+  extension map, distinct from the unspecified `experimental`.
+- feat(mcp): `outputSchema` on `Tool` and `ToolSchema`.
+- feat(mcp): JSON Schema 2020-12 vocabulary on `JsonSchema`/`PropertySchema` —
+  `$schema`, `$defs`, `$ref`, `oneOf`/`anyOf`/`allOf`, `enum`, `const`,
+  `default`, `format`, `pattern`, numeric and length and item bounds,
+  `additionalProperties`. An empty `type` is omitted, which is what a
+  `$ref`-only or composition-only subschema needs.
+
+### Fixed
+
+- fix(mcp): the reserved error codes sat inside the implementation-defined
+  band, where no client could recognise them. `MISSING_REQUIRED_CLIENT_CAPABILITY`
+  moves `-32003` → `-32021` and `UNSUPPORTED_PROTOCOL_VERSION` `-32004` →
+  `-32022`; `HEADER_MISMATCH` (`-32020`) is added. The specification reserves
+  `-32020`..`-32099` for itself and `-32000`..`-32019` for implementations.
+- fix(mcp): `clientInfo` was rejected as a required `_meta` field though the
+  specification types it optional, making every conformant client that omits it
+  unreachable with `-32602` before any handler ran.
+
+### Changed
+
+- chore: `chrono` is no longer optional — task timestamps need it
+  unconditionally. It is dropped from the `notifications` feature list.
+
 ## [0.7.1] — 2026-08-18
 
 

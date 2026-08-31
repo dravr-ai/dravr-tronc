@@ -29,7 +29,33 @@ use serde_json::Value;
 
 use crate::mcp::protocol::JsonRpcResponse;
 use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::tasks::Task;
 use crate::mcp::tool::ToolContext;
+
+/// What a `tools/call` produced.
+///
+/// The Tasks extension lets a server answer asynchronously with a durable
+/// handle *in lieu of* the standard result, so the dispatch path cannot be
+/// typed to [`ToolResponse`] alone.
+#[derive(Debug, Clone)]
+pub enum CallToolOutcome {
+    /// The tool ran to completion; return its result directly.
+    Immediate(Box<ToolResponse>),
+    /// The host accepted the work asynchronously and minted a task. The engine
+    /// frames this as a `resultType: "task"` handle.
+    ///
+    /// A host must only produce this when
+    /// [`ToolContext::supports_tasks`](crate::mcp::tool::ToolContext::supports_tasks)
+    /// is true; the engine refuses it otherwise, because the specification
+    /// forbids handing a task to a client that did not declare the extension.
+    Task(Box<Task>),
+}
+
+impl From<ToolResponse> for CallToolOutcome {
+    fn from(response: ToolResponse) -> Self {
+        Self::Immediate(Box::new(response))
+    }
+}
 
 /// Host-owned tool surface — replaces the built-in registry for `tools/list`
 /// and `tools/call` when installed.
@@ -58,6 +84,24 @@ pub trait ToolDispatcher<S: Send + Sync + ?Sized>: Send + Sync {
         ctx: &ToolContext,
         arguments: Value,
     ) -> ToolResponse;
+
+    /// Execute a tool call, optionally answering with a task handle.
+    ///
+    /// Defaults to [`Self::call_tool`] wrapped as
+    /// [`CallToolOutcome::Immediate`], so a dispatcher that does not implement
+    /// the Tasks extension keeps its existing behaviour untouched. Override
+    /// this to run long work asynchronously: mint a task with
+    /// [`TaskManager::create`](crate::mcp::tasks::TaskManager::create), spawn
+    /// the work, and return [`CallToolOutcome::Task`].
+    async fn call_tool_outcome(
+        &self,
+        name: &str,
+        state: &Arc<S>,
+        ctx: &ToolContext,
+        arguments: Value,
+    ) -> CallToolOutcome {
+        CallToolOutcome::Immediate(Box::new(self.call_tool(name, state, ctx, arguments).await))
+    }
 }
 
 /// Host-supplied handler for methods the engine doesn't natively serve.

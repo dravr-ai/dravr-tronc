@@ -48,6 +48,7 @@ impl McpTool<AppState> for GreetTool {
                 },
                 "required": ["name"]
             }),
+            output_schema: None,
             annotations: None,
         }
     }
@@ -80,6 +81,7 @@ impl McpTool<AppState> for UppercaseTool {
                     "text": { "type": "string" }
                 }
             }),
+            output_schema: None,
             annotations: None,
         }
     }

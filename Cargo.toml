@@ -3,7 +3,7 @@
 
 [package]
 name = "dravr-tronc"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Shared MCP server infrastructure for dravr-xxx microservices"
@@ -14,7 +14,7 @@ categories = ["web-programming::http-server", "network-programming"]
 
 [features]
 default = []
-notifications = ["dep:reqwest", "dep:ring", "dep:hex", "dep:chrono"]
+notifications = ["dep:reqwest", "dep:ring", "dep:hex"]
 # Google Cloud service-to-service auth, both ends of the handshake: an
 # `IdTokenSource` for the caller and a verifying middleware for the callee.
 # Opt-in because it pulls a JWT stack, and a stdio-only MCP server has no use
@@ -37,7 +37,7 @@ async-trait = "0.1"
 axum = "0.8"
 bitflags = "2"
 jsonwebtoken = { version = "9", optional = true }
-chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = { version = "0.4", optional = true }

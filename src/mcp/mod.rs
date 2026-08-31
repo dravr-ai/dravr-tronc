@@ -10,5 +10,6 @@ pub mod modern;
 pub mod protocol;
 pub mod schema;
 pub mod server;
+pub mod tasks;
 pub mod tool;
 pub mod transport;

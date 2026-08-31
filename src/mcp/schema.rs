@@ -107,6 +107,14 @@ pub struct Tool {
     /// JSON Schema describing the tool's input.
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// JSON Schema describing the tool's structured output, when it declares
+    /// one. A tool that sets this SHOULD return `structuredContent` matching it.
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<serde_json::Value>,
     /// Optional behavioral annotations (MCP 2025-11-25).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
@@ -242,6 +250,14 @@ pub struct ServerCapabilities {
     /// Server sampling (LLM calls) capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingCapability>,
+    /// Extension capabilities, keyed by reverse-DNS identifier (revision
+    /// `2026-07-28`). An extension advertises support with an empty object,
+    /// e.g. `{"io.modelcontextprotocol/tasks": {}}`.
+    ///
+    /// Distinct from [`Self::experimental`]: extensions are specified and
+    /// negotiated, experimental capabilities are neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl ServerCapabilities {
@@ -434,6 +450,13 @@ pub struct ToolSchema {
     /// JSON Schema for the tool's input parameters.
     #[serde(rename = "inputSchema")]
     pub input_schema: JsonSchema,
+    /// JSON Schema for the tool's structured output, when it declares one.
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<JsonSchema>,
     /// Optional behavioral annotations (MCP 2025-11-25).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
@@ -451,6 +474,7 @@ impl ToolSchema {
             name,
             description,
             input_schema,
+            output_schema: None,
             annotations: None,
         }
     }
@@ -467,30 +491,75 @@ impl ToolSchema {
             name,
             description,
             input_schema,
+            output_schema: None,
             annotations: Some(annotations),
         }
     }
+
+    /// Declare the schema of this tool's structured output.
+    #[must_use]
+    pub fn with_output_schema(mut self, output_schema: JsonSchema) -> Self {
+        self.output_schema = Some(output_schema);
+        self
+    }
 }
 
-/// A (typed) JSON Schema definition for tool inputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A (typed) JSON Schema definition for tool inputs and outputs.
+///
+/// Revision `2026-07-28` requires tool schemas to be JSON Schema 2020-12, which
+/// admits composition (`oneOf`/`anyOf`/`allOf`), references (`$ref`/`$defs`) and
+/// the validation vocabulary — not just flat `properties`/`required`.
+///
+/// A schema that is *only* a reference or a composition carries no `type`; leave
+/// [`Self::schema_type`] empty and it is omitted from the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonSchema {
-    /// Schema type (e.g. `"object"`, `"string"`).
-    #[serde(rename = "type")]
+    /// Dialect declaration, e.g.
+    /// `"https://json-schema.org/draft/2020-12/schema"`.
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema_dialect: Option<String>,
+    /// Schema type (e.g. `"object"`, `"string"`). Empty means "no `type`".
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
     pub schema_type: String,
+    /// Human-readable schema description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Property definitions for object schemas.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<HashMap<String, PropertySchema>>,
     /// Names of required properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
+    /// Whether properties beyond those declared are permitted.
+    #[serde(
+        rename = "additionalProperties",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_properties: Option<bool>,
+    /// Reusable subschemas referenced by `$ref`.
+    #[serde(rename = "$defs", default, skip_serializing_if = "Option::is_none")]
+    pub defs: Option<HashMap<String, PropertySchema>>,
+    /// Exactly one of these subschemas must validate.
+    #[serde(rename = "oneOf", default, skip_serializing_if = "Option::is_none")]
+    pub one_of: Option<Vec<PropertySchema>>,
+    /// At least one of these subschemas must validate.
+    #[serde(rename = "anyOf", default, skip_serializing_if = "Option::is_none")]
+    pub any_of: Option<Vec<PropertySchema>>,
+    /// All of these subschemas must validate.
+    #[serde(rename = "allOf", default, skip_serializing_if = "Option::is_none")]
+    pub all_of: Option<Vec<PropertySchema>>,
 }
 
-/// A JSON Schema property definition.
+/// A JSON Schema property definition (JSON Schema 2020-12 subset).
+///
+/// As with [`JsonSchema`], an empty [`Self::property_type`] omits `type`, which
+/// is what a `$ref`-only or composition-only subschema needs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PropertySchema {
-    /// Property type (e.g. `"string"`, `"number"`, `"boolean"`).
-    #[serde(rename = "type")]
+    /// Property type (e.g. `"string"`, `"number"`, `"boolean"`). Empty means
+    /// "no `type`".
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
     pub property_type: String,
     /// Human-readable property description.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -504,6 +573,58 @@ pub struct PropertySchema {
     /// Required fields for object-type properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
+    /// Whether properties beyond those declared are permitted.
+    #[serde(
+        rename = "additionalProperties",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_properties: Option<bool>,
+    /// Permitted values (JSON Schema `enum`).
+    #[serde(rename = "enum", default, skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<serde_json::Value>>,
+    /// The single permitted value (JSON Schema `const`).
+    #[serde(rename = "const", default, skip_serializing_if = "Option::is_none")]
+    pub const_value: Option<serde_json::Value>,
+    /// Default value advertised to clients.
+    #[serde(rename = "default", default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<serde_json::Value>,
+    /// Semantic format annotation (e.g. `"date-time"`, `"uri"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Regular expression a string value must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Inclusive lower bound for numeric values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    /// Inclusive upper bound for numeric values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+    /// Minimum length of a string value.
+    #[serde(rename = "minLength", default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// Maximum length of a string value.
+    #[serde(rename = "maxLength", default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// Minimum number of array items.
+    #[serde(rename = "minItems", default, skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    /// Maximum number of array items.
+    #[serde(rename = "maxItems", default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
+    /// Reference to a subschema, typically into `$defs`.
+    #[serde(rename = "$ref", default, skip_serializing_if = "Option::is_none")]
+    pub ref_path: Option<String>,
+    /// Exactly one of these subschemas must validate.
+    #[serde(rename = "oneOf", default, skip_serializing_if = "Option::is_none")]
+    pub one_of: Option<Vec<Self>>,
+    /// At least one of these subschemas must validate.
+    #[serde(rename = "anyOf", default, skip_serializing_if = "Option::is_none")]
+    pub any_of: Option<Vec<Self>>,
+    /// All of these subschemas must validate.
+    #[serde(rename = "allOf", default, skip_serializing_if = "Option::is_none")]
+    pub all_of: Option<Vec<Self>>,
 }
 
 /// Notification for progress on a long-running operation.
@@ -802,6 +923,7 @@ mod tests {
             name: "test_tool".to_owned(),
             description: "A test".to_owned(),
             input_schema: json!({"type": "object"}),
+            output_schema: None,
             annotations: None,
         };
         let json = serde_json::to_value(&tool).expect("serialize"); // Safe: test assertion

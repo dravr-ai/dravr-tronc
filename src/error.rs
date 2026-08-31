@@ -37,19 +37,31 @@ pub const SERVER_ERROR_END: i32 = -32_099;
 /// transport layer for unauthenticated MCP requests.
 pub const UNAUTHORIZED: i32 = -32_001;
 
-/// A required client capability was not declared (modern MCP `-32003`).
+/// A routing header disagreed with the request body (`-32020`).
+///
+/// `HeaderMismatchError` (revision 2026-07-28): the Streamable HTTP transport
+/// pairs this with HTTP 400 when `Mcp-Method` or `Mcp-Name` contradicts the
+/// JSON-RPC payload they summarise.
+pub const HEADER_MISMATCH: i32 = -32_020;
+
+/// A required client capability was not declared (`-32021`).
 ///
 /// `MissingRequiredClientCapabilityError` (revision 2026-07-28):
 /// `data.requiredCapabilities` lists the missing capabilities; paired with
 /// HTTP 400 on the transport layer.
-pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32_003;
+///
+/// The specification reserves `-32020` through `-32099` for codes it defines
+/// and `-32000` through `-32019` for implementation-defined ones, so this code
+/// must stay in the reserved band — it previously sat at `-32003`, inside the
+/// implementation-defined range, where no client could recognise it.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32_021;
 
-/// The request's declared protocol version is unsupported (modern MCP `-32004`).
+/// The request's declared protocol version is unsupported (`-32022`).
 ///
 /// `UnsupportedProtocolVersionError` (revision 2026-07-28): `data.supported`
 /// lists the server's versions and `data.requested` echoes the client's;
 /// paired with HTTP 400 on the transport layer.
-pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32_004;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32_022;
 
 // ============================================================================
 // REST API Error Response

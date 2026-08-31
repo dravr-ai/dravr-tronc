@@ -12,6 +12,7 @@ use bitflags::bitflags;
 use serde_json::Value;
 
 use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::tasks::TASKS_EXTENSION_ID;
 
 bitflags! {
     /// Host-agnostic classification flags a tool declares for discovery + gating.
@@ -56,6 +57,14 @@ pub struct ToolContext {
     pub request_id: Option<Value>,
     /// Whether the caller holds admin privileges (resolved by the host).
     pub is_admin: bool,
+    /// Capabilities the client declared for *this* request, verbatim from
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]` (revision
+    /// `2026-07-28`). Kept as raw JSON so a host can inspect any extension key.
+    ///
+    /// `None` on a legacy request, which declares capabilities once at
+    /// `initialize` rather than per call. Capabilities are per-request in the
+    /// modern era and a server MUST NOT infer them from an earlier request.
+    pub client_capabilities: Option<Value>,
 }
 
 impl ToolContext {
@@ -98,6 +107,35 @@ impl ToolContext {
     pub const fn as_admin(mut self, is_admin: bool) -> Self {
         self.is_admin = is_admin;
         self
+    }
+
+    /// Record the client capabilities declared on this request.
+    #[must_use]
+    pub fn with_client_capabilities(mut self, capabilities: Value) -> Self {
+        self.client_capabilities = Some(capabilities);
+        self
+    }
+
+    /// Whether the client declared the named extension on *this* request.
+    ///
+    /// Reads `capabilities.extensions[<id>]`. A legacy request declares no
+    /// per-request capabilities, so this is always `false` for one — which is
+    /// correct: the extension exists only in the modern era.
+    #[must_use]
+    pub fn declares_extension(&self, extension_id: &str) -> bool {
+        self.client_capabilities
+            .as_ref()
+            .and_then(|caps| caps.get("extensions"))
+            .and_then(|extensions| extensions.get(extension_id))
+            .is_some()
+    }
+
+    /// Whether the client declared `io.modelcontextprotocol/tasks`.
+    ///
+    /// A server MUST NOT answer with a task handle unless this is true.
+    #[must_use]
+    pub fn supports_tasks(&self) -> bool {
+        self.declares_extension(TASKS_EXTENSION_ID)
     }
 }
 
@@ -254,6 +292,7 @@ mod tests {
                         "message": { "type": "string" }
                     }
                 }),
+                output_schema: None,
                 annotations: None,
             }
         }
@@ -285,6 +324,7 @@ mod tests {
                 name: "counter".to_owned(),
                 description: "Returns the counter value".to_owned(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
                 annotations: None,
             }
         }
@@ -308,6 +348,7 @@ mod tests {
                 name: "admin_reset".to_owned(),
                 description: "Admin-only reset".to_owned(),
                 input_schema: json!({"type": "object"}),
+                output_schema: None,
                 annotations: None,
             }
         }

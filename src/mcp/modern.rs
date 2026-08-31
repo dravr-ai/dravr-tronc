@@ -26,7 +26,7 @@ pub const PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 pub mod meta_keys {
     /// Protocol version for this request, e.g. `"2026-07-28"`. Required.
     pub const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
-    /// Client name and version (`Implementation`). Required.
+    /// Client name and version (`Implementation`). Optional.
     pub const CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
     /// Client capabilities relevant to this request. Required.
     pub const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
@@ -49,8 +49,9 @@ pub struct ModernClientInfo {
 pub struct ModernRequestMeta {
     /// Declared protocol version for this request.
     pub protocol_version: String,
-    /// Client identity.
-    pub client_info: ModernClientInfo,
+    /// Client identity, when the client chose to send it. The specification
+    /// types this field optional, so a request omitting it is well-formed.
+    pub client_info: Option<ModernClientInfo>,
     /// Declared client capabilities (kept as raw JSON so capability checks can
     /// look up arbitrary keys and report `MissingRequiredClientCapabilityError`).
     pub client_capabilities: Value,
@@ -95,15 +96,9 @@ impl ModernRequestMeta {
             return ModernMeta::Legacy;
         };
 
-        let Some(client_info) = meta
+        let client_info = meta
             .get(meta_keys::CLIENT_INFO)
-            .and_then(|v| from_value::<ModernClientInfo>(v.clone()).ok())
-        else {
-            return ModernMeta::Malformed(format!(
-                "missing or invalid required _meta field '{}'",
-                meta_keys::CLIENT_INFO
-            ));
-        };
+            .and_then(|v| from_value::<ModernClientInfo>(v.clone()).ok());
 
         let Some(client_capabilities) = meta.get(meta_keys::CLIENT_CAPABILITIES).cloned() else {
             return ModernMeta::Malformed(format!(
@@ -221,19 +216,40 @@ mod tests {
         assert!(matches!(outcome, ModernMeta::Modern(_)));
         if let ModernMeta::Modern(meta) = outcome {
             assert_eq!(meta.protocol_version, "2026-07-28");
-            assert_eq!(meta.client_info.name, "ExampleClient");
-            assert_eq!(meta.client_info.version, "1.0.0");
+            let client_info = meta.client_info.expect("clientInfo was supplied"); // Safe: test assertion
+            assert_eq!(client_info.name, "ExampleClient");
+            assert_eq!(client_info.version, "1.0.0");
             assert_eq!(meta.log_level.as_deref(), Some("info"));
             assert!(meta.client_capabilities.get("tools").is_some());
         }
     }
 
     #[test]
-    fn modern_request_missing_client_info_is_malformed() {
+    fn modern_request_without_client_info_is_well_formed() {
+        // The specification types `clientInfo` optional. Rejecting a request
+        // that omits it made every conformant client that leaves it out
+        // unreachable, extensions included.
         let params = json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                 "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let outcome = ModernRequestMeta::from_params(Some(&params));
+        assert!(matches!(outcome, ModernMeta::Modern(_)));
+        if let ModernMeta::Modern(meta) = outcome {
+            assert!(meta.client_info.is_none());
+        }
+    }
+
+    #[test]
+    fn modern_request_missing_client_capabilities_is_malformed() {
+        // `clientCapabilities` genuinely is required — capabilities are declared
+        // per request and a server may not infer them from an earlier one.
+        let params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { "name": "C", "version": "1" }
             }
         });
         assert!(matches!(
