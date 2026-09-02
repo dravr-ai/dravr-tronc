@@ -16,13 +16,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dravr_tronc::mcp::host::{CallToolOutcome, ToolDispatcher};
-use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::mcp::protocol::JsonRpcRequest;
+use dravr_tronc::mcp::schema::{TaskSupport, Tool, ToolExecution, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tasks::{
-    DetailedTask, InMemoryTaskStore, Task, TaskId, TaskManager, TaskOwner, TaskPayload, TaskStatus,
+    DetailedTask, InMemoryTaskStore, Task, TaskId, TaskManager, TaskOptions, TaskOwner,
+    TaskPayload, TaskStatus,
 };
 use dravr_tronc::mcp::tool::{ToolContext, ToolRegistry};
 use serde_json::{json, Map, Value};
+use std::time::Duration;
+use tokio::time::timeout;
 
 /// State for the test server.
 struct TestState;
@@ -42,6 +46,7 @@ impl ToolDispatcher<TestState> for TaskingDispatcher {
             input_schema: json!({"type": "object"}),
             output_schema: None,
             annotations: None,
+            execution: None,
         }]
     }
 
@@ -75,6 +80,10 @@ impl ToolDispatcher<TestState> for TaskingDispatcher {
 
 fn manager() -> Arc<TaskManager> {
     Arc::new(TaskManager::new(Arc::new(InMemoryTaskStore::new())))
+}
+
+fn parse_request(value: Value) -> JsonRpcRequest {
+    serde_json::from_value(value).expect("request json")
 }
 
 fn server_with_tasks(manager: Arc<TaskManager>) -> McpServer<TestState> {
@@ -468,4 +477,184 @@ async fn unknown_task_id_is_reported_as_absent() {
 
     let response = server.handle_raw(&raw).await.expect("response");
     assert!(response.error.is_some());
+}
+
+/// SEP-2663: a tool's task-support declaration serializes under `execution`
+/// with camelCase levels, and its absence round-trips as absence — the safe
+/// reading for every pre-Tasks client.
+#[test]
+fn tool_execution_task_support_round_trips() {
+    let tool = Tool {
+        name: "long_tool".to_owned(),
+        description: "may answer with a handle".to_owned(),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        annotations: None,
+        execution: Some(ToolExecution {
+            task_support: TaskSupport::Optional,
+        }),
+    };
+    let wire = serde_json::to_value(&tool).expect("serialize");
+    assert_eq!(wire["execution"]["taskSupport"], "optional");
+
+    let back: Tool = serde_json::from_value(wire).expect("deserialize");
+    assert_eq!(
+        back.execution.expect("execution present").task_support,
+        TaskSupport::Optional
+    );
+
+    // Absent stays absent on the wire and in the model.
+    let bare = Tool {
+        name: "sync_tool".to_owned(),
+        description: "always inline".to_owned(),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        annotations: None,
+        execution: None,
+    };
+    let wire = serde_json::to_value(&bare).expect("serialize");
+    assert!(wire.get("execution").is_none());
+    let back: Tool = serde_json::from_value(wire).expect("deserialize");
+    assert!(back.execution.is_none());
+}
+
+/// A subscription pushes each observed transition for its owner — and only
+/// its owner: a second owner's stream stays silent through the whole
+/// lifecycle.
+#[tokio::test]
+async fn subscription_pushes_transitions_for_the_owner_only() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    let manager = TaskManager::with_options(
+        store,
+        TaskOptions {
+            ttl_ms: Some(60_000),
+            poll_interval_ms: 10,
+        },
+    );
+    let owner = TaskOwner {
+        user_id: Some("user-a".to_owned()),
+        tenant_id: Some("tenant-a".to_owned()),
+    };
+    let stranger = TaskOwner {
+        user_id: Some("user-b".to_owned()),
+        tenant_id: Some("tenant-b".to_owned()),
+    };
+
+    let mut mine = manager.subscribe(&owner);
+    let mut theirs = manager.subscribe(&stranger);
+
+    let task_id = TaskId::new("pushed-task");
+    manager
+        .create(&owner, task_id.clone())
+        .await
+        .expect("create");
+
+    let frame = timeout(Duration::from_secs(2), mine.next())
+        .await
+        .expect("a frame within the window")
+        .expect("stream open");
+    assert_eq!(frame.method, "notifications/tasks");
+    let params = frame.params.expect("params");
+    assert_eq!(params["taskId"], "pushed-task");
+    assert_eq!(params["status"], "working");
+
+    let mut result = Map::new();
+    result.insert(
+        "content".to_owned(),
+        json!([{"type": "text", "text": "ok"}]),
+    );
+    manager
+        .complete(&owner, &task_id, result)
+        .await
+        .expect("complete");
+
+    let frame = timeout(Duration::from_secs(2), mine.next())
+        .await
+        .expect("terminal frame within the window")
+        .expect("stream open");
+    assert_eq!(frame.params.expect("params")["status"], "completed");
+
+    // The stranger's stream saw nothing through the whole lifecycle.
+    let silent = timeout(Duration::from_millis(100), theirs.next()).await;
+    assert!(silent.is_err(), "another owner's stream must stay silent");
+}
+
+/// The unary dispatch path cannot stream, and says so — never method-not-found
+/// while a `TaskManager` is installed.
+#[tokio::test]
+async fn listen_through_the_unary_path_is_refused_with_guidance() {
+    let manager = Arc::new(TaskManager::new(Arc::new(InMemoryTaskStore::new())));
+    let server = server_with_tasks(manager);
+    let raw = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} }
+                }
+            }
+        }
+    })
+    .to_string();
+    let response = server.handle_raw(&raw).await.expect("response");
+    let error = response.error.expect("error");
+    assert!(
+        error.message.contains("streaming transport"),
+        "got: {}",
+        error.message
+    );
+}
+
+/// `open_task_subscription` enforces the same gates as the unary tasks methods:
+/// an undeclared client gets -32021, a legacy-shaped request invalid-params.
+#[tokio::test]
+async fn open_task_subscription_gates_on_declaration_and_era() {
+    let manager = Arc::new(TaskManager::new(Arc::new(InMemoryTaskStore::new())));
+    let server = server_with_tasks(manager);
+    let ctx = ToolContext::new().with_user("u1").with_tenant("t1");
+
+    let undeclared = parse_request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    }));
+    let err = server
+        .open_task_subscription(&undeclared, &ctx)
+        .expect_err("undeclared must be refused");
+    assert_eq!(err.error.expect("error").code, -32021);
+
+    let legacy = parse_request(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "subscriptions/listen",
+        "params": {}
+    }));
+    let err = server
+        .open_task_subscription(&legacy, &ctx)
+        .expect_err("legacy shape must be refused");
+    assert_eq!(err.error.expect("error").code, -32602);
+
+    let declared = parse_request(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} }
+                }
+            }
+        }
+    }));
+    assert!(server.open_task_subscription(&declared, &ctx).is_ok());
 }

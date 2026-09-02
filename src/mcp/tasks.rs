@@ -23,17 +23,21 @@
 //! required to send it; this engine is deliberately poll-only, because its
 //! Streamable HTTP transport has no long-lived server-to-client stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
+
+use crate::mcp::protocol::JsonRpcRequest;
 
 /// Reverse-DNS identifier for the tasks extension, used both in a client's
 /// declared capabilities and in the server's `server/discover` advertisement.
@@ -56,8 +60,15 @@ pub mod method_names {
     pub const TASKS_UPDATE: &str = "tasks/update";
     /// Request cooperative cancellation of a task.
     pub const TASKS_CANCEL: &str = "tasks/cancel";
-    /// Optional server-to-client status push (not emitted by this engine).
+    /// Server-to-client task status push, delivered over a
+    /// [`SUBSCRIPTIONS_LISTEN`](Self::SUBSCRIPTIONS_LISTEN) stream.
     pub const NOTIFICATIONS_TASKS: &str = "notifications/tasks";
+    /// Open a server-to-client notification stream.
+    ///
+    /// The engine hands the transport a
+    /// [`TaskSubscription`](super::tasks::TaskSubscription) to drain; a
+    /// transport that cannot stream answers with an error instead.
+    pub const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
 }
 
 /// Opaque, server-minted task identifier.
@@ -429,6 +440,18 @@ pub trait TaskStore: Send + Sync {
 
     /// Drop tasks whose TTL has elapsed, returning how many were removed.
     async fn sweep_expired(&self) -> Result<usize, TaskError>;
+
+    /// Every non-terminal task visible to `owner`.
+    ///
+    /// Feeds [`TaskManager::subscribe`]'s store watch. Defaults to an empty
+    /// list so adding it stays semver-additive — but a store that does not
+    /// override it emits **no push events** (subscriptions stay silent while
+    /// polling remains fully correct). Override it in any durable store that
+    /// serves `subscriptions/listen`.
+    async fn active_tasks(&self, owner: &TaskOwner) -> Result<Vec<DetailedTask>, TaskError> {
+        let _ = owner;
+        Ok(Vec::new())
+    }
 }
 
 /// Process-local [`TaskStore`]. Tasks vanish on restart, which is the right
@@ -486,6 +509,17 @@ impl TaskStore for InMemoryTaskStore {
         let before = entries.len();
         entries.retain(|_, (_, task)| !is_expired(&task.task));
         Ok(before - entries.len())
+    }
+
+    async fn active_tasks(&self, owner: &TaskOwner) -> Result<Vec<DetailedTask>, TaskError> {
+        let entries = self.entries.read().await;
+        Ok(entries
+            .values()
+            .filter(|(task_owner, task)| {
+                task_owner == owner && !task.status().is_terminal() && !is_expired(&task.task)
+            })
+            .map(|(_, task)| task.clone())
+            .collect())
     }
 }
 
@@ -664,5 +698,113 @@ impl TaskManager {
     /// Drop tasks whose TTL elapsed.
     pub async fn sweep_expired(&self) -> Result<usize, TaskError> {
         self.store.sweep_expired().await
+    }
+
+    /// Open a push subscription for `owner`'s tasks.
+    ///
+    /// A background watcher polls the store at the manager's poll interval
+    /// and emits one `notifications/tasks` frame per observed change: a task
+    /// appearing, changing state, or leaving the active set (its terminal
+    /// state is fetched and emitted). The watcher stops when the returned
+    /// [`TaskSubscription`] is dropped.
+    ///
+    /// Poll-based by design (ADR-024): the store is the cross-replica truth,
+    /// so a transition settled on any replica reaches every subscriber
+    /// within one poll interval. A task created AND settled inside a single
+    /// interval emits only if its id was ever observed — the client that
+    /// minted it still holds the handle and `tasks/get` remains authoritative.
+    #[must_use]
+    pub fn subscribe(&self, owner: &TaskOwner) -> TaskSubscription {
+        let (tx, rx) = mpsc::channel(SUBSCRIPTION_BUFFER);
+        let store = Arc::clone(&self.store);
+        let owner = owner.clone();
+        let interval = Duration::from_millis(self.options.poll_interval_ms.max(1));
+        tokio::spawn(watch_tasks(store, owner, interval, tx));
+        TaskSubscription { rx }
+    }
+}
+
+/// Buffered frames per subscription; a subscriber slower than this loses the
+/// connection rather than the server growing an unbounded queue.
+const SUBSCRIPTION_BUFFER: usize = 32;
+
+/// A live `notifications/tasks` stream for one owner.
+///
+/// Drain it with [`TaskSubscription::next`]; dropping it stops the watcher.
+pub struct TaskSubscription {
+    rx: mpsc::Receiver<JsonRpcRequest>,
+}
+
+impl Debug for TaskSubscription {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("TaskSubscription").finish_non_exhaustive()
+    }
+}
+
+impl TaskSubscription {
+    /// The next notification frame, or `None` when the watcher has stopped.
+    pub async fn next(&mut self) -> Option<JsonRpcRequest> {
+        self.rx.recv().await
+    }
+}
+
+/// One `notifications/tasks` frame carrying the task's base state.
+fn task_notification(task: &Task) -> Option<JsonRpcRequest> {
+    serde_json::to_value(task)
+        .ok()
+        .map(|params| JsonRpcRequest::notification(method_names::NOTIFICATIONS_TASKS, Some(params)))
+}
+
+/// The store watch behind one subscription: diff the owner's active set each
+/// tick, chase vanished ids to their terminal state, stop when the receiver
+/// is gone or the store fails.
+async fn watch_tasks(
+    store: Arc<dyn TaskStore>,
+    owner: TaskOwner,
+    interval: Duration,
+    tx: mpsc::Sender<JsonRpcRequest>,
+) {
+    let mut last_seen: HashMap<TaskId, String> = HashMap::new();
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        let Ok(active) = store.active_tasks(&owner).await else {
+            // A store failure ends the stream; the client reconnects or
+            // falls back to polling, both of which read the same store.
+            return;
+        };
+        let mut current: HashSet<TaskId> = HashSet::with_capacity(active.len());
+        for task in active {
+            let id = task.task.task_id.clone();
+            current.insert(id.clone());
+            let stamp = task.task.last_updated_at.clone();
+            if last_seen.get(&id) != Some(&stamp) {
+                last_seen.insert(id, stamp);
+                if let Some(frame) = task_notification(&task.task) {
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // Ids that left the active set settled (or expired): emit their
+        // terminal state once, then forget them.
+        let vanished: Vec<TaskId> = last_seen
+            .keys()
+            .filter(|id| !current.contains(*id))
+            .cloned()
+            .collect();
+        for id in vanished {
+            last_seen.remove(&id);
+            if let Ok(Some(task)) = store.get(&owner, &id).await {
+                if let Some(frame) = task_notification(&task.task) {
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        sleep(interval).await;
     }
 }

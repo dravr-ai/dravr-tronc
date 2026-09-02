@@ -50,6 +50,7 @@ impl McpTool<AppState> for GreetTool {
             }),
             output_schema: None,
             annotations: None,
+            execution: None,
         }
     }
 
@@ -83,6 +84,7 @@ impl McpTool<AppState> for UppercaseTool {
             }),
             output_schema: None,
             annotations: None,
+            execution: None,
         }
     }
 

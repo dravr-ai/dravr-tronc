@@ -210,6 +210,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
                 annotations: None,
+                execution: None,
             }
         }
 
@@ -242,6 +243,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
                 annotations: None,
+                execution: None,
             }
         }
 

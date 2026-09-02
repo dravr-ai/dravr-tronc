@@ -94,6 +94,28 @@ pub struct ToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
+/// Task-execution declaration for one tool (SEP-2663).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecution {
+    /// Whether calls to this tool may be answered with a task handle.
+    pub task_support: TaskSupport,
+}
+
+/// The three task-support levels a tool can declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskSupport {
+    /// The tool never returns a task handle.
+    Forbidden,
+    /// The tool may return a handle to a declaring client, and answers
+    /// inline otherwise.
+    Optional,
+    /// Every call to this tool is answered with a task handle (for a
+    /// declaring client; a non-declaring client's call is refused).
+    Required,
+}
+
 /// Tool definition exposed via `tools/list`.
 ///
 /// `input_schema` is a raw JSON Schema value so each tool can describe arbitrary
@@ -118,6 +140,11 @@ pub struct Tool {
     /// Optional behavioral annotations (MCP 2025-11-25).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    /// Task-execution declaration (SEP-2663): whether a call to this tool may
+    /// be answered with a `resultType: "task"` handle. Absent means the tool
+    /// never returns one — the safe reading for every pre-Tasks client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
 }
 
 /// Parameters for a `tools/call` request.
@@ -460,6 +487,11 @@ pub struct ToolSchema {
     /// Optional behavioral annotations (MCP 2025-11-25).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    /// Task-execution declaration (SEP-2663): whether a call to this tool may
+    /// be answered with a `resultType: "task"` handle. Absent means the tool
+    /// never returns one — the safe reading for every pre-Tasks client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
 }
 
 impl ToolSchema {
@@ -476,6 +508,7 @@ impl ToolSchema {
             input_schema,
             output_schema: None,
             annotations: None,
+            execution: None,
         }
     }
 
@@ -493,6 +526,7 @@ impl ToolSchema {
             input_schema,
             output_schema: None,
             annotations: Some(annotations),
+            execution: None,
         }
     }
 
@@ -925,6 +959,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             output_schema: None,
             annotations: None,
+            execution: None,
         };
         let json = serde_json::to_value(&tool).expect("serialize"); // Safe: test assertion
         assert_eq!(json["name"], "test_tool");

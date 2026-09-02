@@ -26,7 +26,7 @@ use crate::mcp::schema::{
 };
 use crate::mcp::tasks::{
     method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
-    TaskManager, TaskOwner, TASKS_EXTENSION_ID,
+    TaskManager, TaskOwner, TaskSubscription, TASKS_EXTENSION_ID,
 };
 use crate::mcp::tool::{ToolContext, ToolRegistry};
 
@@ -265,6 +265,73 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
     }
 
+    /// Open a `subscriptions/listen` push stream for an authenticated caller.
+    ///
+    /// Streaming transports intercept the method before unary dispatch and
+    /// call this with the transport-authenticated [`ToolContext`]; the
+    /// engine validates the modern-era metadata (declared protocol version,
+    /// the tasks extension declared on THIS request) and hands back a
+    /// [`TaskSubscription`] of `notifications/tasks` frames scoped to the
+    /// caller. The transport frames them (SSE, NDJSON, ...) and owns
+    /// keep-alives and disconnects.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON-RPC response to send instead of a stream: the
+    /// unsupported-version error, `-32021` when the tasks extension was not
+    /// declared, or invalid-params for a legacy-shaped request. When no
+    /// [`TaskManager`] is installed the method does not exist here.
+    pub fn open_task_subscription(
+        &self,
+        request: &JsonRpcRequest,
+        ctx: &ToolContext,
+    ) -> Result<TaskSubscription, Box<JsonRpcResponse>> {
+        let Some(manager) = &self.task_manager else {
+            return Err(Box::new(JsonRpcResponse::error(
+                request.id.clone(),
+                METHOD_NOT_FOUND,
+                format!("Method not found: {}", task_methods::SUBSCRIPTIONS_LISTEN),
+            )));
+        };
+        let meta = match ModernRequestMeta::from_params(request.params.as_ref()) {
+            ModernMeta::Modern(meta) => *meta,
+            ModernMeta::Legacy => {
+                return Err(Box::new(JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    "subscriptions/listen exists only in the modern era".to_owned(),
+                )));
+            }
+            ModernMeta::Malformed(reason) => {
+                return Err(Box::new(JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    reason,
+                )));
+            }
+        };
+        if !self.supports_version(&meta.protocol_version) {
+            return Err(Box::new(self.unsupported_version_error(
+                request.id.clone(),
+                &meta.protocol_version,
+            )));
+        }
+        let ctx = ctx
+            .clone()
+            .with_client_capabilities(meta.client_capabilities);
+        if !ctx.supports_tasks() {
+            return Err(Box::new(Self::missing_capability_error(
+                request.id.clone(),
+                TASKS_EXTENSION_ID,
+            )));
+        }
+        let owner = TaskOwner {
+            user_id: ctx.user_id.clone(),
+            tenant_id: ctx.tenant_id,
+        };
+        Ok(manager.subscribe(&owner))
+    }
+
     /// Authenticate a request via the configured [`AuthHook`], or yield the
     /// default anonymous [`ToolContext`] when no hook is installed.
     ///
@@ -396,6 +463,17 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 self.handle_tools_call(request.id, request.params, &ctx, declares_tasks)
                     .await
             }
+            // subscriptions/listen opens a server->client stream, which a
+            // unary request/response path cannot carry. Streaming transports
+            // intercept the method BEFORE dispatch and call
+            // [`Self::open_task_subscription`]; reaching this arm means the
+            // transport cannot stream, and the honest answer says so instead
+            // of method-not-found.
+            task_methods::SUBSCRIPTIONS_LISTEN => JsonRpcResponse::error(
+                request.id,
+                INVALID_REQUEST,
+                "subscriptions/listen requires a streaming transport".to_owned(),
+            ),
             method @ (task_methods::TASKS_GET
             | task_methods::TASKS_UPDATE
             | task_methods::TASKS_CANCEL) => match &self.task_manager {
@@ -661,6 +739,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
                 annotations: None,
+                execution: None,
             }
         }
 
@@ -995,6 +1074,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     annotations: None,
+                    execution: None,
                 }]
             } else {
                 Vec::new()
