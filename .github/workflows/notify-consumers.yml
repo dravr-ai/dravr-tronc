@@ -21,11 +21,16 @@
 # hard way: a hardcoded list left one crate behind, which put two versions in
 # Cargo.lock and hard-failed Security Audit on main.
 #
-# A dispatch that does not arrive is NOT a silent loss: every consumer's caller also
-# carries a weekly schedule, so a repo missed here catches up on its own within a
-# week. That matters because DRAVR_PLATFORM_DISPATCH_TOKEN was scoped for the
-# platform, and whether it can reach every satellite is a property of the token, not
-# of this file.
+# A repo is a consumer if it carries the caller file; that is checked before
+# anything is sent, so repos without one are skipped rather than dispatched at
+# and reported as unreachable. A consumer that cannot be dispatched to FAILS THIS
+# RUN. The first release through this wire, tronc 1.0.0 on 2026-09-04, reached
+# two of eleven consumers — DRAVR_PLATFORM_DISPATCH_TOKEN was scoped to the
+# platform and photograveur — and the run was green with nine warnings nobody
+# was reading. Reach is a property of the token, not of this file, and a token
+# that has narrowed is a red release, not a footnote. The weekly cron on each
+# caller remains the safety net for a dispatch lost in transit, not for a token
+# that cannot reach.
 
 name: "Tronc: Notify Consumers of Release"
 
@@ -82,38 +87,61 @@ jobs:
             exit 1
           fi
 
-          SENT=0; SKIPPED=""
+          SENT=""; MISSED=""; NOT_CONSUMER=""; UNREADABLE=""
           for R in ${REPOS}; do
-            # A repo with no listener answers 204 just the same, so a send is not
-            # evidence anything acted. The consumer's own run is.
+            # Consumer or not: the caller file is the enrolment, so its presence is
+            # the test. 200 = consumer; 404 = not a consumer, skip quietly; anything
+            # else means the token cannot even read the repo, which is the same
+            # failure as not being able to dispatch to it.
+            CODE=$(gh api "repos/${R}/contents/.github/workflows/tronc-bump.yml" \
+                     -H "Accept: application/vnd.github.object" >/dev/null 2>&1 && echo 200 || echo other)
+            if [ "${CODE}" != "200" ]; then
+              if gh api "repos/${R}" >/dev/null 2>&1; then
+                NOT_CONSUMER="${NOT_CONSUMER} ${R}"
+              else
+                echo "::error::cannot read ${R} with DRAVR_PLATFORM_DISPATCH_TOKEN — widen the token's repository access"
+                UNREADABLE="${UNREADABLE} ${R}"
+              fi
+              continue
+            fi
+            # A consumer answers 204 to the dispatch whether or not its run then
+            # does anything; the consumer's own run is the evidence, not this send.
             if gh api -X POST "repos/${R}/dispatches" \
                  -f event_type=tronc-released \
                  -F client_payload[version]="${VERSION}" \
                  -F client_payload[sha]="${GITHUB_SHA}" 2>/dev/null; then
               echo "dispatched -> ${R}"
-              SENT=$(( SENT + 1 ))
+              SENT="${SENT} ${R}"
             else
-              # Do not abort: one unreachable repo must not stop the other ten.
-              echo "::warning::could not dispatch to ${R} (token scope, or repo disabled)"
-              SKIPPED="${SKIPPED} ${R}"
+              echo "::error::could not dispatch to consumer ${R} — token scope, or Actions disabled there"
+              MISSED="${MISSED} ${R}"
             fi
           done
 
           {
             echo "### tronc ${VERSION} announced"
             echo ""
-            echo "Dispatched \`tronc-released\` to **${SENT}** repo(s)."
-            if [ -n "${SKIPPED}" ]; then
+            echo "Dispatched \`tronc-released\` to **$(echo ${SENT} | wc -w | tr -d ' ')** consumer(s):"
+            for R in ${SENT}; do echo "- \`${R}\`"; done
+            if [ -n "${MISSED}${UNREADABLE}" ]; then
               echo ""
-              echo "Could not reach:"
-              for R in ${SKIPPED}; do echo "- \`${R}\`"; done
+              echo "**Could not reach** — this run is red until the token reaches them:"
+              for R in ${MISSED} ${UNREADABLE}; do echo "- \`${R}\`"; done
               echo ""
-              echo "Each consumer also runs this weekly on a schedule, so an unreachable"
-              echo "repo converges on its own within a week rather than drifting."
+              echo "Dispatch each by hand meanwhile: \`gh workflow run tronc-bump.yml -R <repo> -f version=${VERSION}\`."
+            fi
+            if [ -n "${NOT_CONSUMER}" ]; then
+              echo ""
+              echo "Not consumers (no \`tronc-bump.yml\`), skipped:"
+              for R in ${NOT_CONSUMER}; do echo "- \`${R}\`"; done
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${SENT}" -eq 0 ]; then
-            echo "::error::every dispatch failed — DRAVR_PLATFORM_DISPATCH_TOKEN cannot reach any repo"
+          if [ -n "${MISSED}${UNREADABLE}" ]; then
+            echo "::error::$(echo ${MISSED} ${UNREADABLE} | wc -w | tr -d ' ') repo(s) unreachable — the fan-out did not happen for them"
+            exit 1
+          fi
+          if [ -z "${SENT}" ]; then
+            echo "::error::no consumer reached — every repo read as a non-consumer, which cannot be right while the fleet carries callers"
             exit 1
           fi
