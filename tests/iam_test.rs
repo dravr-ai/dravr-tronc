@@ -168,6 +168,11 @@ async fn verifier_rejects_a_token_with_no_kid_without_network() {
 }
 
 #[tokio::test]
+// Paired with `a_token_is_fetched_from_the_overridden_metadata_host`, which
+// SETS `GCE_METADATA_HOST` — a process-global this test needs unset. Only that
+// one carried `#[serial]`, and a guard one side of a pair holds guards nothing:
+// the two interleaved and both failed, green again the moment they ran serially.
+#[serial]
 async fn token_source_reports_metadata_absence_distinctly() {
     // Off Google infrastructure metadata.google.internal does not resolve. The
     // error must say that rather than looking like a rejected credential —

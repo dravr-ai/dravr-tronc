@@ -13,7 +13,7 @@
 //! single canonical wire vocabulary.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION};
 
@@ -560,7 +560,7 @@ pub struct JsonSchema {
     pub description: Option<String>,
     /// Property definitions for object schemas.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub properties: Option<HashMap<String, PropertySchema>>,
+    pub properties: Option<BTreeMap<String, PropertySchema>>,
     /// Names of required properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
@@ -573,7 +573,7 @@ pub struct JsonSchema {
     pub additional_properties: Option<bool>,
     /// Reusable subschemas referenced by `$ref`.
     #[serde(rename = "$defs", default, skip_serializing_if = "Option::is_none")]
-    pub defs: Option<HashMap<String, PropertySchema>>,
+    pub defs: Option<BTreeMap<String, PropertySchema>>,
     /// Exactly one of these subschemas must validate.
     #[serde(rename = "oneOf", default, skip_serializing_if = "Option::is_none")]
     pub one_of: Option<Vec<PropertySchema>>,

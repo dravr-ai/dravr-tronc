@@ -11,7 +11,7 @@
     clippy::str_to_string
 )]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use dravr_tronc::mcp::schema::{JsonSchema, PropertySchema, ToolSchema};
 use serde_json::json;
@@ -20,7 +20,7 @@ use serde_json::json;
 fn a_simple_object_schema_is_unchanged_on_the_wire() {
     // The 2020-12 vocabulary is additive: a plain object schema must serialize
     // exactly as it did before, with no empty keys leaking onto the wire.
-    let mut properties = HashMap::new();
+    let mut properties = BTreeMap::new();
     properties.insert(
         "name".to_owned(),
         PropertySchema {
@@ -111,7 +111,7 @@ fn a_ref_only_subschema_omits_type() {
 
 #[test]
 fn composition_and_defs_serialize_with_dollar_names() {
-    let mut defs = HashMap::new();
+    let mut defs = BTreeMap::new();
     defs.insert(
         "Activity".to_owned(),
         PropertySchema {

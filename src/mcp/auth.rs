@@ -23,6 +23,7 @@ use crate::mcp::tool::ToolContext;
 /// Why an [`AuthHook`] rejected a request. The HTTP transport maps each variant
 /// to its status code.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthError {
     /// `401 Unauthorized` with a `WWW-Authenticate` challenge header (RFC 9728).
     /// The string is the full header value, e.g.
@@ -33,6 +34,26 @@ pub enum AuthError {
     },
     /// `403 Forbidden` — authenticated but not permitted. Carries a reason.
     Forbidden {
+        /// Human-readable reason (returned in the response body).
+        reason: String,
+    },
+    /// `403 Forbidden` with an RFC 6750 §3.1 `insufficient_scope` challenge —
+    /// the caller authenticated, but the credential's grant does not cover
+    /// what they asked for.
+    ///
+    /// Distinct from [`Self::Forbidden`] because the remedy is different and
+    /// machine-actionable: a client that reads `scope="…"` off the challenge
+    /// knows exactly which grant to request, and can re-authorize instead of
+    /// giving up. A bare 403 tells it only that it lost.
+    ///
+    /// Kept as its own variant rather than a field on [`Self::Forbidden`] so
+    /// that adding it breaks no host that *constructs* a `Forbidden` — the
+    /// common case across consumers — only ones that match exhaustively, which
+    /// `#[non_exhaustive]` now prevents from recurring.
+    InsufficientScope {
+        /// The full `WWW-Authenticate` value, e.g.
+        /// `Bearer error="insufficient_scope", scope="fitness:write"`.
+        www_authenticate: String,
         /// Human-readable reason (returned in the response body).
         reason: String,
     },

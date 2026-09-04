@@ -509,6 +509,27 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self.supported_versions.iter().any(|v| v == version)
     }
 
+    /// Whether the server accepts `version`, for a transport that must judge a
+    /// revision before dispatch.
+    ///
+    /// The HTTP transport reads `MCP-Protocol-Version` off every request after
+    /// `initialize`: on a stateless server that header is the client's standing
+    /// assertion of what was negotiated, and there is no session to check it
+    /// against. Refusing an unsupported one there is the only place it can be
+    /// refused, which is why this is public while [`Self::supports_version`] is
+    /// not.
+    #[must_use]
+    pub fn accepts_protocol_version(&self, version: &str) -> bool {
+        self.supports_version(version)
+    }
+
+    /// The revisions this server advertises, for a transport building an
+    /// `UnsupportedProtocolVersionError` body.
+    #[must_use]
+    pub fn advertised_protocol_versions(&self) -> &[String] {
+        &self.supported_versions
+    }
+
     /// Handle `initialize` — negotiate the protocol version and advertise the
     /// server's identity, capabilities, and instructions.
     ///

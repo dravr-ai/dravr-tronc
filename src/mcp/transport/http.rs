@@ -18,7 +18,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use crate::error::{PARSE_ERROR, UNAUTHORIZED};
+use crate::error::{PARSE_ERROR, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
@@ -100,10 +100,31 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     if let Some(token) = bearer_token(&headers) {
         request.auth_token = Some(token);
     }
+    // `MCP-Protocol-Version` is the client's standing assertion of what was
+    // negotiated at `initialize`. On a stateless server there is no session to
+    // check it against, so this is the only place it can be judged — and until
+    // it was, the header was read into metadata that nothing read back, which
+    // reads as wired and is not. A revision we do not speak is refused here
+    // with -32004 rather than being served as if we did.
     if let Some(version) = headers
         .get(MCP_PROTOCOL_VERSION_HEADER)
         .and_then(|v| v.to_str().ok())
     {
+        if !server.accepts_protocol_version(version) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(JsonRpcResponse::error_with_data(
+                    None,
+                    UNSUPPORTED_PROTOCOL_VERSION,
+                    "Unsupported protocol version".to_owned(),
+                    serde_json::json!({
+                        "supported": server.advertised_protocol_versions(),
+                        "requested": version,
+                    }),
+                )),
+            )
+                .into_response();
+        }
         request = request.with_metadata(MCP_PROTOCOL_VERSION_HEADER, version);
     }
 
@@ -127,6 +148,20 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         Err(AuthError::Forbidden { reason }) => {
             return (
                 StatusCode::FORBIDDEN,
+                Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
+            )
+                .into_response();
+        }
+        Err(AuthError::InsufficientScope {
+            www_authenticate,
+            reason,
+        }) => {
+            // RFC 6750 §3.1: an insufficient-scope refusal is a 403 that still
+            // carries the challenge, so the client learns which grant it needs
+            // rather than only that it was refused.
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::WWW_AUTHENTICATE, www_authenticate)],
                 Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
             )
                 .into_response();
@@ -571,5 +606,135 @@ mod tests {
             .as_str()
             .expect("text") // Safe: test assertion
             .contains("admin"));
+    }
+
+    /// A scope refusal is a 403 that still carries the challenge.
+    ///
+    /// RFC 6750 §3.1: the point of `insufficient_scope` is that the client
+    /// learns which grant it needs. A bare 403 tells it only that it lost, so
+    /// the header is the whole value of the variant — asserted here because a
+    /// renderer that dropped it would still return the "right" status.
+    #[tokio::test]
+    async fn insufficient_scope_returns_403_with_the_challenge() {
+        struct ScopeHook;
+
+        #[async_trait::async_trait]
+        impl AuthHook<TestState> for ScopeHook {
+            async fn authenticate(
+                &self,
+                _request: &JsonRpcRequest,
+                _state: &Arc<TestState>,
+            ) -> Result<ToolContext, AuthError> {
+                Err(AuthError::InsufficientScope {
+                    www_authenticate:
+                        "Bearer error=\"insufficient_scope\", scope=\"fitness:write\"".to_owned(),
+                    reason: "the grant does not cover this tool".to_owned(),
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HelloTool));
+        let server = Arc::new(
+            McpServer::new("test", "0.1.0", registry, Arc::new(TestState))
+                .with_auth_hook(Arc::new(ScopeHook)),
+        );
+        let app = mcp_router(server);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                               "params":{"name":"hello","arguments":{}}})
+                        .to_string(),
+                    )
+                    .expect("request"), // Safe: test fixture
+            )
+            .await
+            .expect("response"); // Safe: test fixture
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("an insufficient-scope refusal must carry the challenge") // Safe: test assertion
+            .to_str()
+            .expect("ascii"); // Safe: test assertion
+        assert!(
+            challenge.contains("insufficient_scope"),
+            "challenge names the error: {challenge}"
+        );
+        assert!(
+            challenge.contains("fitness:write"),
+            "challenge names the scope the client must ask for: {challenge}"
+        );
+    }
+
+    /// An `MCP-Protocol-Version` the server does not speak is refused.
+    ///
+    /// The header used to be read into request metadata that nothing read
+    /// back, which reads as wired and is not. On a stateless server this is the
+    /// only place a per-request revision assertion can be judged.
+    #[tokio::test]
+    async fn an_unsupported_protocol_version_header_is_refused() {
+        let response = make_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
+                    .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
+                    .expect("request"), // Safe: test fixture
+            )
+            .await
+            .expect("response"); // Safe: test fixture
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body") // Safe: test fixture
+                .to_bytes(),
+        )
+        .expect("json"); // Safe: test fixture
+        assert_eq!(body["error"]["code"], -32_022);
+        assert_eq!(body["error"]["data"]["requested"], "1999-01-01");
+        assert!(
+            body["error"]["data"]["supported"].is_array(),
+            "the refusal tells the client what we DO speak: {body}"
+        );
+    }
+
+    /// A supported revision on the header is served normally — the gate must
+    /// refuse the wrong one without refusing the right one.
+    #[tokio::test]
+    async fn a_supported_protocol_version_header_is_served() {
+        let supported = McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+            .advertised_protocol_versions()
+            .first()
+            .cloned()
+            .expect("a server advertises at least one revision"); // Safe: test assertion
+
+        let response = make_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header(MCP_PROTOCOL_VERSION_HEADER, supported.as_str())
+                    .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
+                    .expect("request"), // Safe: test fixture
+            )
+            .await
+            .expect("response"); // Safe: test fixture
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

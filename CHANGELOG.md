@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.10.0] — 2026-09-03
+
+Protocol revision `2026-07-28`, second pass: the two conformance gaps the
+HTTP transport still had, plus the seam a host needs to enforce OAuth scopes.
+Breaking: `AuthError` is now `#[non_exhaustive]` and has a third variant,
+`ToolContext` gained a field (use `..Default::default()`), and
+`JsonSchema::properties`/`defs` changed map type.
+
+### Added
+
+- feat(mcp): `AuthError::InsufficientScope { www_authenticate, reason }` —
+  rendered by the HTTP transport as `403` **carrying** the RFC 6750 §3.1
+  challenge, so a client that authenticated but lacks the grant reads
+  `scope="…"` off the header and knows what to re-request. A bare `Forbidden`
+  tells it only that it lost. Kept as its own variant rather than a field on
+  `Forbidden` so hosts that *construct* a `Forbidden` are untouched.
+- feat(mcp): `AuthError` is `#[non_exhaustive]`, so the next rejection reason
+  is additive for every consumer instead of a release like this one.
+- feat(mcp): `ToolContext::scopes: Vec<String>` — the grant on the credential
+  the host validated. Empty is the pre-existing behaviour: a host that never
+  populates it enforces nothing and keeps working. The vocabulary stays the
+  host's; tronc does not name scopes.
+- feat(mcp): `ToolCapability::PROFILE` — reading or writing the caller's own
+  identity, split out from `READS_DATA`. It is the split an OAuth resource
+  server scopes on: history without identity, or identity without history.
+  Folded together, a grant for one is a grant for both and no consent screen
+  can say which was asked for.
+- feat(mcp): `McpServer::accepts_protocol_version` and
+  `advertised_protocol_versions`, public because the HTTP transport is the only
+  place a stateless server can judge the header.
+
+### Fixed
+
+- fix(mcp): the HTTP transport read `MCP-Protocol-Version` into request
+  metadata that nothing read back — wired in appearance only. A revision the
+  server does not speak is now refused with `-32022` and a
+  `{supported, requested}` body, instead of being served as though it were
+  negotiated.
+- fix(iam): `token_source_reports_metadata_absence_distinctly` did not carry
+  `#[serial]` though its pair sets `GCE_METADATA_HOST`, a process-global. A
+  guard one side of a pair holds guards nothing — the two interleaved and both
+  failed, intermittently and only under parallel test threads.
+- fix(mcp): `JsonSchema::properties` and `$defs` are `BTreeMap`, not `HashMap`.
+  A tool schema is hashed, diffed and checked into generated SDK types by
+  consumers; `HashMap` made its key order vary run to run, so identical schemas
+  serialized differently and read as drift.
+
+## [0.9.0] — 2026-09-02
+
+Re-release of the yanked 0.8.1 under a breaking version. `Tool::execution`
+(SEP-2663) is a new `pub` field, which breaks every struct literal that builds
+a `Tool` — `embacle-tool-host` does — so it could not ship as a patch. Content
+is otherwise 0.8.1's: the `subscriptions/listen` stream and per-tool task
+support.
+
 ## [0.8.0] — 2026-08-31
 
 Protocol revision `2026-07-28` conformance. Breaking: `Tool`,

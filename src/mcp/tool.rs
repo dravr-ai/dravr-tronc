@@ -35,6 +35,15 @@ bitflags! {
         const WRITES_DATA = 0b0001_0000;
         /// The tool may only be invoked by an admin caller.
         const ADMIN_ONLY = 0b0010_0000;
+        /// Tool reads or writes the caller's OWN profile record — who they
+        /// are — rather than the content they have accumulated.
+        ///
+        /// Separate from [`Self::READS_DATA`] because it is the split every
+        /// OAuth resource server scopes on: an integration may legitimately
+        /// need an athlete's training history without needing their identity,
+        /// or the reverse. Folded together, a grant for one is a grant for
+        /// both, and the consent screen cannot say which was asked for.
+        const PROFILE = 0b0100_0000;
     }
 }
 
@@ -65,6 +74,19 @@ pub struct ToolContext {
     /// `initialize` rather than per call. Capabilities are per-request in the
     /// modern era and a server MUST NOT infer them from an earlier request.
     pub client_capabilities: Option<Value>,
+    /// The grant on the credential the host validated, as scope strings.
+    ///
+    /// Empty when the host does not scope its credentials, which is the
+    /// default and the whole behaviour before this field existed — a server
+    /// that never populates it enforces nothing and keeps working. A host that
+    /// does populate it can refuse a call whose grant does not cover the
+    /// tool's declared capabilities, and answer with
+    /// [`AuthError::InsufficientScope`](crate::mcp::auth::AuthError::InsufficientScope)
+    /// so the client learns which grant to ask for.
+    ///
+    /// Deliberately `Vec<String>` and not a typed set: the vocabulary is the
+    /// host's, and tronc has no business naming an athlete's scopes.
+    pub scopes: Vec<String>,
 }
 
 impl ToolContext {
