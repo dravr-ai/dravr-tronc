@@ -42,6 +42,16 @@ on:
         required: false
         type: number
         default: 45
+      lockstep_crates:
+        description: "Space-separated crates.io crates that pin tronc themselves and must move to their latest release in the same commit, or the lockfile ends up with two tronc versions"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Rewrite, resolve and assert on the runner, then stop — no branch, no gates, no merge, no register issue"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -194,6 +204,7 @@ jobs:
       - name: Rewrite every dravr-tronc pin
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
+          LOCKSTEP_CRATES: ${{ inputs.lockstep_crates }}
         run: |
           set -euo pipefail
           MANIFESTS=$(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml)
@@ -240,7 +251,78 @@ jobs:
             exit 1
           fi
 
-          cargo update -p dravr-tronc
+          # Crates that pin tronc themselves and ship from crates.io — on the
+          # platform, embacle and embacle-tool-host — cannot stay put when tronc
+          # moves a 0.x minor or a major: their caret cannot span it, Cargo
+          # resolves a second dravr-tronc, and the platform's duplicate gate
+          # hard-fails. That blocked the platform on 2026-08-31 and 2026-09-03,
+          # and no single-dependency chain can clear it: embacle-bump moves
+          # embacle but not tronc, this chain moves tronc but not embacle, and
+          # each fails the same gate without the other. So they move together.
+          #
+          # Each lockstep crate goes to its latest non-yanked crates.io release,
+          # and that release's own dravr-tronc requirement is checked against the
+          # target BEFORE anything is rewritten: a crate not yet re-released on
+          # the new tronc is a clear message naming what to release, not a
+          # duplicate discovered three steps later.
+          LOCKSTEP_PKGS=""; LOCKSTEP_NOTE=""
+          UA="dravr-tronc-consumer-bump (github.com/dravr-ai/dravr-tronc)"
+          for CRATE in ${LOCKSTEP_CRATES}; do
+            LATEST=$(curl -sf -A "${UA}" "https://crates.io/api/v1/crates/${CRATE}" \
+                     | jq -r '[.versions[] | select(.yanked == false)][0].num')
+            if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
+              echo "::error::could not read the latest ${CRATE} release from crates.io"
+              exit 1
+            fi
+            REQ=$(curl -sf -A "${UA}" "https://crates.io/api/v1/crates/${CRATE}/${LATEST}/dependencies" \
+                  | jq -r '.dependencies[] | select(.crate_id == "dravr-tronc") | .req' | head -1)
+            if [ -n "${REQ}" ] && [ "${REQ}" != "null" ]; then
+              # Caret semantics: "^0.11.0" spans 0.11.*, "^1.0.0" spans 1.*. Same
+              # major, and on 0.x also the same minor, is what resolves to one
+              # package. A requirement shaped any other way reads as incompatible,
+              # which is the safe direction — the lockfile assertion below is the
+              # backstop either way.
+              REQ_MAJOR=$(printf '%s' "${REQ}" | grep -oE '[0-9]+' | sed -n 1p)
+              REQ_MINOR=$(printf '%s' "${REQ}" | grep -oE '[0-9]+' | sed -n 2p)
+              TGT_MAJOR=$(printf '%s' "${VERSION}" | cut -d. -f1)
+              TGT_MINOR=$(printf '%s' "${VERSION}" | cut -d. -f2)
+              COMPATIBLE=false
+              if [ "${REQ_MAJOR}" = "${TGT_MAJOR}" ]; then
+                if [ "${TGT_MAJOR}" != "0" ] || [ "${REQ_MINOR}" = "${TGT_MINOR}" ]; then COMPATIBLE=true; fi
+              fi
+              if [ "${COMPATIBLE}" != "true" ]; then
+                echo "::error::${CRATE} ${LATEST} (latest on crates.io) requires dravr-tronc ${REQ}, which cannot resolve to ${VERSION}"
+                echo "::error::release ${CRATE} on dravr-tronc ${VERSION} first, then re-run — bumping now would leave two dravr-tronc versions in Cargo.lock"
+                exit 1
+              fi
+            fi
+            LS_MANIFESTS=$(grep -rlE "^${CRATE} = " . --include=Cargo.toml || true)
+            if [ -z "${LS_MANIFESTS}" ]; then
+              echo "::error::lockstep crate ${CRATE} is not pinned by any Cargo.toml here — remove it from lockstep_crates"
+              exit 1
+            fi
+            for m in ${LS_MANIFESTS}; do
+              sed -i -E \
+                -e "s|^(${CRATE} = \{ version = \")[0-9]+(\.[0-9]+){1,2}\"|\1${LATEST}\"|" \
+                -e "s|^(${CRATE} = \")[0-9]+(\.[0-9]+){1,2}\"|\1${LATEST}\"|" \
+                "$m"
+              while IFS= read -r line; do
+                case "${line}" in
+                  *"\"${LATEST}\""*) ;;
+                  *)
+                    echo "::error::${m} has a ${CRATE} pin this bump could not rewrite: ${line}"
+                    exit 1
+                    ;;
+                esac
+              done < <(grep -E "^${CRATE} = " "$m")
+            done
+            echo "lockstep: ${CRATE} -> ${LATEST} (requires dravr-tronc ${REQ:-nothing})"
+            LOCKSTEP_PKGS="${LOCKSTEP_PKGS} -p ${CRATE}"
+            LOCKSTEP_NOTE="${LOCKSTEP_NOTE}${LOCKSTEP_NOTE:+, }${CRATE} ${LATEST}"
+          done
+          [ -n "${LOCKSTEP_NOTE}" ] && echo "LOCKSTEP_NOTE=Lockstep: ${LOCKSTEP_NOTE}" >> "$GITHUB_ENV"
+
+          cargo update -p dravr-tronc ${LOCKSTEP_PKGS}
 
           # Assert the graph converged. A green `cargo check` is NOT this assertion:
           # Cargo resolves two versions of a 0.x crate happily, and the platform's
@@ -261,12 +343,38 @@ jobs:
           fi
           echo "Cargo.lock: dravr-tronc ${GOT} (single entry)"
 
+          for CRATE in ${LOCKSTEP_CRATES}; do
+            ENTRIES=$(grep -c "^name = \"${CRATE}\"$" Cargo.lock || true)
+            if [ "${ENTRIES}" != "1" ]; then
+              echo "::error::Cargo.lock holds ${ENTRIES} ${CRATE} entries, expected 1 — this bump cannot merge"
+              grep -A2 "^name = \"${CRATE}\"$" Cargo.lock || true
+              exit 1
+            fi
+            echo "Cargo.lock: ${CRATE} $(grep -A1 "^name = \"${CRATE}\"$" Cargo.lock | grep '^version = ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') (single entry)"
+          done
+
+      - name: Dry run — report what would have been pushed, then stop
+        if: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### Dry run — nothing pushed"
+            echo ""
+            echo "Rewrote, resolved and asserted on the runner. This is the diff a real run would commit:"
+            echo ""
+            echo '```'
+            git --no-pager diff --stat
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git --no-pager diff --stat
+
       - name: Push the branch and dispatch the gates onto it
         id: push
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+          LOCKSTEP_CRATES: ${{ inputs.lockstep_crates }}
         run: |
           set -euo pipefail
           # fix/ is on every consumer's CI push filter alongside feature/, debug/,
@@ -281,7 +389,12 @@ jobs:
           # toolchain left behind — a submodule pointer, a generated file — and commit
           # it to eleven repos' main under a message that says "bump dravr-tronc".
           git add $(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml) Cargo.lock
-          git commit -m "chore(deps): bump dravr-tronc to ${VERSION}"
+          for CRATE in ${LOCKSTEP_CRATES}; do
+            git add $(grep -rlE "^${CRATE} = " . --include=Cargo.toml)
+          done
+          # The lockstep note, when there is one, rides in the body so the subject
+          # stays within the house's 72-character limit.
+          git commit -m "chore(deps): bump dravr-tronc to ${VERSION}" ${LOCKSTEP_NOTE:+-m "${LOCKSTEP_NOTE}"}
           git push --force-with-lease origin "${BRANCH}"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
@@ -300,6 +413,7 @@ jobs:
     name: Wait for CI on the bump branch
     runs-on: ubuntu-latest
     needs: [resolve, bump]
+    if: ${{ !inputs.dry_run }}
     timeout-minutes: 60
     steps:
       - name: Poll until every gate reaches a terminal status
@@ -354,6 +468,7 @@ jobs:
     name: Squash merge onto main
     runs-on: ubuntu-latest
     needs: [resolve, bump, gate]
+    if: ${{ !inputs.dry_run }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -384,7 +499,7 @@ jobs:
     name: File the stall on the register
     runs-on: ubuntu-latest
     needs: [resolve, bump, gate, merge]
-    if: failure() && needs.resolve.outputs.needed == 'true'
+    if: failure() && needs.resolve.outputs.needed == 'true' && !inputs.dry_run
     steps:
       - uses: actions/checkout@v6
 
@@ -416,10 +531,15 @@ jobs:
           A stall is safe. Nothing merged, so this repo keeps building against the tronc
           it already had; the branch is left in place to inspect.
 
+          **If a lockstep check failed**, the run names the crate and the tronc it still
+          requires: release that crate on the target tronc, then re-run this. Nothing was
+          rewritten.
+
           **If the lockfile assertion failed**, something else in this repo's graph pins
-          an incompatible tronc — a published crate holding an older caret. That crate
-          has to be re-released first. This is not hypothetical: it blocked the platform
-          twice, on 2026-08-31 and again on 2026-09-03, both times on \`embacle-tool-host\`.
+          an incompatible tronc — a published crate holding an older caret that is not in
+          \`lockstep_crates\`. That crate has to be re-released first, or added to the
+          lockstep list. This is not hypothetical: it blocked the platform twice, on
+          2026-08-31 and again on 2026-09-03, both times on \`embacle-tool-host\`.
 
           **If a CI gate failed**, the tronc minor needs source changes here, not just a
           pin. Across 0.5.3 -> 0.11.0 the ones that bit were the \`Tool\` literal gaining
