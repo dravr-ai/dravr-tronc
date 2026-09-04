@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.0] — 2026-09-04
+
+### Other
+
+- ci(consumer-bump): lockstep crates and a dry run
+
+
+
 ## [0.11.0] — 2026-09-03
 
 Finishes the determinism fix 0.10.0 only half made.
