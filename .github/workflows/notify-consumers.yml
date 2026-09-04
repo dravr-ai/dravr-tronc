@@ -1,0 +1,119 @@
+# ABOUTME: Tells every tronc consumer a release exists, so their pins stop drifting apart
+# ABOUTME: Fires repository_dispatch org-wide; a repo's tronc-bump.yml is what enrols it
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 dravr.ai
+#
+# This is one end of the wire; each consumer's `tronc-bump.yml` is the other, and
+# both call `consumer-bump.yml` in this repo for the actual work.
+#
+# Called by release.yml rather than triggered by `on: release`. The release is
+# created with the default GITHUB_TOKEN, and GitHub does not start workflow runs
+# from events a GITHUB_TOKEN produced — so an `on: release` trigger here could never
+# fire. That is exactly how sciotte's notifier logged zero runs across five releases
+# while looking perfectly wired. A trigger that cannot fire is worse than no trigger.
+#
+# DISCOVERY IS BY OPT-IN, NOT BY LIST. This dispatches `tronc-released` at every
+# non-archived repo in the org and lets the ones that care answer. A repo with no
+# workflow listening for that event type ignores it silently, so there is no list
+# here to fall out of date — adding `tronc-bump.yml` to a repo is what enrols it,
+# and archiving a repo removes it. contremaitre-bump.yml learned the alternative the
+# hard way: a hardcoded list left one crate behind, which put two versions in
+# Cargo.lock and hard-failed Security Audit on main.
+#
+# A dispatch that does not arrive is NOT a silent loss: every consumer's caller also
+# carries a weekly schedule, so a repo missed here catches up on its own within a
+# week. That matters because DRAVR_PLATFORM_DISPATCH_TOKEN was scoped for the
+# platform, and whether it can reach every satellite is a property of the token, not
+# of this file.
+
+name: "Tronc: Notify Consumers of Release"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Tag to announce"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to announce (defaults to the latest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Dispatch tronc-released across the org
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the version being announced
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not resolve a release tag to announce"
+            exit 1
+          fi
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "announcing ${VERSION}"
+
+      - name: Fire repository_dispatch at every live repo in the org
+        env:
+          GH_TOKEN: ${{ secrets.DRAVR_PLATFORM_DISPATCH_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -uo pipefail
+          REPOS=$(gh api --paginate 'orgs/dravr-ai/repos?type=all&per_page=100' \
+                  --jq '.[] | select(.archived == false) | select(.fork == false) | .full_name')
+          if [ -z "${REPOS}" ]; then
+            echo "::error::listed no repos — the dispatch token cannot see the org"
+            exit 1
+          fi
+
+          SENT=0; SKIPPED=""
+          for R in ${REPOS}; do
+            # A repo with no listener answers 204 just the same, so a send is not
+            # evidence anything acted. The consumer's own run is.
+            if gh api -X POST "repos/${R}/dispatches" \
+                 -f event_type=tronc-released \
+                 -F client_payload[version]="${VERSION}" \
+                 -F client_payload[sha]="${GITHUB_SHA}" 2>/dev/null; then
+              echo "dispatched -> ${R}"
+              SENT=$(( SENT + 1 ))
+            else
+              # Do not abort: one unreachable repo must not stop the other ten.
+              echo "::warning::could not dispatch to ${R} (token scope, or repo disabled)"
+              SKIPPED="${SKIPPED} ${R}"
+            fi
+          done
+
+          {
+            echo "### tronc ${VERSION} announced"
+            echo ""
+            echo "Dispatched \`tronc-released\` to **${SENT}** repo(s)."
+            if [ -n "${SKIPPED}" ]; then
+              echo ""
+              echo "Could not reach:"
+              for R in ${SKIPPED}; do echo "- \`${R}\`"; done
+              echo ""
+              echo "Each consumer also runs this weekly on a schedule, so an unreachable"
+              echo "repo converges on its own within a week rather than drifting."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${SENT}" -eq 0 ]; then
+            echo "::error::every dispatch failed — DRAVR_PLATFORM_DISPATCH_TOKEN cannot reach any repo"
+            exit 1
+          fi

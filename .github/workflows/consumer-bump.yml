@@ -1,0 +1,448 @@
+# ABOUTME: Reusable bump chain a tronc consumer calls to move itself onto a new tronc release
+# ABOUTME: Runs in the CALLER's repo — bump pins, gate on its CI, squash merge on green, file the stall
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 dravr.ai
+#
+# One implementation, eleven callers. Each consumer carries a ten-line
+# `tronc-bump.yml` that calls this; the logic lives here so a fix lands once
+# instead of eleven times.
+#
+# It has to be a reusable workflow rather than a workflow in tronc that pushes to
+# consumers, because no token in this org can do that. contremaitre-bump.yml records
+# the attempt at its line 155: DRAVR_PRIVATE_DEPS_TOKEN is read-only, and the push
+# there falls back to GITHUB_TOKEN, which only reaches its own repo. A called
+# workflow runs in the CALLER's context with the CALLER's GITHUB_TOKEN, so each
+# consumer bumps itself with a token that is already allowed to.
+#
+# Why this exists: on 2026-09-04 twelve repos sat on five different tronc minors
+# (0.5.3 / 0.6.2 / 0.7 / 0.9.0 / 0.11.0) with no mechanism to notice. Nine of them
+# had a green bump branch prepared and unmerged for a day. tronc cut four breaking
+# minors in four days, and it was the only producer in the house with no wire out to
+# its consumers — photograveur, embacle, sciotte and contremaitre all had one.
+# carnet#330.
+
+name: "Tronc: Consumer Bump"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "tronc version to move onto; empty resolves tronc's latest release"
+        required: false
+        type: string
+        default: ""
+      ci_workflows:
+        description: "Space-separated workflow files that must be green before merging"
+        required: false
+        type: string
+        default: "ci.yml"
+      gate_timeout_minutes:
+        description: "How long to wait for those workflows to reach a terminal status"
+        required: false
+        type: number
+        default: 45
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. What are we moving to, does the registry have it, and is there anything
+  #    to do in this repo at all?
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve target version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      pinned: ${{ steps.v.outputs.pinned }}
+      needed: ${{ steps.v.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve the target version
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "${VERSION}" ]; then
+            # The scheduled safety net and a manual run both land here. tronc's own
+            # releases are the source of truth for "latest", not crates.io, because a
+            # release whose publish failed must not become a bump target.
+            VERSION=$(gh release view --repo dravr-ai/dravr-tronc --json tagName -q .tagName)
+          fi
+          VERSION="${VERSION#v}"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::could not resolve a dravr-tronc version to move onto"
+            exit 1
+          fi
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::resolved '${VERSION}', which is not a plain semver version"
+            exit 1
+          fi
+
+          # Read what this repo pins today. Both shapes are in use across the fleet:
+          #   dravr-tronc = "0.11.0"
+          #   dravr-tronc = { version = "0.11.0", features = ["notifications"] }
+          # and the version itself may be two-component ("0.7") or three ("0.11.0").
+          # Matching only three components is the exact trap embacle-bump.yml
+          # documents: sciotte pinned "0.7" for weeks, and a three-component regex
+          # skips that line silently while reporting a successful bump.
+          MANIFESTS=$(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml || true)
+          if [ -z "${MANIFESTS}" ]; then
+            echo "::error::no Cargo.toml in this repo pins dravr-tronc — wrong repo, or the line shape changed"
+            exit 1
+          fi
+          echo "Manifests pinning dravr-tronc:"; echo "${MANIFESTS}"
+
+          PINNED=$(grep -hoE '^dravr-tronc = (\{ version = )?"[0-9]+(\.[0-9]+){1,2}"' ${MANIFESTS} \
+                   | grep -oE '[0-9]+(\.[0-9]+){1,2}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+          if [ -z "${PINNED}" ]; then
+            echo "::error::found dravr-tronc lines but could not read a version from any of them"
+            grep -hE '^dravr-tronc = ' ${MANIFESTS}
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pinned=${PINNED}"   >> "$GITHUB_OUTPUT"
+
+          # PINNED is a space-separated set, so a repo already split across two
+          # versions reports both and still bumps — converging it is the point.
+          if [ "${PINNED}" = "${VERSION}" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "already on ${VERSION} — nothing to do"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "moving [${PINNED}] -> ${VERSION}"
+          fi
+
+      - name: Wait for crates.io to carry it
+        if: steps.v.outputs.needed == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The GitHub release is created in the same job as `cargo publish`, so a tag
+          # is not proof the registry has it, and the sparse index lags publication by
+          # up to a couple of minutes. Bumping onto a version crates.io cannot serve
+          # fails later in `cargo update` with a resolver error naming nothing useful.
+          #
+          # The User-Agent is mandatory, not politeness: crates.io answers an anonymous
+          # request with 403, which reads exactly like "not published" and would turn a
+          # slow index into a hard failure.
+          UA="dravr-tronc-consumer-bump (github.com/dravr-ai/dravr-tronc)"
+          DEADLINE=$(( $(date +%s) + 15 * 60 ))
+          while :; do
+            CODE=$(curl -s -o /tmp/tronc.json -w '%{http_code}' -A "${UA}" \
+                   "https://crates.io/api/v1/crates/dravr-tronc/${VERSION}" || echo 000)
+            if [ "${CODE}" = "200" ]; then
+              YANKED=$(jq -r '.version.yanked' /tmp/tronc.json 2>/dev/null || echo unknown)
+              if [ "${YANKED}" = "true" ]; then
+                # 0.8.1 was yanked on 2026-09-02. A yanked version must never become a
+                # pin: it resolves for whoever already has it and breaks every fresh
+                # checkout.
+                echo "::error::dravr-tronc ${VERSION} is published but YANKED — refusing to pin it"
+                exit 1
+              fi
+              echo "dravr-tronc ${VERSION} is on crates.io"
+              break
+            fi
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "::error::dravr-tronc ${VERSION} never appeared on crates.io (last HTTP ${CODE})"
+              echo "::error::the release tag exists but the publish did not land — fix tronc's release.yml, do not re-run this"
+              exit 1
+            fi
+            echo "not indexed yet (HTTP ${CODE}); retrying in 30s"
+            sleep 30
+          done
+
+  # ---------------------------------------------------------------------------
+  # 2. Bump every pin in this repo, on a branch
+  # ---------------------------------------------------------------------------
+  bump:
+    name: Bump the pins on a branch
+    runs-on: ubuntu-latest
+    needs: resolve
+    if: needs.resolve.outputs.needed == 'true'
+    outputs:
+      branch: ${{ steps.push.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Configure auth for private git deps
+        # Only the platform needs this — it pins dravr-stripe and dravr-photograveur,
+        # both PRIVATE repos, by git tag, and `cargo update` cannot fetch them
+        # anonymously. The satellites' graphs are entirely public, so the secret is
+        # absent there and this is a no-op rather than a failure. Guarded on emptiness
+        # because `secrets: inherit` passes an unset secret as "".
+        env:
+          PRIVATE_DEPS_TOKEN: ${{ secrets.DRAVR_PRIVATE_DEPS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PRIVATE_DEPS_TOKEN}" ]; then
+            git config --global url."https://x-access-token:${PRIVATE_DEPS_TOKEN}@github.com/".insteadOf "https://github.com/"
+            echo "private git dep auth configured"
+          else
+            echo "no DRAVR_PRIVATE_DEPS_TOKEN in this repo — assuming a fully public graph"
+          fi
+
+      - name: Rewrite every dravr-tronc pin
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          MANIFESTS=$(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml)
+          echo "Rewriting:"; echo "${MANIFESTS}"
+          PINS=0
+
+          # Overwrite whatever version each line holds rather than swapping a known old
+          # value, so a manifest that had drifted to a third version converges too.
+          # `{1,2}` on the component group is what lets a two-component pin ("0.7") move;
+          # dropping it is the silent no-op this workflow exists to prevent.
+          #
+          # The [patch."https://github.com/dravr-ai/dravr-tronc.git"] block in the
+          # platform's root manifest is also anchored at line start, so it is rewritten
+          # here as well — which is correct: leaving it behind reintroduces the duplicate.
+          for m in ${MANIFESTS}; do
+            sed -i -E \
+              -e "s|^(dravr-tronc = \{ version = \")[0-9]+(\.[0-9]+){1,2}\"|\1${VERSION}\"|" \
+              -e "s|^(dravr-tronc = \")[0-9]+(\.[0-9]+){1,2}\"|\1${VERSION}\"|" \
+              "$m"
+
+            # Verify positively: every remaining pin line must CONTAIN the target
+            # version. A negative check ("no line holds a different version") is
+            # satisfied vacuously by a line holding no parseable version at all —
+            # `{ workspace = true }`, a git or path override — which passes while the
+            # pin is untouched.
+            while IFS= read -r line; do
+              case "${line}" in
+                *"\"${VERSION}\""*) ;;
+                *)
+                  echo "::error::${m} has a dravr-tronc pin this bump could not rewrite:"
+                  echo "::error::  ${line}"
+                  echo "::error::expected it to carry ${VERSION}. The shape is one the sed does not"
+                  echo "::error::handle (workspace/git/path override, or a non-semver version)."
+                  echo "::error::Refusing to push a partial bump — teach the sed the new shape."
+                  exit 1
+                  ;;
+              esac
+              PINS=$(( PINS + 1 ))
+            done < <(grep -E '^dravr-tronc = ' "$m")
+          done
+          echo "rewrote ${PINS} pin(s) across $(echo "${MANIFESTS}" | wc -l | tr -d ' ') manifest(s)"
+          if [ "${PINS}" -lt 1 ]; then
+            echo "::error::rewrote no pins — discovery missed something, refusing to push"
+            exit 1
+          fi
+
+          cargo update -p dravr-tronc
+
+          # Assert the graph converged. A green `cargo check` is NOT this assertion:
+          # Cargo resolves two versions of a 0.x crate happily, and the platform's
+          # security-audit step hard-fails on exactly that. It cost two failed bumps
+          # (2026-08-31 and 2026-09-03) to learn that the check has to be the lockfile,
+          # at the moment the pins move.
+          ENTRIES=$(grep -c '^name = "dravr-tronc"$' Cargo.lock || true)
+          if [ "${ENTRIES}" != "1" ]; then
+            echo "::error::Cargo.lock holds ${ENTRIES} dravr-tronc entries, expected 1 — this bump cannot merge"
+            grep -A2 '^name = "dravr-tronc"$' Cargo.lock || true
+            echo "::error::something else in the graph pins an incompatible tronc; bump that first"
+            exit 1
+          fi
+          GOT=$(grep -A1 '^name = "dravr-tronc"$' Cargo.lock | grep '^version = ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [ "${GOT}" != "${VERSION}" ]; then
+            echo "::error::Cargo.lock resolves dravr-tronc at ${GOT}, expected ${VERSION}"
+            exit 1
+          fi
+          echo "Cargo.lock: dravr-tronc ${GOT} (single entry)"
+
+      - name: Push the branch and dispatch the gates onto it
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+        run: |
+          set -euo pipefail
+          # fix/ is on every consumer's CI push filter alongside feature/, debug/,
+          # claude/ and copilot/. A branch outside that set pushes green and runs
+          # nothing, which the gate below would read as "never started".
+          BRANCH="fix/tronc-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          # Stage exactly the manifests this bump rewrote plus the lockfile it
+          # regenerated. `git add -A` would sweep in anything else the checkout or the
+          # toolchain left behind — a submodule pointer, a generated file — and commit
+          # it to eleven repos' main under a message that says "bump dravr-tronc".
+          git add $(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml) Cargo.lock
+          git commit -m "chore(deps): bump dravr-tronc to ${VERSION}"
+          git push --force-with-lease origin "${BRANCH}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          # GitHub suppresses workflow runs on pushes made with GITHUB_TOKEN, so this
+          # branch triggers nothing on its own and the gate would wait forever on runs
+          # that never start. Dispatch each gate explicitly.
+          for wf in ${CI_WORKFLOWS}; do
+            gh workflow run "$wf" --ref "${BRANCH}"
+            echo "dispatched ${wf} on ${BRANCH}"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 3. Require green
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Wait for CI on the bump branch
+    runs-on: ubuntu-latest
+    needs: [resolve, bump]
+    timeout-minutes: 60
+    steps:
+      - name: Poll until every gate reaches a terminal status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ needs.bump.outputs.branch }}
+          GH_REPO: ${{ github.repository }}
+          CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+          GATE_TIMEOUT: ${{ inputs.gate_timeout_minutes }}
+        run: |
+          set -uo pipefail
+          DEADLINE=$(( $(date +%s) + GATE_TIMEOUT * 60 ))
+          # The branch is created fresh for this version and nothing else pushes to it,
+          # so the newest run per workflow on it is unambiguously ours. Matching by
+          # commit was rejected: `gh run list --commit` silently returns zero rows.
+          while :; do
+            PENDING=""; FAILED=""
+            for wf in ${CI_WORKFLOWS}; do
+              LINE=$(gh run list --workflow "$wf" --branch "${BRANCH}" --limit 1 \
+                       --json status,conclusion \
+                       -q '.[0] | "\(.status) \(.conclusion // "-")"' 2>/dev/null || true)
+              STATUS="${LINE%% *}"; CONCL="${LINE##* }"
+              if [ -z "${LINE}" ] || [ "${STATUS}" != "completed" ]; then
+                PENDING="${PENDING} ${wf}(${STATUS:-not-started})"
+              elif [ "${CONCL}" != "success" ]; then
+                # cancelled and skipped are not green. A cancelled run validated
+                # nothing — and on a satellite it is usually a job timeout, which is a
+                # real signal about the tree, not noise to retry past.
+                FAILED="${FAILED} ${wf}(${CONCL})"
+              fi
+            done
+            if [ -n "${FAILED}" ]; then
+              echo "::error::CI is not green on ${BRANCH}:${FAILED} — the branch is left in place for inspection"
+              exit 1
+            fi
+            if [ -z "${PENDING}" ]; then
+              echo "all gates green on ${BRANCH}"
+              break
+            fi
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "::error::timed out after ${GATE_TIMEOUT}m waiting on:${PENDING}"
+              exit 1
+            fi
+            echo "waiting on:${PENDING}"
+            sleep 60
+          done
+
+  # ---------------------------------------------------------------------------
+  # 4. Squash onto main
+  # ---------------------------------------------------------------------------
+  merge:
+    name: Squash merge onto main
+    runs-on: ubuntu-latest
+    needs: [resolve, bump, gate]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Squash merge and delete the branch
+        env:
+          BRANCH: ${{ needs.bump.outputs.branch }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PINNED: ${{ needs.resolve.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "${BRANCH}"
+          git merge --squash "origin/${BRANCH}"
+          git commit -m "chore(deps): bump dravr-tronc ${PINNED} -> ${VERSION}"
+          git push origin main
+          # Squash gives the merge a new SHA, so the branch is dead the moment it
+          # lands. Deleting it here keeps dead refs from accumulating per release.
+          git push origin --delete "${BRANCH}"
+
+  # ---------------------------------------------------------------------------
+  # Anything that stops the chain becomes a tracked issue
+  # ---------------------------------------------------------------------------
+  report-failure:
+    name: File the stall on the register
+    runs-on: ubuntu-latest
+    needs: [resolve, bump, gate, merge]
+    if: failure() && needs.resolve.outputs.needed == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Open or update the register issue
+        env:
+          GH_TOKEN: ${{ secrets.DRAVR_CARNET_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PINNED: ${{ needs.resolve.outputs.pinned }}
+          BRANCH: ${{ needs.bump.outputs.branch }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The private register, because most of these repos are public.
+          TRACKER="dravr-ai/dravr-carnet"
+          SHORT="${REPO#dravr-ai/}"
+          TITLE="[platform] ${SHORT} tronc bump stalled (${PINNED} -> ${VERSION})"
+
+          # Indented to this block's level on purpose: YAML strips a block scalar's
+          # common indentation, so the shell receives column 0. Dedenting breaks the YAML.
+          BODY=$(cat <<EOF
+          Automated bump of \`dravr-tronc\` to **${VERSION}** did not complete in \`${REPO}\`.
+
+          - Pinned: **${PINNED}**
+          - Target: **${VERSION}**
+          - Branch: \`${BRANCH:-not created}\`
+          - Run: ${RUN_URL}
+
+          A stall is safe. Nothing merged, so this repo keeps building against the tronc
+          it already had; the branch is left in place to inspect.
+
+          **If the lockfile assertion failed**, something else in this repo's graph pins
+          an incompatible tronc — a published crate holding an older caret. That crate
+          has to be re-released first. This is not hypothetical: it blocked the platform
+          twice, on 2026-08-31 and again on 2026-09-03, both times on \`embacle-tool-host\`.
+
+          **If a CI gate failed**, the tronc minor needs source changes here, not just a
+          pin. Across 0.5.3 -> 0.11.0 the ones that bit were the \`Tool\` literal gaining
+          \`execution\` and \`output_schema\` (a missing-fields error, E0063) and
+          \`JsonSchema::properties\` / \`defs\` moving from \`HashMap\` to \`BTreeMap\`.
+
+          **If the registry wait failed**, the release tag exists but \`cargo publish\`
+          did not land. Re-running this cannot help — fix tronc's \`release.yml\` and cut
+          the release again.
+
+          _Filed by \`consumer-bump.yml\` in dravr-tronc. See carnet#330._
+          EOF
+          )
+
+          EXISTING=$(gh issue list --repo "$TRACKER" --state open \
+                     --search "${SHORT} tronc bump stalled in:title" \
+                     --json number -q '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING}" ]; then
+            gh issue edit "${EXISTING}" --repo "$TRACKER" --title "$TITLE" --body "$BODY"
+            echo "updated ${TRACKER}#${EXISTING}"
+          else
+            gh issue create --repo "$TRACKER" --title "$TITLE" --body "$BODY" \
+              --label "dependency" 2>/dev/null \
+              || gh issue create --repo "$TRACKER" --title "$TITLE" --body "$BODY"
+            echo "opened a new issue on ${TRACKER}"
+          fi

@@ -177,3 +177,20 @@ jobs:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           body_path: CHANGELOG.md
+
+  # Tell the consumers. Called from here rather than triggered by `on: release` in
+  # notify-consumers.yml, because the release above is created with the default
+  # GITHUB_TOKEN and GitHub does not start workflow runs from events a GITHUB_TOKEN
+  # produced — an `on: release` trigger could never fire. sciotte's notifier logged
+  # zero runs across five releases that way.
+  #
+  # `needs: publish` on purpose: announcing a version crates.io does not carry sends
+  # every consumer into a fifteen-minute registry wait that ends in a failed bump.
+  notify:
+    name: Notify consumers
+    needs: [version, publish]
+    if: always() && needs.publish.result == 'success'
+    uses: ./.github/workflows/notify-consumers.yml
+    with:
+      version: ${{ inputs.tag != '' && inputs.tag || format('v{0}', needs.version.outputs.version) }}
+    secrets: inherit
