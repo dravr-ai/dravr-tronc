@@ -211,3 +211,72 @@ fn a_2020_12_schema_round_trips() {
         Some(json!("fixed"))
     );
 }
+
+/// A schema serializes with ordered keys at EVERY level, nested ones included.
+///
+/// This is what a consumer relies on when it hashes a tool schema, diffs it, or
+/// checks a generated SDK type into git: two processes over the same schema must
+/// emit the same bytes, or identical schemas read as drift.
+///
+/// Nested levels are the point. Moving only the top-level map to an ordered one
+/// leaves a schema whose outer keys are stable and whose `properties.x.properties`
+/// still reshuffles per process — which looks fixed on a flat schema and is not
+/// fixed at all on a real one.
+///
+/// Asserted against the serialized STRING, not `serde_json::to_value`. A `Value`
+/// map is a `BTreeMap` unless `preserve_order` is on, so it sorts the keys
+/// itself and would report success over an unordered source — and whether that
+/// feature is on depends on which consumer's build unified it in. The string is
+/// what actually goes on the wire.
+#[test]
+fn nested_schema_keys_serialize_in_order() {
+    fn many(prefix: &str) -> BTreeMap<String, PropertySchema> {
+        (0..12)
+            .map(|i| {
+                let key = format!("{prefix}_{i:02}");
+                (
+                    key.clone(),
+                    PropertySchema {
+                        property_type: "string".to_owned(),
+                        description: Some(format!("field {key}")),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    let mut outer = many("outer");
+    outer.insert(
+        "nested".to_owned(),
+        PropertySchema {
+            property_type: "object".to_owned(),
+            properties: Some(many("inner")),
+            ..Default::default()
+        },
+    );
+
+    let encoded = serde_json::to_string(&JsonSchema {
+        schema_type: "object".to_owned(),
+        properties: Some(outer),
+        ..Default::default()
+    })
+    .expect("serializes");
+
+    // The inner keys appear in the string in the order the map yielded them.
+    let positions: Vec<usize> = (0..12)
+        .map(|i| {
+            let key = format!("\"inner_{i:02}\"");
+            encoded
+                .find(&key)
+                .unwrap_or_else(|| panic!("{key} is present in the encoded schema"))
+        })
+        .collect();
+
+    let mut ascending = positions.clone();
+    ascending.sort_unstable();
+    assert_eq!(
+        positions, ascending,
+        "nested property keys must serialize in order — the half 0.10.0 missed"
+    );
+}

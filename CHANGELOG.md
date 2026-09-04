@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0] — 2026-09-03
+
+Finishes the determinism fix 0.10.0 only half made.
+
+### Fixed
+
+- fix(mcp): `PropertySchema::properties` — the NESTED property map — is
+  `BTreeMap`, not `HashMap`. 0.10.0 moved `JsonSchema::properties` and `$defs`
+  and claimed schema serialization was deterministic; it was not. A schema whose
+  outer keys were stable still reshuffled `properties.x.properties` per process,
+  so anything hashing or diffing a real (nested) tool schema still saw drift.
+  The 0.10.0 entry below overstates what it fixed — this is the rest of it.
+- test(mcp): `nested_schema_keys_serialize_in_order` pins the property at every
+  level. Asserted against the serialized string, not `serde_json::to_value`: a
+  `Value` map is a `BTreeMap` unless `preserve_order` is on, so it sorts keys
+  itself and reports success over an unordered source — and whether that feature
+  is on depends on which consumer's build unified it in. The first draft of this
+  test made exactly that mistake and passed against the unfixed code.
+
 ## [0.10.0] — 2026-09-03
 
 Protocol revision `2026-07-28`, second pass: the two conformance gaps the

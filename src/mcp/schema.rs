@@ -603,7 +603,7 @@ pub struct PropertySchema {
     pub items: Option<Box<Self>>,
     /// Nested property definitions for object-type properties.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub properties: Option<HashMap<String, Self>>,
+    pub properties: Option<BTreeMap<String, Self>>,
     /// Required fields for object-type properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
