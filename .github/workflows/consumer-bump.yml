@@ -43,7 +43,7 @@ on:
         type: number
         default: 45
       lockstep_crates:
-        description: "Space-separated crates.io crates that pin tronc themselves and must move to their latest release in the same commit, or the lockfile ends up with two tronc versions"
+        description: "Space-separated dependencies that pin tronc themselves and must move in the same commit, or the lockfile ends up with two tronc versions. A bare name is a crates.io crate, moved to its latest release; git:<name> is a git-tag dependency, moved to its repo's latest vN.N.N tag"
         required: false
         type: string
         default: ""
@@ -265,9 +265,74 @@ jobs:
           # target BEFORE anything is rewritten: a crate not yet re-released on
           # the new tronc is a clear message naming what to release, not a
           # duplicate discovered three steps later.
-          LOCKSTEP_PKGS=""; LOCKSTEP_NOTE=""
+          LOCKSTEP_PKGS=""; LOCKSTEP_NOTE=""; GIT_LOCKSTEP=""
           UA="dravr-tronc-consumer-bump (github.com/dravr-ai/dravr-tronc)"
           for CRATE in ${LOCKSTEP_CRATES}; do
+            case "${CRATE}" in
+              git:*)
+                # A git-tag dependency. The crates.io path cannot move a `tag = "vX"`
+                # pin, and on the platform dravr-stripe is exactly this — private,
+                # taken by tag, pinning tronc in its root — so tronc 1.0.0 landed
+                # there as a hand commit (carnet#338). Same contract as the crates.io
+                # path: the latest tag's own tronc requirement is checked against the
+                # target BEFORE anything is rewritten. The shallow clone rides the
+                # private-git-dep auth configured above, so private repos work.
+                CRATE="${CRATE#git:}"
+                LINE=$(grep -rhE "^${CRATE} = \{" . --include=Cargo.toml | head -1)
+                URL=$(printf '%s' "${LINE}" | grep -oE 'git = "[^"]+"' | cut -d'"' -f2)
+                if [ -z "${URL}" ]; then
+                  echo "::error::lockstep git:${CRATE} — no Cargo.toml here pins ${CRATE} by git source; remove it from lockstep_crates"
+                  exit 1
+                fi
+                LATEST=$(git ls-remote --tags "${URL}" 2>/dev/null \
+                         | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's|refs/tags/||' | sort -V | tail -1)
+                if [ -z "${LATEST}" ]; then
+                  echo "::error::lockstep git:${CRATE} — could not list vN.N.N tags at ${URL} (auth, or no tags)"
+                  exit 1
+                fi
+                TMP=$(mktemp -d)
+                if ! git clone --quiet --depth 1 --branch "${LATEST}" "${URL}" "${TMP}/src" 2>/dev/null; then
+                  echo "::error::lockstep git:${CRATE} — could not fetch tag ${LATEST} from ${URL}"
+                  exit 1
+                fi
+                # The tag's root manifest may pin tronc as a registry version or, in
+                # older tags, as a git tag; either way the number is what matters.
+                REQ=$(grep -E '^dravr-tronc = ' "${TMP}/src/Cargo.toml" \
+                      | grep -oE '(version|tag) = "v?[0-9]+(\.[0-9]+){1,2}"' | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1)
+                rm -rf "${TMP}"
+                if [ -n "${REQ}" ]; then
+                  REQ_MAJOR=$(printf '%s' "${REQ}" | cut -d. -f1); REQ_MINOR=$(printf '%s' "${REQ}" | cut -d. -f2)
+                  TGT_MAJOR=$(printf '%s' "${VERSION}" | cut -d. -f1); TGT_MINOR=$(printf '%s' "${VERSION}" | cut -d. -f2)
+                  COMPATIBLE=false
+                  if [ "${REQ_MAJOR}" = "${TGT_MAJOR}" ]; then
+                    if [ "${TGT_MAJOR}" != "0" ] || [ "${REQ_MINOR}" = "${TGT_MINOR}" ]; then COMPATIBLE=true; fi
+                  fi
+                  if [ "${COMPATIBLE}" != "true" ]; then
+                    echo "::error::${CRATE} ${LATEST} (latest tag at ${URL}) pins dravr-tronc ${REQ}, which cannot resolve to ${VERSION}"
+                    echo "::error::cut a ${CRATE} tag on dravr-tronc ${VERSION} first, then re-run — bumping now would leave two dravr-tronc versions in Cargo.lock"
+                    exit 1
+                  fi
+                fi
+                LS_MANIFESTS=$(grep -rlE "^${CRATE} = \{" . --include=Cargo.toml || true)
+                for m in ${LS_MANIFESTS}; do
+                  sed -i -E "/^${CRATE} = \{/s|tag = \"v[0-9]+(\.[0-9]+){1,2}\"|tag = \"${LATEST}\"|" "$m"
+                  while IFS= read -r line; do
+                    case "${line}" in
+                      *"tag = \"${LATEST}\""*) ;;
+                      *)
+                        echo "::error::${m} has a ${CRATE} pin this bump could not rewrite: ${line}"
+                        exit 1
+                        ;;
+                    esac
+                  done < <(grep -E "^${CRATE} = \{" "$m")
+                done
+                echo "lockstep: ${CRATE} -> ${LATEST} (git tag; pins dravr-tronc ${REQ:-nothing})"
+                LOCKSTEP_PKGS="${LOCKSTEP_PKGS} -p ${CRATE}"
+                LOCKSTEP_NOTE="${LOCKSTEP_NOTE}${LOCKSTEP_NOTE:+, }${CRATE} ${LATEST}"
+                GIT_LOCKSTEP="${GIT_LOCKSTEP} ${CRATE}=${LATEST}"
+                continue
+                ;;
+            esac
             LATEST=$(curl -sf -A "${UA}" "https://crates.io/api/v1/crates/${CRATE}" \
                      | jq -r '[.versions[] | select(.yanked == false)][0].num')
             if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
@@ -344,6 +409,7 @@ jobs:
           echo "Cargo.lock: dravr-tronc ${GOT} (single entry)"
 
           for CRATE in ${LOCKSTEP_CRATES}; do
+            CRATE="${CRATE#git:}"
             ENTRIES=$(grep -c "^name = \"${CRATE}\"$" Cargo.lock || true)
             if [ "${ENTRIES}" != "1" ]; then
               echo "::error::Cargo.lock holds ${ENTRIES} ${CRATE} entries, expected 1 — this bump cannot merge"
@@ -351,6 +417,16 @@ jobs:
               exit 1
             fi
             echo "Cargo.lock: ${CRATE} $(grep -A1 "^name = \"${CRATE}\"$" Cargo.lock | grep '^version = ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') (single entry)"
+          done
+          # A git-tag lockstep crate must also resolve at the tag just pinned, not at
+          # whatever the lockfile still remembered.
+          for PAIR in ${GIT_LOCKSTEP}; do
+            CRATE="${PAIR%%=*}"; TAG="${PAIR##*=}"
+            if ! grep -A2 "^name = \"${CRATE}\"$" Cargo.lock | grep -q "tag=${TAG}"; then
+              echo "::error::Cargo.lock resolves ${CRATE} at $(grep -A2 "^name = \"${CRATE}\"$" Cargo.lock | grep -oE 'tag=v[0-9.]+' || echo '?'), expected ${TAG}"
+              exit 1
+            fi
+            echo "Cargo.lock: ${CRATE} at ${TAG}"
           done
 
       - name: Dry run — report what would have been pushed, then stop
@@ -390,6 +466,7 @@ jobs:
           # it to eleven repos' main under a message that says "bump dravr-tronc".
           git add $(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml) Cargo.lock
           for CRATE in ${LOCKSTEP_CRATES}; do
+            CRATE="${CRATE#git:}"
             git add $(grep -rlE "^${CRATE} = " . --include=Cargo.toml)
           done
           # The lockstep note, when there is one, rides in the body so the subject
@@ -532,8 +609,8 @@ jobs:
           it already had; the branch is left in place to inspect.
 
           **If a lockstep check failed**, the run names the crate and the tronc it still
-          requires: release that crate on the target tronc, then re-run this. Nothing was
-          rewritten.
+          requires: release that crate on the target tronc (for a \`git:\` entry, cut a tag),
+          then re-run this. Nothing was rewritten.
 
           **If the lockfile assertion failed**, something else in this repo's graph pins
           an incompatible tronc — a published crate holding an older caret that is not in
