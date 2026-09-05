@@ -88,12 +88,13 @@ jobs:
           set -uo pipefail
           REPOS=$(gh api --paginate 'orgs/dravr-ai/repos?type=all&per_page=100' \
                   --jq '.[] | select(.archived == false) | select(.fork == false) | .full_name')
-          if [ -z "${REPOS}" ]; then
-            echo "::error::listed no repos — the dispatch token cannot see the org"
-            exit 1
-          fi
-
           SENT=""; MISSED=""; NOT_CONSUMER=""; UNREADABLE=""
+          if [ -z "${REPOS}" ]; then
+            # The token cannot see the org at all. Same rule as every other miss: it
+            # is the token's problem, filed below, never a red release.
+            echo "::warning::listed no repos — DRAVR_PLATFORM_DISPATCH_TOKEN cannot see the org; filing on the register"
+            UNREADABLE="dravr-ai/(org listing failed)"
+          fi
           for R in ${REPOS}; do
             # Consumer or not: the caller file is the enrolment, so its presence is
             # the test. 200 = consumer; 404 = not a consumer, skip quietly; anything
