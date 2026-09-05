@@ -69,6 +69,17 @@ jobs:
       - run: cargo test
       - run: cargo test --features notifications
 
+  lockstep:
+    name: Consumer-bump lockstep (shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The lockstep step of consumer-bump.yml, lifted out of the YAML and run
+      # against a fixture repo with curl/git/cargo answered from canned data.
+      # Runs here on the runner's own sed, sort and coreutils, the ones the
+      # real step uses; nothing about the step can be reached by cargo test.
+      - run: bash scripts/consumer-bump-lockstep.test.sh
+
   validate:
     name: Architectural Validation
     runs-on: ubuntu-latest
