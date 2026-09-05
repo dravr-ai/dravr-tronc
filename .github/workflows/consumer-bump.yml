@@ -278,27 +278,37 @@ jobs:
                 # target BEFORE anything is rewritten. The shallow clone rides the
                 # private-git-dep auth configured above, so private repos work.
                 CRATE="${CRATE#git:}"
-                LINE=$(grep -rhE "^${CRATE} = \{" . --include=Cargo.toml | head -1)
-                URL=$(printf '%s' "${LINE}" | grep -oE 'git = "[^"]+"' | cut -d'"' -f2)
+                # Every substitution here is `|| true`: this step runs under
+                # `set -euo pipefail`, and `x=$(a | b)` ends the step on the pipeline's
+                # status before the named check behind it can say what was missing.
+                # The first dry run of this arm died exactly that way, with nothing
+                # but "exit code 1" in the log.
+                LINE=$(grep -rhE "^${CRATE} = \{" . --include=Cargo.toml | head -1 || true)
+                URL=$(printf '%s' "${LINE}" | grep -oE 'git = "[^"]+"' | cut -d'"' -f2 || true)
                 if [ -z "${URL}" ]; then
                   echo "::error::lockstep git:${CRATE} — no Cargo.toml here pins ${CRATE} by git source; remove it from lockstep_crates"
                   exit 1
                 fi
-                LATEST=$(git ls-remote --tags "${URL}" 2>/dev/null \
-                         | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's|refs/tags/||' | sort -V | tail -1)
+                # Talk to the remote from OUTSIDE the checkout. Inside it,
+                # actions/checkout's extraheader sends GITHUB_TOKEN for github.com,
+                # which cannot read a private dependency; outside it the global
+                # insteadOf rewrite configured above carries the private-deps token.
+                SCRATCH="${RUNNER_TEMP:-/tmp}"
+                LATEST=$(cd "${SCRATCH}" && git ls-remote --tags "${URL}" 2>/dev/null \
+                         | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's|refs/tags/||' | sort -V | tail -1 || true)
                 if [ -z "${LATEST}" ]; then
                   echo "::error::lockstep git:${CRATE} — could not list vN.N.N tags at ${URL} (auth, or no tags)"
                   exit 1
                 fi
-                TMP=$(mktemp -d)
-                if ! git clone --quiet --depth 1 --branch "${LATEST}" "${URL}" "${TMP}/src" 2>/dev/null; then
+                TMP=$(mktemp -d "${SCRATCH}/lockstep.XXXXXX")
+                if ! (cd "${SCRATCH}" && git clone --quiet --depth 1 --branch "${LATEST}" "${URL}" "${TMP}/src") 2>/dev/null; then
                   echo "::error::lockstep git:${CRATE} — could not fetch tag ${LATEST} from ${URL}"
                   exit 1
                 fi
                 # The tag's root manifest may pin tronc as a registry version or, in
                 # older tags, as a git tag; either way the number is what matters.
                 REQ=$(grep -E '^dravr-tronc = ' "${TMP}/src/Cargo.toml" \
-                      | grep -oE '(version|tag) = "v?[0-9]+(\.[0-9]+){1,2}"' | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1)
+                      | grep -oE '(version|tag) = "v?[0-9]+(\.[0-9]+){1,2}"' | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1 || true)
                 rm -rf "${TMP}"
                 if [ -n "${REQ}" ]; then
                   REQ_MAJOR=$(printf '%s' "${REQ}" | cut -d. -f1); REQ_MINOR=$(printf '%s' "${REQ}" | cut -d. -f2)
@@ -334,13 +344,13 @@ jobs:
                 ;;
             esac
             LATEST=$(curl -sf -A "${UA}" "https://crates.io/api/v1/crates/${CRATE}" \
-                     | jq -r '[.versions[] | select(.yanked == false)][0].num')
+                     | jq -r '[.versions[] | select(.yanked == false)][0].num' || true)
             if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
               echo "::error::could not read the latest ${CRATE} release from crates.io"
               exit 1
             fi
             REQ=$(curl -sf -A "${UA}" "https://crates.io/api/v1/crates/${CRATE}/${LATEST}/dependencies" \
-                  | jq -r '.dependencies[] | select(.crate_id == "dravr-tronc") | .req' | head -1)
+                  | jq -r '.dependencies[] | select(.crate_id == "dravr-tronc") | .req' | head -1 || true)
             if [ -n "${REQ}" ] && [ "${REQ}" != "null" ]; then
               # Caret semantics: "^0.11.0" spans 0.11.*, "^1.0.0" spans 1.*. Same
               # major, and on 0.x also the same minor, is what resolves to one
