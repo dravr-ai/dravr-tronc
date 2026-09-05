@@ -23,14 +23,18 @@
 #
 # A repo is a consumer if it carries the caller file; that is checked before
 # anything is sent, so repos without one are skipped rather than dispatched at
-# and reported as unreachable. A consumer that cannot be dispatched to FAILS THIS
-# RUN. The first release through this wire, tronc 1.0.0 on 2026-09-04, reached
-# two of eleven consumers — DRAVR_PLATFORM_DISPATCH_TOKEN was scoped to the
-# platform and photograveur — and the run was green with nine warnings nobody
-# was reading. Reach is a property of the token, not of this file, and a token
-# that has narrowed is a red release, not a footnote. The weekly cron on each
-# caller remains the safety net for a dispatch lost in transit, not for a token
-# that cannot reach.
+# and reported as unreachable. A consumer that cannot be dispatched to is FILED
+# ON THE REGISTER, and the run stays green. The first release through this wire,
+# tronc 1.0.0 on 2026-09-04, reached two of eleven consumers —
+# DRAVR_PLATFORM_DISPATCH_TOKEN was scoped to the platform and photograveur —
+# and the run was green with nine warnings nobody was reading. The fix is not
+# to make the run red: by this job the crate is already published and tagged,
+# and a red tronc lane stops every session that touches tronc for a reach
+# problem that is the token's, not the release's. So a miss opens or updates
+# one carnet issue naming the repos and the hand-dispatch line, the same way a
+# consumer's own chain files its stalls. Reach is a property of the token, not
+# of this file. The weekly cron on each caller remains the safety net for a
+# dispatch lost in transit.
 
 name: "Tronc: Notify Consumers of Release"
 
@@ -77,7 +81,9 @@ jobs:
       - name: Fire repository_dispatch at every live repo in the org
         env:
           GH_TOKEN: ${{ secrets.DRAVR_PLATFORM_DISPATCH_TOKEN }}
+          CARNET_TOKEN: ${{ secrets.DRAVR_CARNET_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
           REPOS=$(gh api --paginate 'orgs/dravr-ai/repos?type=all&per_page=100' \
@@ -99,7 +105,7 @@ jobs:
               if gh api "repos/${R}" >/dev/null 2>&1; then
                 NOT_CONSUMER="${NOT_CONSUMER} ${R}"
               else
-                echo "::error::cannot read ${R} with DRAVR_PLATFORM_DISPATCH_TOKEN — widen the token's repository access"
+                echo "::warning::cannot read ${R} with DRAVR_PLATFORM_DISPATCH_TOKEN — widen the token's repository access"
                 UNREADABLE="${UNREADABLE} ${R}"
               fi
               continue
@@ -113,7 +119,7 @@ jobs:
               echo "dispatched -> ${R}"
               SENT="${SENT} ${R}"
             else
-              echo "::error::could not dispatch to consumer ${R} — token scope, or Actions disabled there"
+              echo "::warning::could not dispatch to consumer ${R} — token scope, or Actions disabled there"
               MISSED="${MISSED} ${R}"
             fi
           done
@@ -125,7 +131,7 @@ jobs:
             for R in ${SENT}; do echo "- \`${R}\`"; done
             if [ -n "${MISSED}${UNREADABLE}" ]; then
               echo ""
-              echo "**Could not reach** — this run is red until the token reaches them:"
+              echo "**Could not reach** — filed on the register; the release itself is done:"
               for R in ${MISSED} ${UNREADABLE}; do echo "- \`${R}\`"; done
               echo ""
               echo "Dispatch each by hand meanwhile: \`gh workflow run tronc-bump.yml -R <repo> -f version=${VERSION}\`."
@@ -137,11 +143,38 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -n "${MISSED}${UNREADABLE}" ]; then
-            echo "::error::$(echo ${MISSED} ${UNREADABLE} | wc -w | tr -d ' ') repo(s) unreachable — the fan-out did not happen for them"
-            exit 1
-          fi
-          if [ -z "${SENT}" ]; then
-            echo "::error::no consumer reached — every repo read as a non-consumer, which cannot be right while the fleet carries callers"
-            exit 1
+          # A miss is a tracked issue, never a red release: by now the crate is
+          # published and tagged, and a red tronc lane blocks every session that
+          # touches tronc. One issue per version, updated rather than duplicated.
+          if [ -n "${MISSED}${UNREADABLE}" ] || [ -z "${SENT}" ]; then
+            N=$(echo ${MISSED} ${UNREADABLE} | wc -w | tr -d ' ')
+            TRACKER="dravr-ai/dravr-carnet"
+            TITLE="[platform] tronc ${VERSION} announcement did not reach ${N} consumer(s)"
+            # Indented to this block's level on purpose: YAML strips a block scalar's
+            # common indentation, so the shell receives column 0.
+            BODY=$(cat <<EOF
+          tronc **${VERSION}** is published and tagged; its announcement to consumers reached **$(echo ${SENT} | wc -w | tr -d ' ')** and could not reach **${N}**. Run: ${RUN_URL}
+
+          Unreached:
+          $(for R in ${MISSED} ${UNREADABLE}; do echo "- \`${R}\`"; done)
+
+          Reach is a property of \`DRAVR_PLATFORM_DISPATCH_TOKEN\` — a fine-grained PAT whose repository access must include every consumer (Contents: read & write). Widen it, then re-run this workflow (\`notify-consumers.yml\`, version \`v${VERSION}\`) or dispatch each consumer by hand:
+
+          \`\`\`
+          $(for R in ${MISSED} ${UNREADABLE}; do echo "gh workflow run tronc-bump.yml -R ${R} -f version=${VERSION}"; done)
+          \`\`\`
+
+          Each consumer's weekly cron also picks the release up on its own. _Filed by \`notify-consumers.yml\` in dravr-tronc._
+          EOF
+            )
+            EXISTING=$(GH_TOKEN="${CARNET_TOKEN}" gh issue list --repo "$TRACKER" --state open \
+                         --search "tronc ${VERSION} announcement did not reach in:title" \
+                         --json number -q '.[0].number' 2>/dev/null || true)
+            if [ -n "${EXISTING}" ]; then
+              GH_TOKEN="${CARNET_TOKEN}" gh issue edit "${EXISTING}" --repo "$TRACKER" --title "$TITLE" --body "$BODY" >/dev/null 2>&1 \
+                && echo "::warning::${N} consumer(s) unreached — updated ${TRACKER}#${EXISTING}"
+            else
+              URL=$(GH_TOKEN="${CARNET_TOKEN}" gh issue create --repo "$TRACKER" --title "$TITLE" --body "$BODY" 2>/dev/null || true)
+              echo "::warning::${N} consumer(s) unreached — filed ${URL:-on ${TRACKER} (create failed: check DRAVR_CARNET_TOKEN)}"
+            fi
           fi
