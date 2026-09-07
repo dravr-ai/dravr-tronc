@@ -478,12 +478,21 @@ pub struct ToolSchema {
     #[serde(rename = "inputSchema")]
     pub input_schema: JsonSchema,
     /// JSON Schema for the tool's structured output, when it declares one.
+    ///
+    /// Held as a document rather than as [`JsonSchema`], which models the
+    /// subset a hand-written input schema needs. An output schema is
+    /// typically derived from the result type — schemars writes
+    /// `"type": ["string", "null"]` for an optional field, and `title` on
+    /// every definition — so the typed form cannot round-trip one: it
+    /// refuses the union outright and drops what it does not model. Nothing
+    /// here inspects the document; it is carried to the client verbatim,
+    /// which is also what [`Tool::output_schema`] does.
     #[serde(
         rename = "outputSchema",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub output_schema: Option<JsonSchema>,
+    pub output_schema: Option<serde_json::Value>,
     /// Optional behavioral annotations (MCP 2025-11-25).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
@@ -532,7 +541,7 @@ impl ToolSchema {
 
     /// Declare the schema of this tool's structured output.
     #[must_use]
-    pub fn with_output_schema(mut self, output_schema: JsonSchema) -> Self {
+    pub fn with_output_schema(mut self, output_schema: serde_json::Value) -> Self {
         self.output_schema = Some(output_schema);
         self
     }

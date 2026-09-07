@@ -160,11 +160,10 @@ fn tool_schema_carries_an_output_schema() {
             ..Default::default()
         },
     )
-    .with_output_schema(JsonSchema {
-        schema_type: "object".to_owned(),
-        required: Some(vec!["activities".to_owned()]),
-        ..Default::default()
-    });
+    .with_output_schema(json!({
+        "type": "object",
+        "required": ["activities"],
+    }));
 
     let value = serde_json::to_value(&schema).expect("serializes");
     assert_eq!(value["outputSchema"]["type"], "object");
@@ -181,6 +180,70 @@ fn tool_schema_carries_an_output_schema() {
     );
     let value = serde_json::to_value(&bare).expect("serializes");
     assert!(value.get("outputSchema").is_none());
+}
+
+/// An output schema is normally derived from the result type rather than
+/// written by hand, and a derived document uses vocabulary the typed
+/// [`JsonSchema`] does not model: a union `type` for an optional field, a
+/// `title` on every definition, `$defs` entries that are themselves
+/// compositions.
+///
+/// The field holds the document for exactly this reason. Routed through the
+/// typed form instead, this schema does not arrive degraded — it does not
+/// arrive at all, because `"type": ["string", "null"]` is not a string and
+/// deserialization refuses it.
+#[test]
+fn an_output_schema_reaches_the_wire_as_it_was_derived() {
+    let derived = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ActivitiesResult",
+        "type": "object",
+        "properties": {
+            "activities": { "$ref": "#/$defs/Activity" },
+            "next_cursor": { "type": ["string", "null"] },
+        },
+        "required": ["activities"],
+        "$defs": {
+            "Activity": {
+                "title": "Activity",
+                "anyOf": [
+                    { "type": "object", "properties": { "id": { "type": "string" } } },
+                    { "type": "null" },
+                ],
+            },
+        },
+    });
+
+    let schema = ToolSchema::without_annotations(
+        "get_activities".to_owned(),
+        "List activities".to_owned(),
+        JsonSchema {
+            schema_type: "object".to_owned(),
+            ..Default::default()
+        },
+    )
+    .with_output_schema(derived.clone());
+
+    let wire = serde_json::to_value(&schema).expect("serializes");
+    assert_eq!(
+        wire["outputSchema"], derived,
+        "the document a tool declares is the document its client reads"
+    );
+
+    let parsed: ToolSchema = serde_json::from_value(wire).expect("deserializes");
+    assert_eq!(
+        parsed.output_schema.as_ref(),
+        Some(&derived),
+        "and it survives a round trip through the wire form"
+    );
+
+    // The reason the field is a document, stated as an assertion so that
+    // retyping it fails here rather than silently dropping schemas.
+    let refused = serde_json::from_value::<JsonSchema>(derived);
+    assert!(
+        refused.is_err(),
+        "the typed form models a hand-written input schema, not a derived one"
+    );
 }
 
 #[test]
