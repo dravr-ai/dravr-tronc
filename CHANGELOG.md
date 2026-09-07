@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.1] — 2026-09-07
+
+### Fixed
+
+- fix(mcp): an output schema is a document, not the input subset
+
+### Other
+
+- chore(build): .build 87f8c6d -> 660d542
+- test(consumer-bump): the lockstep step runs against stubs in CI
+- ci(consumer-bump): reach a private git remote from outside the checkout
+- ci(consumer-bump): lockstep can move a git-tag dependency
+- ci(notify-consumers): an unlistable org files an issue, never a red run
+- ci(notify-consumers): a miss files an issue, never a red release
+
+
+
 ## [1.0.0] — 2026-09-04
 
 ### Other
