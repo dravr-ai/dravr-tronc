@@ -29,6 +29,11 @@
 #   - a bare crates.io entry behaves exactly as it did before the git arm existed,
 #     and never touches git
 #   - a lockfile that resolves the git crate at the wrong tag fails the assertion
+#   - a consumer using [workspace.dependencies] has its root entry rewritten while
+#     the inheriting members are left alone, and inheriting members never satisfy
+#     the "at least one pin moved" check on their own
+#   - a git or path override is still refused, because the workspace arm keys on
+#     "workspace = true" rather than on the absence of a version
 #
 # The step runs under `set -euo pipefail`, so every `x=$(a | b)` in it ends the
 # step on the pipeline's status unless the arm carries `|| true`; the refusal
@@ -287,6 +292,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 EOF
 }
 
+# A consumer that declares the pin once in [workspace.dependencies] and inherits it
+# everywhere else — the shape dravr-platform moved to on 2026-09-09. The version lives
+# in the root manifest; every member line carries `workspace = true` and no version at
+# all, so the sed has nothing to rewrite there and the root line is the only real pin.
+make_workspace_repo() {
+  local dir="$1"
+  mkdir -p "${dir}/crates/core" "${dir}/crates/server"
+  cat > "${dir}/Cargo.toml" <<'EOF'
+[workspace]
+members = ["crates/core", "crates/server"]
+
+[workspace.dependencies]
+dravr-tronc = "0.11.0"
+EOF
+  cat > "${dir}/crates/core/Cargo.toml" <<'EOF'
+[package]
+name = "core"
+version = "0.1.0"
+
+[dependencies]
+dravr-tronc = { workspace = true }
+EOF
+  cat > "${dir}/crates/server/Cargo.toml" <<'EOF'
+[package]
+name = "server"
+version = "0.1.0"
+
+[dependencies]
+dravr-tronc = { workspace = true, features = ["notifications"] }
+EOF
+  cat > "${dir}/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "dravr-tronc"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+EOF
+  cat > "${dir}/Cargo.lock.resolved" <<'EOF'
+version = 4
+
+[[package]]
+name = "dravr-tronc"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+EOF
+}
+
 # The lock a real resolve writes once every pin agrees on tronc 1.0.0.
 converged_lock() {
   local dir="$1" stripe_tag="${2:-v0.1.14}" stripe_version="${3:-0.1.14}" stripe_url="${4:-https://github.com/dravr-ai/dravr-stripe.git}"
@@ -431,6 +484,43 @@ R="${WORK}/s8"; make_repo "${R}"; converged_lock "${R}" v0.1.13 0.1.14
 run_step "${R}" 1.0.0 "git:dravr-stripe"
 expect_rc 1
 expect_out "::error::Cargo.lock resolves dravr-stripe at tag=v0.1.13, expected v0.1.14"
+
+echo "9. a consumer on [workspace.dependencies] bumps the root entry and leaves members alone"
+R="${WORK}/s9"; make_workspace_repo "${R}"
+run_step "${R}" 1.0.0 ""
+expect_rc 0
+expect_line "${R}/Cargo.toml" 'dravr-tronc = "1.0.0"'
+# The members are the point: they carry no version, so they must come out untouched
+# rather than rewritten into something that shadows the workspace entry.
+expect_line "${R}/crates/core/Cargo.toml"   'dravr-tronc = { workspace = true }'
+expect_line "${R}/crates/server/Cargo.toml" 'dravr-tronc = { workspace = true, features = ["notifications"] }'
+expect_out "rewrote 1 pin(s)"
+expect_out "2 member(s) inherit it from [workspace.dependencies]"
+
+echo "10. an inheriting member never counts as the pin that moved"
+# Same shape with the root entry absent — the sed rewrites nothing, and the two
+# `workspace = true` members must not satisfy "at least one pin moved". Before the
+# workspace arm existed this failed for the right reason by accident (the members
+# tripped the unrewritable-shape check); it has to keep failing now that they are
+# deliberately skipped.
+R="${WORK}/s10"; make_workspace_repo "${R}"
+sed -i.bak '/^dravr-tronc = "0.11.0"$/d' "${R}/Cargo.toml" && rm -f "${R}/Cargo.toml.bak"
+run_step "${R}" 1.0.0 ""
+expect_rc 1
+expect_out "::error::rewrote no pins — discovery missed something, refusing to push"
+expect_out "an inheriting member is"
+
+echo "11. a git or path override is still refused, workspace arm notwithstanding"
+# The override sits in a member that ALSO carries an inheriting line, so the arm has
+# to judge each line on its own rather than passing the whole file the moment it sees
+# a `workspace = true` anywhere in it.
+R="${WORK}/s11"; make_workspace_repo "${R}"
+echo 'dravr-tronc = { git = "https://github.com/dravr-ai/dravr-tronc.git", tag = "v0.11.0" }' \
+  >> "${R}/crates/core/Cargo.toml"
+run_step "${R}" 1.0.0 ""
+expect_rc 1
+expect_out "::error::expected it to carry 1.0.0. The shape is one the sed does not"
+
 
 echo ""
 if [ "${FAILURES}" -gt 0 ]; then

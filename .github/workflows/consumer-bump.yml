@@ -210,6 +210,7 @@ jobs:
           MANIFESTS=$(grep -rlE '^dravr-tronc = ' . --include=Cargo.toml)
           echo "Rewriting:"; echo "${MANIFESTS}"
           PINS=0
+          INHERITED=0
 
           # Overwrite whatever version each line holds rather than swapping a known old
           # value, so a manifest that had drifted to a third version converges too.
@@ -228,26 +229,50 @@ jobs:
             # Verify positively: every remaining pin line must CONTAIN the target
             # version. A negative check ("no line holds a different version") is
             # satisfied vacuously by a line holding no parseable version at all —
-            # `{ workspace = true }`, a git or path override — which passes while the
-            # pin is untouched.
+            # a git or path override — which passes while the pin is untouched.
+            #
+            # `{ workspace = true }` is the one shape that carries no version and is
+            # still correct. A consumer using [workspace.dependencies] declares the
+            # version once in its root manifest and every member inherits it, so the
+            # member lines have nothing to rewrite and the root line is the real pin.
+            # They are counted separately from PINS: a member must never satisfy the
+            # "at least one pin moved" check below, or a repo where the sed silently
+            # missed the root entry would pass on its inheriting members alone.
+            #
+            # Matching on "workspace = true" rather than on the absence of a version
+            # is what keeps this from becoming the vacuous check above — a git or
+            # path override still fails, because it says nothing about a workspace.
+            # (The dotted form, `dravr-tronc.workspace = true`, never reaches here:
+            # discovery anchors on `^dravr-tronc = `. That is safe for the same
+            # reason — it carries no version either.)
             while IFS= read -r line; do
               case "${line}" in
-                *"\"${VERSION}\""*) ;;
+                *"\"${VERSION}\""*)
+                  PINS=$(( PINS + 1 ))
+                  ;;
+                *"workspace = true"*)
+                  INHERITED=$(( INHERITED + 1 ))
+                  ;;
                 *)
                   echo "::error::${m} has a dravr-tronc pin this bump could not rewrite:"
                   echo "::error::  ${line}"
                   echo "::error::expected it to carry ${VERSION}. The shape is one the sed does not"
-                  echo "::error::handle (workspace/git/path override, or a non-semver version)."
+                  echo "::error::handle (git or path override, or a non-semver version)."
                   echo "::error::Refusing to push a partial bump — teach the sed the new shape."
                   exit 1
                   ;;
               esac
-              PINS=$(( PINS + 1 ))
             done < <(grep -E '^dravr-tronc = ' "$m")
           done
           echo "rewrote ${PINS} pin(s) across $(echo "${MANIFESTS}" | wc -l | tr -d ' ') manifest(s)"
+          if [ "${INHERITED}" -gt 0 ]; then
+            echo "${INHERITED} member(s) inherit it from [workspace.dependencies] — nothing to rewrite there"
+          fi
           if [ "${PINS}" -lt 1 ]; then
             echo "::error::rewrote no pins — discovery missed something, refusing to push"
+            echo "::error::(${INHERITED} inheriting member(s) found; an inheriting member is"
+            echo "::error::never the pin, so the root [workspace.dependencies] entry is what"
+            echo "::error::is missing or unparseable here.)"
             exit 1
           fi
 
