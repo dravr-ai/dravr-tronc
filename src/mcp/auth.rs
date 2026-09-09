@@ -12,6 +12,12 @@
 //! per-call [`crate::mcp::tool::ToolContext`], or to reject it. The HTTP
 //! transport renders an [`AuthError`] as the matching status code: `401` with a
 //! `WWW-Authenticate` challenge (RFC 9728) or `403`.
+//!
+//! **Which mechanism?** This crate ships five, and the choice is made by what
+//! the caller can present, per route — not by which one has no feature flag.
+//! The table is in the crate README under "Choosing an auth mechanism"; read it
+//! before reaching for a shared bearer key, which is the wrong answer whenever
+//! the caller is another Google workload, a browser session, or a webhook.
 
 use std::sync::Arc;
 

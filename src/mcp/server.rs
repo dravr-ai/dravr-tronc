@@ -638,12 +638,22 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Handle `tools/list` — return the tool definitions visible to the caller.
     ///
-    /// Uses the host [`ToolListProvider`] when installed (e.g. for tenant
-    /// scoping); otherwise lists every registered tool.
+    /// Uses the host [`ToolDispatcher`] when installed (e.g. for tenant
+    /// scoping); otherwise lists the registry's tools, minus the `ADMIN_ONLY`
+    /// ones when `ctx` is not admin.
+    ///
+    /// That filter matters because it makes discovery agree with dispatch.
+    /// [`ToolRegistry::execute`] has always refused an `ADMIN_ONLY` tool to a
+    /// non-admin caller, but this branch used to list every tool regardless, so
+    /// a server with no dispatcher advertised the names, descriptions and input
+    /// schemas of its admin tools to anyone — then refused the call. Nothing in
+    /// the fleet was exposed, because the one host that declares `ADMIN_ONLY`
+    /// tools installs a dispatcher; the trap was that any host adding its first
+    /// admin-only tool without one would leak it silently.
     async fn handle_tools_list(&self, id: Option<Value>, ctx: &ToolContext) -> JsonRpcResponse {
         let definitions = match &self.tool_dispatcher {
             Some(dispatcher) => dispatcher.list_tools(&self.state, ctx).await,
-            None => self.tools.list_definitions(),
+            None => self.tools.list_definitions_for(ctx.is_admin),
         };
         match serde_json::to_value(definitions) {
             Ok(tools) => {
@@ -744,7 +754,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 mod tests {
     use super::*;
     use crate::mcp::schema::{Tool, ToolResponse};
-    use crate::mcp::tool::McpTool;
+    use crate::mcp::tool::{McpTool, ToolCapabilities};
     use serde_json::json;
 
     struct TestState;
@@ -772,6 +782,71 @@ mod tests {
         ) -> ToolResponse {
             ToolResponse::text("pong".to_owned())
         }
+    }
+
+    struct AdminOnlyTool;
+
+    #[async_trait::async_trait]
+    impl McpTool<TestState> for AdminOnlyTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "admin_tool".to_owned(),
+                description: "Operator only".to_owned(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+                execution: None,
+            }
+        }
+
+        fn capabilities(&self) -> ToolCapabilities {
+            ToolCapabilities::ADMIN_ONLY
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text("admin pong".to_owned())
+        }
+    }
+
+    /// Grants admin to any caller presenting the token `admin`.
+    struct AdminIfTokenHook;
+
+    #[async_trait::async_trait]
+    impl AuthHook<TestState> for AdminIfTokenHook {
+        async fn authenticate(
+            &self,
+            request: &JsonRpcRequest,
+            _state: &Arc<TestState>,
+        ) -> Result<ToolContext, AuthError> {
+            Ok(ToolContext {
+                is_admin: request.auth_token.as_deref() == Some("admin"),
+                ..ToolContext::default()
+            })
+        }
+    }
+
+    /// A registry holding one public and one `ADMIN_ONLY` tool, and no
+    /// [`ToolDispatcher`] — the shape whose `tools/list` used to leak.
+    fn make_server_with_admin_tool() -> McpServer<TestState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(PingTool));
+        registry.register(Box::new(AdminOnlyTool));
+        McpServer::new("test-server", "0.1.0", registry, Arc::new(TestState))
+    }
+
+    fn listed_names(resp: &JsonRpcResponse) -> Vec<String> {
+        resp.result
+            .as_ref()
+            .and_then(|r| r["tools"].as_array())
+            .expect("tools array") // Safe: test assertion
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
     }
 
     fn make_server() -> McpServer<TestState> {
@@ -819,6 +894,70 @@ mod tests {
         let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "ping_tool");
+    }
+
+    #[tokio::test]
+    async fn tools_list_withholds_admin_tools_from_an_anonymous_caller() {
+        // No auth hook, so the caller resolves to an anonymous ToolContext with
+        // is_admin false. Without a dispatcher this branch used to list the
+        // whole registry, publishing the admin tool's name, description and
+        // input schema to anyone who could reach the transport.
+        let server = make_server_with_admin_tool();
+        let raw = r#"{"jsonrpc": "2.0", "id": 40, "method": "tools/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+
+        // Assert the whole name set, not just that admin_tool is absent — an
+        // empty list would satisfy the weaker check.
+        assert_eq!(listed_names(&resp), vec!["ping_tool".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn tools_list_shows_admin_tools_to_an_admin_caller() {
+        let server = make_server_with_admin_tool().with_auth_hook(Arc::new(AdminIfTokenHook));
+        let mut request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc": "2.0", "id": 41, "method": "tools/list"}"#)
+                .expect("parse"); // Safe: test assertion
+        request.auth_token = Some("admin".to_owned());
+
+        // Mirror what the HTTP transport does: resolve the context through the
+        // hook, then dispatch under it. handle_request is the anonymous path
+        // by design and would not consult the hook at all.
+        let ctx = server.authenticate(&request).await.expect("authenticate"); // Safe: test assertion
+        assert!(ctx.is_admin, "the hook must have granted admin");
+        let resp = server
+            .handle_request_with_context(request, &ctx)
+            .await
+            .expect("response"); // Safe: test assertion
+
+        let mut names = listed_names(&resp);
+        names.sort();
+        assert_eq!(names, vec!["admin_tool".to_owned(), "ping_tool".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn discovery_and_dispatch_agree_for_a_non_admin_caller() {
+        // execute() has always refused this call. The point of the pairing is
+        // that the tool is no longer advertised and then refused — the two
+        // surfaces now say the same thing.
+        let server = make_server_with_admin_tool();
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": { "name": "admin_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("admin"),
+            "the refusal must say why; got {:?}",
+            result["content"][0]["text"]
+        );
     }
 
     #[tokio::test]
