@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1] — 2026-09-21
+
+### Fixed
+
+- fix(mcp): a 2026-07-28 list result carries its required cache fields
+
+
+
 ## [1.1.0] — 2026-09-09
 
 
