@@ -13,7 +13,7 @@
 //! detection), so a single `/mcp` endpoint can serve both eras concurrently.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{from_value, Value};
+use serde_json::{from_value, Map, Value};
 
 use crate::mcp::schema::{ServerCapabilities, ServerInfo};
 
@@ -32,6 +32,54 @@ pub mod meta_keys {
     pub const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
     /// Minimum log level the server should emit for this request. Optional.
     pub const LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
+}
+
+/// Methods whose result extends the revision's `CacheableResult`, on which
+/// `ttlMs` and `cacheScope` are REQUIRED, not optional.
+///
+/// `server/discover` is cacheable too but builds its own values in
+/// [`DiscoverResult::new`], so it is not listed here.
+///
+/// A conforming client validates the result against the schema and discards one
+/// that fails. Claude Code 2.1.278 does exactly that: it retried a `tools/list`
+/// answer carrying `resultType` alone four times, then reported the server
+/// `connected` with zero tools — so the model had nothing to call and said so
+/// to the athlete. Nothing errored on either side.
+pub(crate) const CACHEABLE_RESULT_METHODS: [&str; 5] = [
+    "tools/list",
+    "resources/list",
+    "resources/templates/list",
+    "prompts/list",
+    "resources/read",
+];
+
+/// `ttlMs` a cacheable result carries when its producer states none: the
+/// response is immediately stale and the client re-fetches when it needs it.
+pub(crate) const UNCACHED_TTL_MS: u64 = 0;
+
+/// `cacheScope` a cacheable result carries when its producer states none.
+///
+/// What a caller may list depends on who is asking — the registry withholds
+/// `ADMIN_ONLY` tools from a non-admin, and a host dispatcher scopes by tenant
+/// — so a shared intermediary must never serve one caller's answer to another.
+/// `"private"` is the only value that is safe without knowing the producer.
+pub(crate) const UNSHARED_CACHE_SCOPE: &str = "private";
+
+/// Give a cacheable method's result the cache fields the revision requires.
+///
+/// Values the producer already set are kept, so a host handler serving a
+/// genuinely static `resources/list` can advertise a real TTL and `"public"`.
+/// The defaults promise nothing: immediately stale, never shared.
+pub(crate) fn frame_cacheable_result(method: &str, result: &mut Map<String, Value>) {
+    if !CACHEABLE_RESULT_METHODS.contains(&method) {
+        return;
+    }
+    result
+        .entry("ttlMs")
+        .or_insert_with(|| Value::from(UNCACHED_TTL_MS));
+    result
+        .entry("cacheScope")
+        .or_insert_with(|| Value::String(UNSHARED_CACHE_SCOPE.to_owned()));
 }
 
 /// Client identity (`Implementation`) carried in a modern request's `_meta`.

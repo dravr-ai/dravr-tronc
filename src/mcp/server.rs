@@ -18,7 +18,8 @@ use crate::error::{
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::modern::{
-    DiscoverResult, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_2026_07_28,
+    frame_cacheable_result, DiscoverResult, ModernMeta, ModernRequestMeta,
+    PROTOCOL_VERSION_2026_07_28,
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{
@@ -501,7 +502,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             }
         };
 
-        Self::frame_modern_result(response)
+        Self::frame_modern_result(&request.method, response)
     }
 
     /// Whether the server advertises and accepts the given protocol revision.
@@ -594,12 +595,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     }
 
     /// Frame a modern response's successful result with a `resultType` (defaults
-    /// to `"complete"`), as required by revision 2026-07-28. Error responses and
-    /// non-object results pass through unchanged.
-    fn frame_modern_result(mut response: JsonRpcResponse) -> JsonRpcResponse {
+    /// to `"complete"`), as required by revision 2026-07-28, and — when `method`
+    /// is one whose result the revision makes cacheable — with the `ttlMs` and
+    /// `cacheScope` it requires there. Error responses and non-object results
+    /// pass through unchanged.
+    fn frame_modern_result(method: &str, mut response: JsonRpcResponse) -> JsonRpcResponse {
         if let Some(obj) = response.result.as_mut().and_then(Value::as_object_mut) {
             obj.entry("resultType")
                 .or_insert_with(|| Value::String("complete".to_owned()));
+            frame_cacheable_result(method, obj);
         }
         response
     }
@@ -1140,6 +1144,46 @@ mod tests {
         let result = resp.result.expect("result"); // Safe: test assertion
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["tools"][0]["name"], "ping_tool");
+        // `ListToolsResult extends CacheableResult`: both fields are required,
+        // and a client that validates the schema drops a list without them.
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    /// A modern `_meta` block, spliced into a request's `params`.
+    const MODERN_META: &str = r#""_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    }"#;
+
+    #[tokio::test]
+    async fn legacy_tools_list_carries_no_cache_fields() {
+        // The cache contract belongs to 2026-07-28. A 2025-11-25 result gains
+        // nothing, so a legacy client sees the shape it always has.
+        let server = make_server();
+        let raw = r#"{"jsonrpc": "2.0", "id": 24, "method": "tools/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["tools"][0]["name"], "ping_tool");
+        assert!(result.get("ttlMs").is_none());
+        assert!(result.get("cacheScope").is_none());
+        assert!(result.get("resultType").is_none());
+    }
+
+    #[tokio::test]
+    async fn modern_tools_call_is_not_cacheable() {
+        // `CallToolResult` does not extend `CacheableResult`; framing it would
+        // invite a client to replay a tool's answer instead of calling it.
+        let server = make_server();
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 25, "method": "tools/call",
+                "params": {{ "name": "ping_tool", "arguments": {{}}, {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["resultType"], "complete");
+        assert!(result.get("ttlMs").is_none());
+        assert!(result.get("cacheScope").is_none());
     }
 
     #[tokio::test]
@@ -1312,6 +1356,57 @@ mod tests {
         let result = resp.result.expect("result"); // Safe: test assertion
         assert!(result["resources"].is_array());
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn modern_method_handler_list_gains_cache_defaults() {
+        // A host handler that knows nothing of the revision still answers a
+        // conforming `ListResourcesResult`: the framing supplies what it omits.
+        let server = make_server().with_method_handler(Arc::new(ResourcesMethodHandler));
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 35, "method": "resources/list",
+                "params": {{ {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert!(result["resources"].is_array());
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    /// Serves a static `prompts/list` and states its own cache policy.
+    struct StaticPromptsHandler;
+
+    #[async_trait::async_trait]
+    impl MethodHandler<TestState> for StaticPromptsHandler {
+        async fn handle(
+            &self,
+            method: &str,
+            id: Option<Value>,
+            _params: Option<Value>,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+        ) -> Option<JsonRpcResponse> {
+            (method == "prompts/list").then(|| {
+                JsonRpcResponse::success(
+                    id,
+                    json!({ "prompts": [], "ttlMs": 60_000, "cacheScope": "public" }),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_cache_policy_stated_by_the_producer_is_kept() {
+        let server = make_server().with_method_handler(Arc::new(StaticPromptsHandler));
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 36, "method": "prompts/list",
+                "params": {{ {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["ttlMs"], 60_000);
+        assert_eq!(result["cacheScope"], "public");
     }
 
     #[tokio::test]
