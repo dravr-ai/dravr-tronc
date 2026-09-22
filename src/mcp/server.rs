@@ -40,6 +40,30 @@ fn default_supported_versions() -> Vec<String> {
     ]
 }
 
+/// Source of the natural-language instructions a server advertises in
+/// `initialize` and `server/discover`.
+///
+/// Resolved per handshake rather than captured when the server is built, so a
+/// host whose instruction text lives in a hot-reloading catalogue serves the
+/// current revision to every client that connects, instead of the revision
+/// that happened to be loaded at process start. A host with fixed text passes
+/// it to [`McpServer::with_instructions`] and never implements this.
+///
+/// `instructions` is per-session either way: MCP hands it to a client once,
+/// during the handshake, so a resolved edit reaches an already-connected
+/// client on its next `initialize`, not mid-session.
+pub trait InstructionsSource: Send + Sync {
+    /// The instructions to advertise right now, or `None` to advertise none.
+    fn instructions(&self) -> Option<String>;
+}
+
+/// Fixed instructions, resolved by cloning the same text into every handshake.
+impl InstructionsSource for String {
+    fn instructions(&self) -> Option<String> {
+        Some(self.clone())
+    }
+}
+
 /// MCP server that dispatches JSON-RPC requests to the appropriate handler
 ///
 /// Generic over `S` — the project-specific server state type, shared as
@@ -54,7 +78,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     state: Arc<S>,
     tools: ToolRegistry<S>,
     capabilities: ServerCapabilities,
-    instructions: Option<String>,
+    instructions: Option<Arc<dyn InstructionsSource>>,
     supported_versions: Vec<String>,
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
@@ -98,10 +122,26 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
-    /// Set the natural-language instructions advertised to clients.
+    /// Set fixed natural-language instructions advertised to clients.
+    ///
+    /// The text is resolved through [`InstructionsSource`] like any other, so
+    /// a host that later needs live text moves to
+    /// [`Self::with_instructions_source`] without the response path changing.
     #[must_use]
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.instructions = Some(instructions.into());
+        self.instructions = Some(Arc::new(instructions.into()));
+        self
+    }
+
+    /// Set the source resolved for each handshake to obtain the advertised
+    /// instructions.
+    ///
+    /// For a host whose instruction text can change while the process runs —
+    /// one serving it from a catalogue that hot-reloads. [`Self::with_instructions`]
+    /// is the fixed-text case.
+    #[must_use]
+    pub fn with_instructions_source(mut self, source: Arc<dyn InstructionsSource>) -> Self {
+        self.instructions = Some(source);
         self
     }
 
@@ -531,6 +571,17 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         &self.supported_versions
     }
 
+    /// The instructions to advertise in this handshake, resolved now.
+    ///
+    /// Called once per `initialize` and per `server/discover` rather than read
+    /// from a field captured at build time, which is what lets a live
+    /// [`InstructionsSource`] reach clients without a restart.
+    fn advertised_instructions(&self) -> Option<String> {
+        self.instructions
+            .as_ref()
+            .and_then(|source| source.instructions())
+    }
+
     /// Handle `initialize` — negotiate the protocol version and advertise the
     /// server's identity, capabilities, and instructions.
     ///
@@ -560,7 +611,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             negotiated_version,
             ServerInfo::new(self.name.clone(), self.version.clone()),
             self.capabilities.clone(),
-            self.instructions.clone(),
+            self.advertised_instructions(),
         );
 
         Self::success_or_error(id, &result)
@@ -574,7 +625,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             self.supported_versions.clone(),
             self.advertised_capabilities(),
             ServerInfo::new(self.name.clone(), self.version.clone()),
-            self.instructions.clone(),
+            self.advertised_instructions(),
         );
         Self::success_or_error(id, &discover)
     }
@@ -760,6 +811,7 @@ mod tests {
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities};
     use serde_json::json;
+    use std::sync::{PoisonError, RwLock};
 
     struct TestState;
 
@@ -878,6 +930,86 @@ mod tests {
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], "test-server");
         assert_eq!(result["serverInfo"]["version"], "0.1.0");
+    }
+
+    /// An [`InstructionsSource`] whose text can change while the server runs,
+    /// standing in for a host catalogue that hot-reloads.
+    struct MutableInstructions(RwLock<String>);
+
+    impl InstructionsSource for MutableInstructions {
+        fn instructions(&self) -> Option<String> {
+            Some(
+                self.0
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            )
+        }
+    }
+
+    const INIT_REQUEST: &str = r#"{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client" }
+        }
+    }"#;
+
+    async fn advertised(server: &McpServer<TestState>, raw: &str) -> Value {
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        resp.result.expect("result")["instructions"].clone() // Safe: test assertion
+    }
+
+    #[tokio::test]
+    async fn fixed_instructions_are_advertised() {
+        let server = make_server().with_instructions("read the docs first");
+        assert_eq!(
+            advertised(&server, INIT_REQUEST).await,
+            "read the docs first"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_instructions_advertises_none() {
+        let server = make_server();
+        assert_eq!(advertised(&server, INIT_REQUEST).await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_source_edit_reaches_the_next_handshake() {
+        let source = Arc::new(MutableInstructions(RwLock::new("before".to_owned())));
+        let server = make_server().with_instructions_source(source.clone());
+
+        assert_eq!(advertised(&server, INIT_REQUEST).await, "before");
+
+        // What a catalogue sync does to the host's text mid-process.
+        *source.0.write().unwrap_or_else(PoisonError::into_inner) = "after".to_owned();
+
+        assert_eq!(
+            advertised(&server, INIT_REQUEST).await,
+            "after",
+            "instructions must be resolved per handshake, not captured at build time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_edit_reaches_the_next_server_discover() {
+        let source = Arc::new(MutableInstructions(RwLock::new("before".to_owned())));
+        let server = make_server().with_instructions_source(source.clone());
+        let raw = r#"{"jsonrpc": "2.0", "id": 1, "method": "server/discover"}"#;
+
+        assert_eq!(advertised(&server, raw).await, "before");
+
+        *source.0.write().unwrap_or_else(PoisonError::into_inner) = "after".to_owned();
+
+        assert_eq!(
+            advertised(&server, raw).await,
+            "after",
+            "server/discover resolves the same source as initialize"
+        );
     }
 
     #[tokio::test]
