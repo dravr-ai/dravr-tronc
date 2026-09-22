@@ -26,6 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo check --all-targets --features notifications
+      # The emitter profile. Every other job passes --features notifications,
+      # so without this nothing catches an item being moved back behind that
+      # feature. NOTIFY_TARGET is the case that matters: a crate that only
+      # emits notify events must reach it without pulling the sender's
+      # reqwest/ring/hex, and when it could not, dravr-stripe copied the
+      # constant instead of importing it.
+      - run: cargo check --all-targets --no-default-features
 
   clippy:
     name: Clippy

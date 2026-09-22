@@ -57,7 +57,11 @@ mod rule;
 mod state;
 mod visit;
 
-pub use layer::{NotifyLayer, NotifyLayerBuilder, NOTIFY_TARGET};
+pub use layer::{NotifyLayer, NotifyLayerBuilder};
+// Re-exported so a NotifyLayer user finds the target beside the layer it
+// filters with. The definition is ungated in `crate::notify_target`, because
+// an emitter must reach it without the `notifications` feature.
+pub use crate::notify_target::NOTIFY_TARGET;
 pub use provider::{
     AnalyticsCapture, AnalyticsProvider, NotifyEnricher, RoutingProvider, StaticRoutingProvider,
 };

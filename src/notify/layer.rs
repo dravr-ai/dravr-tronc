@@ -26,10 +26,7 @@ use super::state::{
 };
 use super::visit::NotifyVisitor;
 use crate::notifications::{PostHogClient, SlackClient};
-
-/// Tracing target the layer filters on. Events whose target differs are
-/// ignored — they're regular application logs, not notify-channel pings.
-pub const NOTIFY_TARGET: &str = "notify";
+use crate::notify_target::NOTIFY_TARGET;
 
 /// Default cadence at which the batch flusher wakes to drain ripe buffers.
 /// Individual rules can still configure longer intervals; this just bounds
