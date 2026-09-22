@@ -38,10 +38,15 @@ on:
         type: string
         default: "ci.yml"
       gate_timeout_minutes:
-        description: "How long to wait for those workflows to reach a terminal status"
+        description: "How long the gate workflows may RUN, counted from the moment every one of them has started"
         required: false
         type: number
         default: 45
+      gate_queue_minutes:
+        description: "How long the gate workflows may wait for a runner before starting — queue time is not run time, and on a busy fleet it is most of the wait"
+        required: false
+        type: number
+        default: 180
       lockstep_crates:
         description: "Space-separated dependencies that pin tronc themselves and must move in the same commit, or the lockfile ends up with two tronc versions. A bare name is a crates.io crate, moved to its latest release; git:<name> is a git-tag dependency, moved to its repo's latest vN.N.N tag"
         required: false
@@ -526,7 +531,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [resolve, bump]
     if: ${{ !inputs.dry_run }}
-    timeout-minutes: 60
+    # A backstop, not the gate: GitHub expressions cannot add, so this cannot be
+    # derived from the two budgets. It sits above their defaults (180 + 45); the
+    # step below enforces each budget itself and names which one ran out.
+    timeout-minutes: 300
     steps:
       - name: Poll until every gate reaches a terminal status
         env:
@@ -535,14 +543,24 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CI_WORKFLOWS: ${{ inputs.ci_workflows }}
           GATE_TIMEOUT: ${{ inputs.gate_timeout_minutes }}
+          GATE_QUEUE: ${{ inputs.gate_queue_minutes }}
         run: |
           set -uo pipefail
-          DEADLINE=$(( $(date +%s) + GATE_TIMEOUT * 60 ))
+          # Two budgets, because waiting for a runner is not the tree failing.
+          # With one clock counting from here, a busy fleet spent the whole
+          # budget in the queue: on 2026-09-22 the platform's and embacle's
+          # tronc 1.3.0 bumps timed out with ci-backend still `queued`, twice
+          # that day, and filed stalls about trees nobody had built.
+          #   QUEUE_DEADLINE — from now; spent only while some gate has not started
+          #   RUN_DEADLINE   — starts the first time every gate is running, and
+          #                    is GATE_TIMEOUT from then
+          QUEUE_DEADLINE=$(( $(date +%s) + GATE_QUEUE * 60 ))
+          RUN_DEADLINE=""
           # The branch is created fresh for this version and nothing else pushes to it,
           # so the newest run per workflow on it is unambiguously ours. Matching by
           # commit was rejected: `gh run list --commit` silently returns zero rows.
           while :; do
-            PENDING=""; FAILED=""
+            PENDING=""; FAILED=""; UNSTARTED=""
             for wf in ${CI_WORKFLOWS}; do
               LINE=$(gh run list --workflow "$wf" --branch "${BRANCH}" --limit 1 \
                        --json status,conclusion \
@@ -550,6 +568,11 @@ jobs:
               STATUS="${LINE%% *}"; CONCL="${LINE##* }"
               if [ -z "${LINE}" ] || [ "${STATUS}" != "completed" ]; then
                 PENDING="${PENDING} ${wf}(${STATUS:-not-started})"
+                # No run yet, or one GitHub has not handed a runner: it is
+                # waiting, not running, and must not spend the run budget.
+                case "${STATUS:-not-started}" in
+                  not-started|queued|waiting|requested|pending) UNSTARTED="${UNSTARTED} ${wf}" ;;
+                esac
               elif [ "${CONCL}" != "success" ]; then
                 # cancelled and skipped are not green. A cancelled run validated
                 # nothing — and on a satellite it is usually a job timeout, which is a
@@ -565,9 +588,21 @@ jobs:
               echo "all gates green on ${BRANCH}"
               break
             fi
-            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-              echo "::error::timed out after ${GATE_TIMEOUT}m waiting on:${PENDING}"
-              exit 1
+            NOW=$(date +%s)
+            if [ -n "${UNSTARTED}" ]; then
+              if [ "${NOW}" -ge "${QUEUE_DEADLINE}" ]; then
+                echo "::error::no runner picked up${UNSTARTED} within ${GATE_QUEUE}m — the fleet is saturated; the tree was never built, so this says nothing about it"
+                exit 1
+              fi
+            else
+              if [ -z "${RUN_DEADLINE}" ]; then
+                RUN_DEADLINE=$(( NOW + GATE_TIMEOUT * 60 ))
+                echo "every gate is running — ${GATE_TIMEOUT}m run budget starts now"
+              fi
+              if [ "${NOW}" -ge "${RUN_DEADLINE}" ]; then
+                echo "::error::timed out after ${GATE_TIMEOUT}m of running on:${PENDING}"
+                exit 1
+              fi
             fi
             echo "waiting on:${PENDING}"
             sleep 60
@@ -592,12 +627,51 @@ jobs:
           BRANCH: ${{ needs.bump.outputs.branch }}
           VERSION: ${{ needs.resolve.outputs.version }}
           PINNED: ${{ needs.resolve.outputs.pinned }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # In a called workflow the github context is the CALLER's, so this is
+          # the consumer's own tronc-bump.yml — the file a retry re-dispatches.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          MAX_RETRIES_PER_DAY: "4"
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin "${BRANCH}"
-          git merge --squash "origin/${BRANCH}"
+
+          # The branch was cut from main when this run began, and the gate took
+          # as long as it took. If main moved meanwhile in a way that touches the
+          # same lines, the squash conflicts — and the usual culprit is this
+          # repo's own release, which rewrites the path-dependency line directly
+          # above the tronc pin. On 2026-09-22 enforme and equilibre each cut two
+          # releases inside the tronc 1.3.0 window and both bumps died here, CI
+          # green, with nothing wrong with the bump.
+          #
+          # A conflict is not a verdict on the bump, so it is not a stall. The
+          # bump is mechanical: re-dispatch this repo's caller, which cuts a
+          # fresh branch from the main that exists now and gates it again, so
+          # the tree that merges is one CI actually built. Bounded, so a main
+          # that moves faster than CI finishes files a stall instead of looping.
+          if ! git merge --squash "origin/${BRANCH}"; then
+            git merge --abort 2>/dev/null || git reset --hard -q HEAD
+            CALLER_FILE="${CALLER_WORKFLOW_REF%%@*}"; CALLER_FILE="${CALLER_FILE##*/}"
+            SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+            RECENT=$(gh run list --workflow "${CALLER_FILE}" --limit 50 --json createdAt \
+                       -q "[.[] | select(.createdAt >= \"${SINCE}\")] | length")
+            if [ "${RECENT}" -gt "${MAX_RETRIES_PER_DAY}" ]; then
+              echo "::error::main moved under the bump again — ${RECENT} runs of ${CALLER_FILE} in 24h, over the retry cap of ${MAX_RETRIES_PER_DAY}. Filing a stall rather than looping."
+              exit 1
+            fi
+            gh workflow run "${CALLER_FILE}" --ref main -f version="${VERSION}"
+            echo "::notice::main moved under ${BRANCH} and the squash conflicted — re-dispatched ${CALLER_FILE} for ${VERSION} against current main"
+            {
+              echo "### Re-dispatched, not stalled"
+              echo ""
+              echo "main moved while ${BRANCH} was being gated, and the squash conflicted."
+              echo "A fresh run of ${CALLER_FILE} for ${VERSION} was dispatched against current main."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           git commit -m "chore(deps): bump dravr-tronc ${PINNED} -> ${VERSION}"
           git push origin main
           # Squash gives the merge a new SHA, so the branch is dead the moment it

@@ -86,6 +86,7 @@ jobs:
       # Runs here on the runner's own sed, sort and coreutils, the ones the
       # real step uses; nothing about the step can be reached by cargo test.
       - run: bash scripts/consumer-bump-lockstep.test.sh
+      - run: bash scripts/consumer-bump-gate.test.sh
 
   validate:
     name: Architectural Validation
