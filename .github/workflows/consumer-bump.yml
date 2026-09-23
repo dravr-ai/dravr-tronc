@@ -181,6 +181,7 @@ jobs:
     if: needs.resolve.outputs.needed == 'true'
     outputs:
       branch: ${{ steps.push.outputs.branch }}
+      sha: ${{ steps.push.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -514,6 +515,7 @@ jobs:
           git commit -m "chore(deps): bump dravr-tronc to ${VERSION}" ${LOCKSTEP_NOTE:+-m "${LOCKSTEP_NOTE}"}
           git push --force-with-lease origin "${BRANCH}"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
           # GitHub suppresses workflow runs on pushes made with GITHUB_TOKEN, so this
           # branch triggers nothing on its own and the gate would wait forever on runs
@@ -540,6 +542,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ needs.bump.outputs.branch }}
+          SHA: ${{ needs.bump.outputs.sha }}
           GH_REPO: ${{ github.repository }}
           CI_WORKFLOWS: ${{ inputs.ci_workflows }}
           GATE_TIMEOUT: ${{ inputs.gate_timeout_minutes }}
@@ -556,15 +559,18 @@ jobs:
           #                    is GATE_TIMEOUT from then
           QUEUE_DEADLINE=$(( $(date +%s) + GATE_QUEUE * 60 ))
           RUN_DEADLINE=""
-          # The branch is created fresh for this version and nothing else pushes to it,
-          # so the newest run per workflow on it is unambiguously ours. Matching by
-          # commit was rejected: `gh run list --commit` silently returns zero rows.
+          # Runs are matched by the commit this job pushed, never by branch. The
+          # branch name is fix/tronc-<version>, so every attempt at one version
+          # reuses it, and "the newest run on the branch" is a previous attempt's run
+          # until this commit's run registers — green, on a different tree, if the
+          # previous attempt's CI passed (equilibre's did on 2026-09-22). `gh run list
+          # --commit` silently returns zero rows, which is why this once matched by
+          # branch; the REST filter `head_sha` on the workflow's runs does work.
           while :; do
             PENDING=""; FAILED=""; UNSTARTED=""
             for wf in ${CI_WORKFLOWS}; do
-              LINE=$(gh run list --workflow "$wf" --branch "${BRANCH}" --limit 1 \
-                       --json status,conclusion \
-                       -q '.[0] | "\(.status) \(.conclusion // "-")"' 2>/dev/null || true)
+              LINE=$(gh api "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${SHA}&per_page=1" \
+                       -q '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "-")"' 2>/dev/null || true)
               STATUS="${LINE%% *}"; CONCL="${LINE##* }"
               if [ -z "${LINE}" ] || [ "${STATUS}" != "completed" ]; then
                 PENDING="${PENDING} ${wf}(${STATUS:-not-started})"

@@ -45,9 +45,10 @@ MERGE="${WORK}/merge.sh"; lift "Squash merge and delete the branch" "${MERGE}" "
 
 # ---------------------------------------------------------------------------
 # Stand-ins. CLOCK holds fake epoch seconds; `sleep` advances it, `date +%s`
-# reads it. TIMELINE rows are "<minute> <workflow> <status> <conclusion>"; `gh
-# run list --workflow W` answers W's latest row at or before the current minute,
-# or nothing (not started) when there is none.
+# reads it. TIMELINE rows are "<minute> <workflow> <status> <conclusion> [sha]";
+# the gate asks for W's runs on one commit (`gh api .../workflows/W/runs?head_sha=S`)
+# and gets the latest row for W on S at or before the current minute, or nothing
+# (not started) when there is none. A row with no sha is on the commit under test.
 # ---------------------------------------------------------------------------
 BIN="${WORK}/bin"; mkdir -p "${BIN}"
 cat > "${BIN}/date" <<'SH'
@@ -65,7 +66,17 @@ SH
 cat > "${BIN}/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "${CALLS}"
-if [ "$1 $2" = "run list" ] && [[ " $* " == *" --branch "* ]]; then
+if [ "$1" = "api" ] && [[ "$2" == *"/actions/workflows/"*"/runs?head_sha="* ]]; then
+  wf="${2#*/actions/workflows/}"; wf="${wf%%/runs*}"
+  sha="${2#*head_sha=}"; sha="${sha%%&*}"
+  now_min=$(( ( $(cat "${CLOCK}") - START ) / 60 ))
+  awk -v wf="${wf}" -v now="${now_min}" -v sha="${sha}" -v head="${HEAD_SHA}" '
+    { row_sha = (NF >= 5) ? $5 : head }
+    $2 == wf && $1 <= now && row_sha == sha { line = $3 " " $4 }
+    END { if (line) print line }' "${TIMELINE}"
+elif [ "$1 $2" = "run list" ] && [[ " $* " == *" --branch "* ]]; then
+  # GitHub's branch listing: the newest run on the branch, whatever commit it was
+  # on — which is exactly what a gate matching by branch would read.
   wf=""; prev=""
   for a in "$@"; do [ "${prev}" = "--workflow" ] && wf="$a"; prev="$a"; done
   now_min=$(( ( $(cat "${CLOCK}") - START ) / 60 ))
@@ -87,6 +98,7 @@ SH
 chmod +x "${BIN}"/*
 
 START=1790000000
+HEAD_SHA="c0ffee0000000000000000000000000000000000"
 run_gate() {  # run_gate <queue min> <run min> <workflows> <timeline rows...>
   local queue="$1" budget="$2" wfs="$3"; shift 3
   TIMELINE="${WORK}/timeline"; printf '%s\n' "$@" > "${TIMELINE}"
@@ -94,7 +106,8 @@ run_gate() {  # run_gate <queue min> <run min> <workflows> <timeline rows...>
   CALLS="${WORK}/calls"; : > "${CALLS}"
   set +e
   OUT=$(PATH="${BIN}:${PATH}" CLOCK="${CLOCK}" START="${START}" TIMELINE="${TIMELINE}" CALLS="${CALLS}" \
-        BRANCH="fix/tronc-9.9.9" CI_WORKFLOWS="${wfs}" GATE_TIMEOUT="${budget}" GATE_QUEUE="${queue}" \
+        BRANCH="fix/tronc-9.9.9" SHA="${HEAD_SHA}" HEAD_SHA="${HEAD_SHA}" GH_REPO="dravr-ai/dravr-x" \
+        CI_WORKFLOWS="${wfs}" GATE_TIMEOUT="${budget}" GATE_QUEUE="${queue}" \
         bash "${GATE}" 2>&1)
   RC=$?
   set -e
@@ -129,6 +142,12 @@ grep -q "run budget starts now" <<<"${OUT}" && pass "  ...and says when it start
 
 run_gate 180 45 "ci.yml"
 check "a gate that never produces a run is waiting, not running" 1 "no runner picked up"
+
+run_gate 180 45 "ci.yml" "0 ci.yml completed success deadbeef00000000000000000000000000000000"
+check "a green run from a previous attempt on another commit does not satisfy the gate" 1 "no runner picked up"
+
+run_gate 180 45 "ci.yml" "0 ci.yml completed success deadbeef00000000000000000000000000000000" "5 ci.yml in_progress -" "20 ci.yml completed failure"
+check "  ...and this commit's own red is what decides, not the stale green" 1 "CI is not green"
 
 # ---------------------------------------------------------------------------
 echo "merge retry"
