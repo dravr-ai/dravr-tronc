@@ -537,8 +537,11 @@ jobs:
     # derived from the two budgets. It sits above their defaults (180 + 45); the
     # step below enforces each budget itself and names which one ran out.
     timeout-minutes: 300
+    outputs:
+      verdict: ${{ steps.poll.outputs.verdict }}
     steps:
       - name: Poll until every gate reaches a terminal status
+        id: poll
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ needs.bump.outputs.branch }}
@@ -567,11 +570,11 @@ jobs:
           # --commit` silently returns zero rows, which is why this once matched by
           # branch; the REST filter `head_sha` on the workflow's runs does work.
           while :; do
-            PENDING=""; FAILED=""; UNSTARTED=""
+            PENDING=""; FAILED=""; UNSTARTED=""; NEVER_RAN=""
             for wf in ${CI_WORKFLOWS}; do
               LINE=$(gh api "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${SHA}&per_page=1" \
-                       -q '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "-")"' 2>/dev/null || true)
-              STATUS="${LINE%% *}"; CONCL="${LINE##* }"
+                       -q '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "-") \(.id)"' 2>/dev/null || true)
+              read -r STATUS CONCL RUN_ID <<< "${LINE}"
               if [ -z "${LINE}" ] || [ "${STATUS}" != "completed" ]; then
                 PENDING="${PENDING} ${wf}(${STATUS:-not-started})"
                 # No run yet, or one GitHub has not handed a runner: it is
@@ -584,10 +587,24 @@ jobs:
                 # nothing — and on a satellite it is usually a job timeout, which is a
                 # real signal about the tree, not noise to retry past.
                 FAILED="${FAILED} ${wf}(${CONCL})"
+                # A job GitHub refused to START — Actions minutes exhausted, a
+                # spending limit — also concludes `failure`, but with no step
+                # executed. It says nothing about the tree, and reporting it as a
+                # red build sent people looking for a break that was a bill
+                # (enforme and equilibre, 2026-09-22).
+                UNRUN=$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+                          -q '[.jobs[] | select(.conclusion == "failure" and ((.steps // []) | length) == 0) | .name] | join(", ")' 2>/dev/null || true)
+                [ -n "${UNRUN}" ] && NEVER_RAN="${NEVER_RAN} ${wf}[${UNRUN}]"
               fi
             done
             if [ -n "${FAILED}" ]; then
-              echo "::error::CI is not green on ${BRANCH}:${FAILED} — the branch is left in place for inspection"
+              if [ -n "${NEVER_RAN}" ]; then
+                echo "verdict=not-started" >> "${GITHUB_OUTPUT}"
+                echo "::error::GitHub did not start jobs on ${BRANCH}:${NEVER_RAN} — a billing or spending-limit refusal, not a red tree. Re-run once Actions can start jobs."
+              else
+                echo "verdict=red" >> "${GITHUB_OUTPUT}"
+                echo "::error::CI is not green on ${BRANCH}:${FAILED} — the branch is left in place for inspection"
+              fi
               exit 1
             fi
             if [ -z "${PENDING}" ]; then
@@ -703,6 +720,7 @@ jobs:
           BRANCH: ${{ needs.bump.outputs.branch }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_VERDICT: ${{ needs.gate.outputs.verdict }}
         run: |
           set -euo pipefail
           # The private register, because most of these repos are public.
@@ -746,6 +764,11 @@ jobs:
           EOF
           )
 
+          # A gate that GitHub never started is a bill, not a break: say so first,
+          # before the list of source causes a reader would otherwise start on.
+          if [ "${GATE_VERDICT:-}" = "not-started" ]; then
+            BODY="**GitHub did not start this repo's CI jobs** — Actions minutes or the spending limit, not the tree and not the bump. Nothing to fix here; re-run this workflow once Actions can start jobs."$'\n\n'"${BODY}"
+          fi
           EXISTING=$(gh issue list --repo "$TRACKER" --state open \
                      --search "${SHORT} tronc bump stalled in:title" \
                      --json number -q '.[0].number' 2>/dev/null || true)

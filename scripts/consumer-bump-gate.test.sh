@@ -72,8 +72,12 @@ if [ "$1" = "api" ] && [[ "$2" == *"/actions/workflows/"*"/runs?head_sha="* ]]; 
   now_min=$(( ( $(cat "${CLOCK}") - START ) / 60 ))
   awk -v wf="${wf}" -v now="${now_min}" -v sha="${sha}" -v head="${HEAD_SHA}" '
     { row_sha = (NF >= 5) ? $5 : head }
-    $2 == wf && $1 <= now && row_sha == sha { line = $3 " " $4 }
+    $2 == wf && $1 <= now && row_sha == sha { line = $3 " " $4 " 4242" }
     END { if (line) print line }' "${TIMELINE}"
+elif [ "$1" = "api" ] && [[ "$2" == *"/actions/runs/4242/jobs"* ]]; then
+  # The jobs of a finished run, filtered by the step to those that concluded
+  # failure with no step executed — GitHub's "not started" shape.
+  printf '%s\n' "${UNSTARTED_JOBS:-}"
 elif [ "$1 $2" = "run list" ] && [[ " $* " == *" --branch "* ]]; then
   # GitHub's branch listing: the newest run on the branch, whatever commit it was
   # on — which is exactly what a gate matching by branch would read.
@@ -105,7 +109,9 @@ run_gate() {  # run_gate <queue min> <run min> <workflows> <timeline rows...>
   CLOCK="${WORK}/clock"; echo "${START}" > "${CLOCK}"
   CALLS="${WORK}/calls"; : > "${CALLS}"
   set +e
+  GH_OUTPUT_FILE="${WORK}/gh_output"; : > "${GH_OUTPUT_FILE}"
   OUT=$(PATH="${BIN}:${PATH}" CLOCK="${CLOCK}" START="${START}" TIMELINE="${TIMELINE}" CALLS="${CALLS}" \
+        GITHUB_OUTPUT="${GH_OUTPUT_FILE}" UNSTARTED_JOBS="${UNSTARTED_JOBS:-}" \
         BRANCH="fix/tronc-9.9.9" SHA="${HEAD_SHA}" HEAD_SHA="${HEAD_SHA}" GH_REPO="dravr-ai/dravr-x" \
         CI_WORKFLOWS="${wfs}" GATE_TIMEOUT="${budget}" GATE_QUEUE="${queue}" \
         bash "${GATE}" 2>&1)
@@ -148,6 +154,16 @@ check "a green run from a previous attempt on another commit does not satisfy th
 
 run_gate 180 45 "ci.yml" "0 ci.yml completed success deadbeef00000000000000000000000000000000" "5 ci.yml in_progress -" "20 ci.yml completed failure"
 check "  ...and this commit's own red is what decides, not the stale green" 1 "CI is not green"
+
+UNSTARTED_JOBS="Architectural Validation"
+run_gate 180 45 "ci.yml" "0 ci.yml in_progress -" "10 ci.yml completed failure"
+check "a job GitHub never started is named as a billing refusal, not a red tree" 1 "did not start jobs"
+grep -q "verdict=not-started" "${GH_OUTPUT_FILE}" && pass "  ...and hands the stall report verdict=not-started" || fail "  verdict not recorded as not-started"
+UNSTARTED_JOBS=""
+
+run_gate 180 45 "ci.yml" "0 ci.yml in_progress -" "10 ci.yml completed failure"
+check "a job that ran and failed is still a red tree" 1 "CI is not green"
+grep -q "verdict=red" "${GH_OUTPUT_FILE}" && pass "  ...and hands the stall report verdict=red" || fail "  verdict not recorded as red"
 
 # ---------------------------------------------------------------------------
 echo "merge retry"
