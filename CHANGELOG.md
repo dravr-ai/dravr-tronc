@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.0] — 2026-09-23
+
+### Added
+
+- feat(mcp): Computation, a tool stated as one typed operation
+
+### Fixed
+
+- fix(consumer-bump): a job GitHub never started is a bill, not a red tree
+- fix(consumer-bump): the gate reads CI for the commit it pushed
+
+
+
 ## [1.3.0] — 2026-09-22
 
 
