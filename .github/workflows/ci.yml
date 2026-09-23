@@ -46,7 +46,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --quiet
-      - run: cargo clippy --all-targets --features notifications --quiet
+      # --all-features, not a hand-picked list: google-iam's tests sat behind a
+      # feature no job enabled, so the ID-token middleware two deployed services
+      # rely on compiled here but never ran.
+      - run: cargo clippy --all-targets --all-features --quiet
 
   fmt:
     name: Format
@@ -74,7 +77,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
-      - run: cargo test --features notifications
+      - run: cargo test --all-features
 
   lockstep:
     name: Consumer-bump lockstep (shell)

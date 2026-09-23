@@ -5,6 +5,8 @@
 // Copyright (c) 2026 dravr.ai
 
 pub mod auth;
+#[cfg(feature = "computation")]
+pub mod computation;
 pub mod host;
 pub mod modern;
 pub mod protocol;

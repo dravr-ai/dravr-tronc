@@ -107,6 +107,7 @@ let app = axum::Router::new()
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools |
+| `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: schema generated from its input type, result written at each number's own precision |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext` |

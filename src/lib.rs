@@ -45,6 +45,8 @@ pub mod server;
 
 // Convenience re-exports
 pub use mcp::auth::{AuthError, AuthHook};
+#[cfg(feature = "computation")]
+pub use mcp::computation::Computation;
 pub use mcp::server::{InstructionsSource, McpServer};
 pub use mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
 pub use mcp::{auth, modern, protocol, schema, transport};
