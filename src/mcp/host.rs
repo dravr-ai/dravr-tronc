@@ -35,12 +35,19 @@ use crate::mcp::tool::ToolContext;
 /// What a `tools/call` produced.
 ///
 /// The Tasks extension lets a server answer asynchronously with a durable
-/// handle *in lieu of* the standard result, so the dispatch path cannot be
-/// typed to [`ToolResponse`] alone.
+/// handle *in lieu of* the standard result, and MCP answers a call to a tool
+/// that does not exist with a protocol error rather than a result, so the
+/// dispatch path cannot be typed to [`ToolResponse`] alone.
 #[derive(Debug, Clone)]
 pub enum CallToolOutcome {
-    /// The tool ran to completion; return its result directly.
+    /// The tool ran to completion; return its result directly. A tool that
+    /// ran and failed, or refused the caller, is still a result here: an
+    /// error [`ToolResponse`] (`isError: true`) the model can read.
     Immediate(Box<ToolResponse>),
+    /// No tool of that name is callable here. The engine answers with the
+    /// JSON-RPC protocol error MCP specifies for an unknown tool (`-32602`,
+    /// 2025-06-18 server/tools §Error Handling), not with a tool result.
+    UnknownTool,
     /// The host accepted the work asynchronously and minted a task. The engine
     /// frames this as a `resultType: "task"` handle.
     ///
@@ -72,36 +79,24 @@ pub trait ToolDispatcher<S: Send + Sync + ?Sized>: Send + Sync {
     /// Return the tool definitions to advertise for this caller.
     async fn list_tools(&self, state: &Arc<S>, ctx: &ToolContext) -> Vec<Tool>;
 
-    /// Execute a tool call end-to-end and return its response. The host owns
-    /// everything inside: authorization beyond authentication, quota checks,
-    /// the actual execution, usage recording, and response augmentation. An
-    /// unknown tool or a refusal is reported as an error [`ToolResponse`]
-    /// (`is_error = true`), not a transport error.
+    /// Execute a tool call end-to-end. The host owns everything inside:
+    /// authorization beyond authentication, quota checks, the actual
+    /// execution, usage recording, and response augmentation.
+    ///
+    /// Answer [`CallToolOutcome::UnknownTool`] for a name this caller cannot
+    /// call, which the engine reports as a protocol error; a refusal or a
+    /// failure of a tool that does exist is an error [`ToolResponse`] in
+    /// [`CallToolOutcome::Immediate`]. A host implementing the Tasks
+    /// extension may instead mint a task with
+    /// [`TaskManager::create`](crate::mcp::tasks::TaskManager::create), spawn
+    /// the work, and answer [`CallToolOutcome::Task`].
     async fn call_tool(
         &self,
         name: &str,
         state: &Arc<S>,
         ctx: &ToolContext,
         arguments: Value,
-    ) -> ToolResponse;
-
-    /// Execute a tool call, optionally answering with a task handle.
-    ///
-    /// Defaults to [`Self::call_tool`] wrapped as
-    /// [`CallToolOutcome::Immediate`], so a dispatcher that does not implement
-    /// the Tasks extension keeps its existing behaviour untouched. Override
-    /// this to run long work asynchronously: mint a task with
-    /// [`TaskManager::create`](crate::mcp::tasks::TaskManager::create), spawn
-    /// the work, and return [`CallToolOutcome::Task`].
-    async fn call_tool_outcome(
-        &self,
-        name: &str,
-        state: &Arc<S>,
-        ctx: &ToolContext,
-        arguments: Value,
-    ) -> CallToolOutcome {
-        CallToolOutcome::Immediate(Box::new(self.call_tool(name, state, ctx, arguments).await))
-    }
+    ) -> CallToolOutcome;
 }
 
 /// Host-supplied handler for methods the engine doesn't natively serve.

@@ -19,10 +19,10 @@ use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRP
 
 /// `notifications/progress` method string.
 const METHOD_PROGRESS: &str = "notifications/progress";
-/// `notifications/cancelled` method string.
-const METHOD_CANCELLED: &str = "notifications/cancelled";
 /// `notifications/oauth_completed` method string.
 const METHOD_OAUTH_COMPLETED: &str = "notifications/oauth_completed";
+/// Key under [`ServerCapabilities::experimental`] carrying an [`OAuth2Capability`].
+const EXPERIMENTAL_OAUTH2: &str = "oauth2";
 
 /// MCP request wire frame (alias for the canonical JSON-RPC request).
 pub type McpRequest = JsonRpcRequest;
@@ -192,7 +192,12 @@ impl ToolResponse {
     }
 }
 
-/// Content item within an MCP message or tool result.
+/// A content block within a tool result or prompt message, in its spec shape.
+///
+/// The specification's `ContentBlock` also admits `audio`, `resource_link` and
+/// embedded `resource` blocks. No server on this engine produces any of them,
+/// so none is modelled: a variant nothing constructs is a wire shape nothing
+/// checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Content {
@@ -211,29 +216,6 @@ pub enum Content {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
-    /// Resource reference with URI.
-    #[serde(rename = "resource")]
-    Resource {
-        /// URI of the resource.
-        uri: String,
-        /// Optional text description of the resource.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        /// MIME type of the resource.
-        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
-    /// Progress update for a long-running operation.
-    #[serde(rename = "progress")]
-    Progress {
-        /// Token identifying the operation.
-        #[serde(rename = "progressToken")]
-        progress_token: String,
-        /// Current progress value.
-        progress: f64,
-        /// Optional total for computing a percentage.
-        total: Option<f64>,
-    },
 }
 
 impl Content {
@@ -242,20 +224,31 @@ impl Content {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
-            _ => None,
+            Self::Image { .. } => None,
         }
     }
 }
 
 /// MCP server capability declarations.
+///
+/// Exactly the keys the specification defines for a server (2025-06-18 schema
+/// `ServerCapabilities`: `experimental`, `logging`, `completions`, `prompts`,
+/// `resources`, `tools`) plus the revision `2026-07-28` `extensions` map. A
+/// client negotiates only what it finds under these names, so anything else a
+/// server wants to state goes under [`Self::experimental`] — which is where
+/// [`Self::with_oauth2`] puts the OAuth 2.0 endpoints.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
-    /// Experimental capabilities not in the MCP spec.
+    /// Non-standard capabilities, keyed by name. The one place the
+    /// specification lets a server advertise something it does not define.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
     /// Server logging capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Argument auto-completion: the server answers `completion/complete`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completions: Option<CompletionCapability>,
     /// Server prompts capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
@@ -265,18 +258,6 @@ pub struct ServerCapabilities {
     /// Server tools capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
-    /// Server authentication capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthCapability>,
-    /// Server OAuth 2.0 capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth2: Option<OAuth2Capability>,
-    /// Server completion (auto-complete) capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion: Option<CompletionCapability>,
-    /// Server sampling (LLM calls) capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sampling: Option<SamplingCapability>,
     /// Extension capabilities, keyed by reverse-DNS identifier (revision
     /// `2026-07-28`). An extension advertises support with an empty object,
     /// e.g. `{"io.modelcontextprotocol/tasks": {}}`.
@@ -297,6 +278,21 @@ impl ServerCapabilities {
             }),
             ..Self::default()
         }
+    }
+
+    /// Advertise the server's OAuth 2.0 endpoints, under
+    /// `experimental["oauth2"]`.
+    ///
+    /// MCP defines no capability for them — a client finds the authorization
+    /// server through RFC 9728 protected-resource metadata — so they are an
+    /// experimental capability, not a top-level key a conforming client would
+    /// read as a negotiated one.
+    #[must_use]
+    pub fn with_oauth2(mut self, oauth2: OAuth2Capability) -> Self {
+        self.experimental
+            .get_or_insert_with(HashMap::new)
+            .insert(EXPERIMENTAL_OAUTH2.to_owned(), oauth2.into_value());
+        self
     }
 }
 
@@ -331,15 +327,8 @@ pub struct ResourcesCapability {
     pub list_changed: Option<bool>,
 }
 
-/// Authentication capability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthCapability {
-    /// OAuth 2.0 authentication details.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth2: Option<OAuth2Capability>,
-}
-
-/// OAuth 2.0 capability.
+/// OAuth 2.0 endpoints a server advertises through
+/// [`ServerCapabilities::with_oauth2`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuth2Capability {
     /// OAuth 2.0 discovery URL.
@@ -356,7 +345,23 @@ pub struct OAuth2Capability {
     pub registration_endpoint: String,
 }
 
-/// Completion (auto-complete) capability.
+impl OAuth2Capability {
+    /// The capability as the JSON object its serde derive writes.
+    ///
+    /// Built by hand because every field is a string, so the conversion
+    /// cannot fail, and `serde_json::to_value` would still hand back a
+    /// `Result` to discard.
+    fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "discoveryUrl": self.discovery_url,
+            "authorizationEndpoint": self.authorization_endpoint,
+            "tokenEndpoint": self.token_endpoint,
+            "registrationEndpoint": self.registration_endpoint,
+        })
+    }
+}
+
+/// Completion (auto-complete) capability, advertised as `completions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionCapability {}
 
@@ -374,7 +379,9 @@ pub struct ClientCapabilities {
     pub roots: Option<RootsCapability>,
 }
 
-/// Sampling capability (declared by either client or server).
+/// Sampling capability: the client can answer `sampling/createMessage`.
+///
+/// A client capability only. A server does not declare it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingCapability {}
 
@@ -689,7 +696,9 @@ pub struct ProgressParams {
     pub progress_token: String,
     /// Current progress value.
     pub progress: f64,
-    /// Optional total for percentage calculation.
+    /// Total the progress counts toward, when known. Omitted when unknown:
+    /// the spec types it as an optional number, and `null` is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<f64>,
     /// Optional human-readable progress message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -712,21 +721,6 @@ impl ProgressNotification {
                 progress_token,
                 progress,
                 total,
-                message,
-            },
-        }
-    }
-
-    /// Create a cancellation notification.
-    #[must_use]
-    pub fn cancelled(progress_token: String, message: Option<String>) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION.to_owned(),
-            method: METHOD_CANCELLED.to_owned(),
-            params: ProgressParams {
-                progress_token,
-                progress: 0.0,
-                total: None,
                 message,
             },
         }
@@ -1018,6 +1012,83 @@ mod tests {
         assert!(json.get("protocol_version").is_none());
     }
 
+    fn oauth2() -> OAuth2Capability {
+        OAuth2Capability {
+            discovery_url: "https://auth.example/.well-known/oauth-authorization-server".to_owned(),
+            authorization_endpoint: "https://auth.example/authorize".to_owned(),
+            token_endpoint: "https://auth.example/token".to_owned(),
+            registration_endpoint: "https://auth.example/register".to_owned(),
+        }
+    }
+
+    /// A fully populated set writes only keys the specification defines for a
+    /// server, and completion support under its spec name, `completions`.
+    #[test]
+    fn server_capabilities_write_only_spec_keys() {
+        let caps = ServerCapabilities {
+            experimental: Some(HashMap::new()),
+            logging: Some(LoggingCapability {}),
+            completions: Some(CompletionCapability {}),
+            prompts: Some(PromptsCapability {
+                list_changed: Some(false),
+            }),
+            resources: Some(ResourcesCapability {
+                subscribe: Some(false),
+                list_changed: Some(false),
+            }),
+            tools: Some(ToolsCapability {
+                list_changed: Some(false),
+            }),
+            extensions: Some(HashMap::new()),
+        }
+        .with_oauth2(oauth2());
+        let json = serde_json::to_value(&caps).expect("serialize"); // Safe: test assertion
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object") // Safe: test assertion
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "completions",
+                "experimental",
+                "extensions",
+                "logging",
+                "prompts",
+                "resources",
+                "tools"
+            ]
+        );
+        assert_eq!(json["completions"], json!({}));
+    }
+
+    #[test]
+    fn a_client_reading_spec_completions_sees_them() {
+        let caps: ServerCapabilities =
+            serde_json::from_value(json!({ "completions": {}, "tools": {} })).expect("deserialize"); // Safe: test assertion
+        assert!(caps.completions.is_some());
+    }
+
+    #[test]
+    fn oauth2_endpoints_travel_under_experimental() {
+        let caps = ServerCapabilities::tools_only().with_oauth2(oauth2());
+        let json = serde_json::to_value(&caps).expect("serialize"); // Safe: test assertion
+        assert!(json.get("oauth2").is_none());
+        assert!(json.get("auth").is_none());
+        assert_eq!(
+            json["experimental"]["oauth2"]["tokenEndpoint"],
+            "https://auth.example/token"
+        );
+        // The hand-built object is exactly what the serde derive writes.
+        assert_eq!(
+            json["experimental"]["oauth2"],
+            serde_json::to_value(oauth2()).expect("serialize") // Safe: test assertion
+        );
+    }
+
     #[test]
     fn initialize_request_deserializes_camel_case() {
         let raw = r#"{
@@ -1029,6 +1100,57 @@ mod tests {
         assert_eq!(req.protocol_version, "2025-11-25");
         assert_eq!(req.client_info.name, "test-client");
         assert_eq!(req.client_info.version, "1.0");
+    }
+
+    /// Blocks that are not spec content, or not in the spec's shape, are
+    /// refused rather than read: `progress` is a notification, never a
+    /// content type, and an embedded resource nests under `resource`.
+    #[test]
+    fn non_spec_content_blocks_are_refused() {
+        let progress = json!({
+            "type": "progress", "progressToken": "t", "progress": 1.0, "total": null
+        });
+        assert!(serde_json::from_value::<Content>(progress).is_err());
+        let flattened_resource = json!({
+            "type": "resource", "uri": "file:///a.txt", "text": "a", "mimeType": "text/plain"
+        });
+        assert!(serde_json::from_value::<Content>(flattened_resource).is_err());
+    }
+
+    #[test]
+    fn progress_without_a_total_omits_it() {
+        let json = serde_json::to_value(ProgressNotification::new(
+            "tok-1".to_owned(),
+            0.5,
+            None,
+            None,
+        ))
+        .expect("serialize"); // Safe: test assertion
+        assert_eq!(json["method"], "notifications/progress");
+        assert_eq!(
+            json["params"],
+            json!({ "progressToken": "tok-1", "progress": 0.5 })
+        );
+    }
+
+    #[test]
+    fn progress_with_a_total_carries_it() {
+        let json = serde_json::to_value(ProgressNotification::new(
+            "tok-2".to_owned(),
+            3.0,
+            Some(10.0),
+            Some("reading activities".to_owned()),
+        ))
+        .expect("serialize"); // Safe: test assertion
+        assert_eq!(
+            json["params"],
+            json!({
+                "progressToken": "tok-2",
+                "progress": 3.0,
+                "total": 10.0,
+                "message": "reading activities"
+            })
+        );
     }
 
     #[test]

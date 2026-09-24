@@ -16,6 +16,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::error::{INVALID_REQUEST, PARSE_ERROR};
+
 /// JSON-RPC 2.0 version string.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -30,6 +32,13 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 ///
 /// Carries the protocol-agnostic envelope plus MCP/A2A transport extensions
 /// (`auth` bearer token, forwarded `headers`, free-form `metadata`).
+///
+/// The extensions are set by the transport from what it received out of band
+/// — the `Authorization` header, the `MCP-Protocol-Version` header — and are
+/// never read from the message body. A body is written by the client, so a
+/// body field an auth hook trusted would let any caller name its own
+/// credential; MCP requires the token to travel in the `Authorization` header
+/// (2025-06-18 authorization §Access Token Usage).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     /// JSON-RPC version (always `"2.0"`).
@@ -46,16 +55,23 @@ pub struct JsonRpcRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Value>,
 
-    /// Authorization header value (bearer token) — MCP/A2A transport extension.
-    #[serde(rename = "auth", skip_serializing_if = "Option::is_none", default)]
+    /// Authorization header value (bearer token) — MCP/A2A transport extension,
+    /// set by the transport and never deserialized from the body.
+    #[serde(
+        rename = "auth",
+        skip_serializing_if = "Option::is_none",
+        skip_deserializing
+    )]
     pub auth_token: Option<String>,
 
-    /// Forwarded HTTP headers for tenant context and other metadata — MCP extension.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// Forwarded HTTP headers for tenant context and other metadata — MCP
+    /// extension, set by the transport and never deserialized from the body.
+    #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
     pub headers: Option<HashMap<String, Value>>,
 
-    /// Protocol-specific metadata (additional extensions, not part of the spec).
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    /// Protocol-specific metadata (additional extensions, not part of the
+    /// spec), set by the transport and never deserialized from the body.
+    #[serde(skip_serializing_if = "HashMap::is_empty", skip_deserializing)]
     pub metadata: HashMap<String, String>,
 }
 
@@ -123,6 +139,66 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcRequest {
+    /// Read one JSON-RPC 2.0 request or notification from a message body.
+    ///
+    /// The body is parsed to a JSON value first, so the two failures JSON-RPC
+    /// 2.0 §5.1 keeps apart stay apart: text that is not JSON is a Parse error
+    /// (-32700), and JSON that is not a Request object is an Invalid Request
+    /// (-32600). The second covers an array (a batch, which MCP does not carry
+    /// since 2025-06-18), a scalar, a client's response (no `method`), and an
+    /// object missing or mistyping a member.
+    ///
+    /// A present `id` must be a string or an integer: MCP basic §Requests says
+    /// it "MUST be a string or integer" and "MUST NOT be null". Any other `id`
+    /// is refused before the object is read, because serde reads `"id": null`
+    /// as an absent id and would turn a malformed request into a notification
+    /// that is never answered. Only an absent `id` makes a notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error response to send back, with a null `id`: when the
+    /// message is not a well-formed Request its `id` cannot be trusted to
+    /// correlate with anything the client is waiting on (a client's response
+    /// carries an id from the server's own id space).
+    pub fn parse(raw: &str) -> Result<Self, Box<JsonRpcResponse>> {
+        let value: Value = serde_json::from_str(raw).map_err(|e| {
+            Box::new(JsonRpcResponse::error(
+                None,
+                PARSE_ERROR,
+                format!("Parse error: {e}"),
+            ))
+        })?;
+
+        let Value::Object(fields) = &value else {
+            let reason = if value.is_array() {
+                "Invalid Request: batch requests are not supported"
+            } else {
+                "Invalid Request: a request must be a JSON object"
+            };
+            return Err(Box::new(JsonRpcResponse::error(
+                None,
+                INVALID_REQUEST,
+                reason,
+            )));
+        };
+
+        if fields.get("id").is_some_and(|id| !is_request_id(id)) {
+            return Err(Box::new(JsonRpcResponse::error(
+                None,
+                INVALID_REQUEST,
+                "Invalid Request: id must be a string or an integer",
+            )));
+        }
+
+        serde_json::from_value(value).map_err(|e| {
+            Box::new(JsonRpcResponse::error(
+                None,
+                INVALID_REQUEST,
+                format!("Invalid Request: {e}"),
+            ))
+        })
+    }
+
     /// Create a new request with a default id of `1`.
     #[must_use]
     pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
@@ -176,6 +252,19 @@ impl JsonRpcRequest {
     #[must_use]
     pub fn get_metadata(&self, key: &str) -> Option<&String> {
         self.metadata.get(key)
+    }
+}
+
+/// Whether `id` is an identifier a request may carry: a string or an integer.
+///
+/// `serde_json` reads a number written with a fraction or an exponent (`1.5`,
+/// `1e3`) as a float, which is not an integer id, so those are refused along
+/// with `null`, booleans, arrays and objects.
+fn is_request_id(id: &Value) -> bool {
+    match id {
+        Value::String(_) => true,
+        Value::Number(number) => number.is_i64() || number.is_u64(),
+        _ => false,
     }
 }
 
@@ -264,7 +353,6 @@ impl JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::PARSE_ERROR;
 
     #[test]
     fn serialize_success_response() {
@@ -317,6 +405,103 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#;
         let req: JsonRpcRequest = serde_json::from_str(raw).expect("deserialize"); // Safe: test assertion
         assert!(req.id.is_none());
+    }
+
+    /// The error code `parse` answers `raw` with.
+    fn parse_error_code(raw: &str) -> i32 {
+        JsonRpcRequest::parse(raw)
+            .expect_err("the message must be refused") // Safe: test assertion
+            .error
+            .expect("an error response") // Safe: test assertion
+            .code
+    }
+
+    #[test]
+    fn parse_reads_text_that_is_not_json_as_a_parse_error() {
+        assert_eq!(parse_error_code("not json"), PARSE_ERROR);
+        assert_eq!(parse_error_code(r#"{"jsonrpc":"2.0","id":1,"#), PARSE_ERROR);
+    }
+
+    #[test]
+    fn parse_reads_json_that_is_not_a_request_as_an_invalid_request() {
+        for raw in [
+            // A batch: MCP carries none since 2025-06-18.
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            "[]",
+            // Scalars.
+            "42",
+            r#""ping""#,
+            "null",
+            // A client's response to a server request: no method.
+            r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-1,"message":"x"}}"#,
+            // Missing or mistyped members.
+            r#"{"id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":42}"#,
+        ] {
+            assert_eq!(parse_error_code(raw), INVALID_REQUEST, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_refuses_an_id_that_is_not_a_string_or_an_integer() {
+        for id in ["null", "1.5", "1e3", "true", r#"{"a":1}"#, "[1]"] {
+            let raw = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            let refused = JsonRpcRequest::parse(&raw).expect_err("id must be refused"); // Safe: test assertion
+            assert_eq!(
+                refused.error.as_ref().map(|e| e.code),
+                Some(INVALID_REQUEST),
+                "id {id}"
+            );
+            // The refusal carries no id, so it cannot be mistaken for an
+            // answer to a request the client does have outstanding.
+            assert_eq!(refused.id, None, "id {id}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_string_and_integer_ids() {
+        for (id, expected) in [
+            (r#""req-1""#, Value::from("req-1")),
+            ("0", Value::from(0)),
+            ("-3", Value::from(-3)),
+            ("18446744073709551615", Value::from(u64::MAX)),
+        ] {
+            let raw = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            let req = JsonRpcRequest::parse(&raw).expect("a valid id parses"); // Safe: test assertion
+            assert_eq!(req.id, Some(expected), "id {id}");
+            assert_eq!(req.method, "ping");
+        }
+    }
+
+    #[test]
+    fn parse_reads_an_absent_id_as_a_notification() {
+        let req =
+            JsonRpcRequest::parse(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .expect("a notification parses"); // Safe: test assertion
+        assert_eq!(req.id, None);
+        assert_eq!(req.method, "notifications/initialized");
+    }
+
+    /// A body cannot name its own credential, headers or metadata: those are
+    /// the transport's to set from what it received out of band.
+    #[test]
+    fn transport_extensions_are_never_read_from_the_body() {
+        let raw = r#"{
+            "jsonrpc":"2.0","id":1,"method":"tools/list",
+            "auth":"admin",
+            "headers":{"x-tenant-id":"someone-else"},
+            "metadata":{"mcp-protocol-version":"2025-11-25"}
+        }"#;
+        for req in [
+            serde_json::from_str::<JsonRpcRequest>(raw).expect("deserialize"), // Safe: test assertion
+            JsonRpcRequest::parse(raw).expect("parse"), // Safe: test assertion
+        ] {
+            assert_eq!(req.auth_token, None);
+            assert_eq!(req.headers, None);
+            assert!(req.metadata.is_empty(), "metadata was {:?}", req.metadata);
+            assert_eq!(req.method, "tools/list");
+        }
     }
 
     #[test]

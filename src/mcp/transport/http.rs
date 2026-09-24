@@ -18,10 +18,11 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use crate::error::{PARSE_ERROR, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
+use crate::error::{UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
+use crate::server::auth::{bearer_credential, is_loopback_host};
 
 /// The `MCP-Protocol-Version` HTTP header (revision 2026-07-28). The transport
 /// forwards its value into the request metadata for the dispatch layer.
@@ -68,38 +69,40 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 
 /// Handle an incoming MCP POST request
 ///
-/// Enforces the `Origin` allowlist (403), authenticates via the server's hook
-/// (401 + `WWW-Authenticate` on rejection, per RFC 9728), then dispatches under
-/// the resolved per-call context and renders the response as JSON or SSE.
+/// Enforces the `Origin` allowlist (403), refuses a body that is not a
+/// JSON-RPC Request (400), authenticates via the server's hook (401 +
+/// `WWW-Authenticate` on rejection, per RFC 9728), then dispatches under the
+/// resolved per-call context. A request's response is rendered as JSON or SSE;
+/// an accepted notification is answered 202 Accepted with no body.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // 1. Origin allowlist (DNS-rebinding protection).
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    // 1. Origin allowlist (DNS-rebinding protection). A present Origin that is
+    // not readable text is judged as the empty origin, which no list admits
+    // but `"*"`: present-and-invalid is a 403, never read as absent.
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or_default());
     if !is_origin_allowed(origin, server.allowed_origins()) {
         debug!(?origin, "Rejected MCP request: origin not allowed");
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
 
-    // 2. Parse the JSON-RPC envelope.
-    let mut request: JsonRpcRequest = match serde_json::from_str(&body) {
-        Ok(req) => req,
-        Err(e) => {
-            return Json(JsonRpcResponse::error(
-                None,
-                PARSE_ERROR,
-                format!("Parse error: {e}"),
-            ))
-            .into_response();
-        }
+    // 2. Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
+    // a batch, a client's response, an id that is neither a string nor an
+    // integer — is one this server cannot accept, which Streamable HTTP
+    // answers with an HTTP error status, never a 2xx.
+    let mut request = match JsonRpcRequest::parse(&body) {
+        Ok(request) => request,
+        Err(refusal) => return (StatusCode::BAD_REQUEST, Json(*refusal)).into_response(),
     };
 
-    // 3. Populate transport-derived fields for the auth hook.
-    if let Some(token) = bearer_token(&headers) {
-        request.auth_token = Some(token);
-    }
+    // 3. Populate transport-derived fields for the auth hook. The credential
+    // comes from the `Authorization` header only; `parse` never reads one out
+    // of the body.
+    request.auth_token = bearer_token(&headers);
     // `MCP-Protocol-Version` is the client's standing assertion of what was
     // negotiated at `initialize`. On a stateless server there is no session to
     // check it against, so this is the only place it can be judged — and until
@@ -170,8 +173,9 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
 
     // 5. Dispatch under the resolved context.
     let Some(response) = server.handle_request_with_context(request, &ctx).await else {
-        // Notification — no response needed
-        return StatusCode::NO_CONTENT.into_response();
+        // An accepted notification: Streamable HTTP requires 202 Accepted with
+        // no body (basic/transports §Sending Messages to the Server).
+        return StatusCode::ACCEPTED.into_response();
     };
 
     debug!(method = "mcp", "Handled HTTP MCP request");
@@ -189,20 +193,81 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     }
 }
 
-/// Whether the given `Origin` is permitted. An absent origin (non-browser
-/// client) is allowed; an empty allowlist or one containing `"*"` allows any
-/// origin; otherwise the origin must be listed exactly.
-fn is_origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
-    origin
-        .is_none_or(|origin| allowed.is_empty() || allowed.iter().any(|a| a == "*" || a == origin))
+/// Whether a request carrying `origin` passes the `allowed` list — the gate
+/// MCP requires on every Streamable HTTP request to stop DNS rebinding.
+///
+/// - no `Origin` header (a non-browser client): accepted
+/// - an empty list: only a loopback origin is accepted (see
+///   [`McpServer::with_allowed_origins`]), so a page on another site that
+///   rebinds its name to 127.0.0.1 cannot drive a local server
+/// - a list containing `"*"`: every origin is accepted, by explicit opt-in
+/// - otherwise the origin must be listed exactly
+///
+/// Public so a host serving another route over the same catalog can apply the
+/// same gate rather than a copy of it.
+#[must_use]
+pub fn is_origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
+    origin.is_none_or(|origin| {
+        if allowed.is_empty() {
+            is_loopback_origin(origin)
+        } else {
+            allowed.iter().any(|a| a == "*" || a == origin)
+        }
+    })
 }
 
-/// Extract a bearer token from the `Authorization` header.
+/// Whether `origin` is a serialized `http` or `https` origin (RFC 6454
+/// `scheme://host[:port]`) whose host is a loopback interface.
+///
+/// Anything that is not exactly that shape is refused rather than guessed at:
+/// the opaque origin `null`, other schemes, and any authority carrying a path,
+/// userinfo, query, fragment or whitespace. The host test is
+/// [`is_loopback_host`], the same one the startup posture check uses.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return false;
+    }
+    if authority.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#')) {
+        return false;
+    }
+
+    // Split off an optional `:port`, minding the colons inside a bracketed
+    // IPv6 literal, after whose `]` only nothing or `:port` may follow.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((literal, rest)) = bracketed.split_once(']') else {
+                return false;
+            };
+            if rest.is_empty() {
+                (literal, None)
+            } else if let Some(port) = rest.strip_prefix(':') {
+                (literal, Some(port))
+            } else {
+                return false;
+            }
+        }
+        None => authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port))),
+    };
+    port.is_none_or(is_port) && is_loopback_host(host)
+}
+
+/// Whether `port` is a decimal TCP port.
+fn is_port(port: &str) -> bool {
+    port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+/// The bearer credential of the request's `Authorization` header, read with
+/// the crate's one scheme parser ([`bearer_credential`]).
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_credential)
         .map(str::to_owned)
 }
 
@@ -224,6 +289,7 @@ fn respond_sse(response: &JsonRpcResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{INVALID_REQUEST, PARSE_ERROR};
     use crate::mcp::auth::AuthHook;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
@@ -388,6 +454,7 @@ mod tests {
             .expect("request"); // Safe: test assertion
 
         let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response
             .into_body()
             .collect()
@@ -398,19 +465,197 @@ mod tests {
         assert_eq!(json["error"]["code"], PARSE_ERROR);
     }
 
+    /// Streamable HTTP §Sending Messages to the Server: an accepted
+    /// notification "MUST return HTTP status code 202 Accepted with no body".
+    /// Older Python SDK clients fail on the 204 this used to return.
     #[tokio::test]
-    async fn mcp_post_notification_returns_204() {
-        let app = make_app();
-        let body = r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#;
+    async fn mcp_post_notification_returns_202_with_no_body() {
+        let (status, body) = post(
+            make_app(),
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty(), "a 202 carries no body; got {body:?}");
+    }
+
+    /// POST `body` to `/mcp` with the extra `headers`, returning the status and
+    /// the raw response body.
+    async fn post(app: Router, body: &str, headers: &[(&str, &str)]) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(body.to_owned()).expect("request"); // Safe: test assertion
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body") // Safe: test assertion
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A body that is JSON but not a Request is one the server cannot accept:
+    /// a 4xx carrying -32600, not a 200 carrying -32700.
+    #[tokio::test]
+    async fn json_that_is_not_a_request_is_refused_with_400_invalid_request() {
+        for body in [
+            // A client's response: this transport never sends the client a
+            // request, so there is nothing for it to answer.
+            r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+            // A batch: MCP carries none.
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            // A null id: not a notification, and not answerable either.
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            // An id that is neither a string nor an integer.
+            r#"{"jsonrpc":"2.0","id":{"n":1},"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
+        ] {
+            let (status, response) = post(make_app(), body, &[]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let json: Value = serde_json::from_str(&response).expect("json"); // Safe: test assertion
+            assert_eq!(json["error"]["code"], INVALID_REQUEST, "{body}");
+            assert_eq!(json["id"], Value::Null, "{body}");
+        }
+    }
+
+    /// DNS-rebinding protection is on by default: with no allowlist a browser
+    /// origin that is not loopback is refused with 403.
+    #[tokio::test]
+    async fn empty_allowlist_refuses_a_non_loopback_origin() {
+        for origin in [
+            "https://evil.test",
+            "http://192.168.1.10:3000",
+            "http://localhost.evil.test",
+            "http://127.0.0.1.nip.io",
+            "http://evil.test@localhost",
+            "http://localhost/path",
+            "http://localhost:99999",
+            "http://::1",
+            "ftp://localhost",
+            "null",
+        ] {
+            let (status, _) = post(
+                make_app(),
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                &[("origin", origin)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin}");
+        }
+    }
+
+    /// An `Origin` header that is present but not readable text is invalid,
+    /// not absent: reading it as absent would admit it as a non-browser client.
+    #[tokio::test]
+    async fn an_unreadable_origin_is_refused_not_read_as_absent() {
         let request = Request::builder()
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
-            .body(body.to_owned())
-            .expect("request"); // Safe: test assertion
+            .header(
+                "origin",
+                header::HeaderValue::from_bytes(b"http://localhost\xff")
+                    .expect("obs-text is a legal header byte"), // Safe: test fixture
+            )
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_owned())
+            .expect("request"); // Safe: test fixture
+        let response = make_app().oneshot(request).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
-        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
-        assert_eq!(response.status(), 204);
+    /// Local development keeps working without configuration: a page served
+    /// from a loopback origin, on any port, reaches an unconfigured server.
+    #[tokio::test]
+    async fn empty_allowlist_admits_a_loopback_origin() {
+        for origin in [
+            "http://localhost:3000",
+            "https://localhost",
+            "http://LOCALHOST:8082",
+            "http://127.0.0.1:8081",
+            "http://127.1.2.3",
+            "http://[::1]:5173",
+            "http://[::1]",
+        ] {
+            let (status, _) = post(
+                make_app(),
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                &[("origin", origin)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "origin {origin}");
+        }
+    }
+
+    /// `"*"` is the explicit opt-out: a host that lists it accepts any origin.
+    #[tokio::test]
+    async fn wildcard_allowlist_admits_any_origin() {
+        let server = Arc::new(
+            McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                .with_allowed_origins(vec!["*".to_owned()]),
+        );
+        let (status, _) = post(
+            mcp_router(server),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &[("origin", "https://evil.test")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A configured allowlist is exact: it does not also admit loopback, and a
+    /// request with no `Origin` (a non-browser client) is still accepted.
+    #[test]
+    fn a_configured_allowlist_is_matched_exactly() {
+        let allowed = vec!["https://app.example.test".to_owned()];
+        assert!(is_origin_allowed(
+            Some("https://app.example.test"),
+            &allowed
+        ));
+        assert!(!is_origin_allowed(Some("http://localhost:3000"), &allowed));
+        assert!(!is_origin_allowed(Some("https://evil.test"), &allowed));
+        assert!(is_origin_allowed(None, &allowed));
+        assert!(is_origin_allowed(None, &[]));
+    }
+
+    /// The token comes from the `Authorization` header only. A body field
+    /// named `auth` used to survive whenever no header was sent, so any caller
+    /// could write its own credential into the JSON and be served as admin.
+    #[tokio::test]
+    async fn a_token_in_the_body_does_not_authenticate() {
+        let (status, _) = post(
+            make_authed_app(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"admin_op"},"auth":"admin"}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// RFC 7235 §2.1: the auth-scheme is case-insensitive.
+    #[tokio::test]
+    async fn the_bearer_scheme_is_matched_case_insensitively() {
+        for authorization in ["bearer user", "BEARER user"] {
+            let (status, body) = post(
+                make_authed_app(),
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello"}}"#,
+                &[("authorization", authorization)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{authorization}");
+            let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+            assert_eq!(
+                json["result"]["content"][0]["text"], "hello world",
+                "{authorization}"
+            );
+        }
     }
 
     #[tokio::test]

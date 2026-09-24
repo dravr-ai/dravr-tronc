@@ -21,6 +21,7 @@ use tracing::warn;
 
 use super::error::IamError;
 use crate::error::ErrorResponse;
+use crate::server::auth::bearer_credential;
 
 /// Google's published signing keys for identity tokens.
 const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
@@ -222,7 +223,7 @@ pub async fn require_google_id_token(
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(bearer_credential);
 
     let Some(token) = presented else {
         return unauthorized("Missing bearer identity token");

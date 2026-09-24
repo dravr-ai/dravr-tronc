@@ -60,19 +60,36 @@ pub async fn require_auth(env_var: &str, request: Request, next: Next) -> Respon
         .get("authorization")
         .and_then(|v| v.to_str().ok());
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header.as_bytes()["Bearer ".len()..];
-            let expected = expected_key.as_bytes();
-            if token.ct_eq(expected).into() {
+    match auth_header.map(bearer_credential) {
+        Some(Some(token)) => {
+            if token.as_bytes().ct_eq(expected_key.as_bytes()).into() {
                 next.run(request).await
             } else {
                 auth_error("Invalid API key")
             }
         }
-        Some(_) => auth_error("Authorization header must use Bearer scheme"),
+        Some(None) => auth_error("Authorization header must use Bearer scheme"),
         None => auth_error("Missing Authorization header"),
     }
+}
+
+/// The credential carried by an `Authorization` header value that uses the
+/// `Bearer` scheme, or `None` for any other scheme or an empty credential.
+///
+/// The scheme is matched case-insensitively — RFC 7235 §2.1 makes every
+/// auth-scheme case-insensitive, so `bearer x` and `BEARER x` present the same
+/// credential as `Bearer x` — and the one or more spaces separating it from the
+/// credential are consumed. Every bearer check in this crate reads the header
+/// through this function, so no two of them can disagree about which forms
+/// authenticate.
+#[must_use]
+pub fn bearer_credential(header_value: &str) -> Option<&str> {
+    let (scheme, credential) = header_value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let credential = credential.trim_start_matches(' ');
+    (!credential.is_empty()).then_some(credential)
 }
 
 /// Build a 401 error response
@@ -323,6 +340,60 @@ mod tests {
             .expect("msg") // Safe: test assertion
             .contains("Bearer"));
         env::remove_var(ENV);
+    }
+
+    /// RFC 7235 §2.1: the auth-scheme is case-insensitive. A client sending
+    /// `bearer` in lower case holds the right key and used to get a 401.
+    #[tokio::test]
+    async fn lowercase_bearer_scheme_passes() {
+        const ENV: &str = "TRONC_AUTH_TEST_LOWERCASE_SCHEME";
+        env::set_var(ENV, "secret-key-123");
+        let app = make_app(ENV);
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .header("authorization", "bearer secret-key-123")
+            .body(Body::empty())
+            .expect("request"); // Safe: test assertion
+
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
+        assert_eq!(resp.status(), 200);
+        env::remove_var(ENV);
+    }
+
+    #[test]
+    fn bearer_credential_reads_the_scheme_in_any_case() {
+        for header in [
+            "Bearer tok-1",
+            "bearer tok-1",
+            "BEARER tok-1",
+            "BeArEr tok-1",
+            "Bearer   tok-1",
+        ] {
+            assert_eq!(
+                bearer_credential(header),
+                Some("tok-1"),
+                "{header:?} carries the credential tok-1"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_credential_refuses_other_schemes_and_empty_credentials() {
+        for header in [
+            "Basic dXNlcjpwYXNz",
+            "Bearertok-1",
+            "Bearer",
+            "Bearer ",
+            "Bearer    ",
+            "tok-1",
+            "",
+        ] {
+            assert_eq!(
+                bearer_credential(header),
+                None,
+                "{header:?} must not read as a bearer credential"
+            );
+        }
     }
 
     // ---- startup posture ----

@@ -271,23 +271,23 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
 
     /// Dispatch a `tools/call` to the named tool handler
     ///
-    /// Gates `ADMIN_ONLY` tools on `ctx.is_admin` before dispatching.
+    /// Gates `ADMIN_ONLY` tools on `ctx.is_admin` before dispatching. Returns
+    /// `None` when no tool is registered under `name`: that is a protocol
+    /// error in MCP, not a tool result, so it is the caller's to frame.
     pub async fn execute(
         &self,
         name: &str,
         state: &Arc<S>,
         ctx: &ToolContext,
         arguments: Value,
-    ) -> ToolResponse {
-        match self.tools.get(name) {
-            Some(tool) => {
-                if tool.capabilities().contains(ToolCapabilities::ADMIN_ONLY) && !ctx.is_admin {
-                    return ToolResponse::error(format!("Tool '{name}' requires admin privileges"));
-                }
-                tool.execute(state, ctx, arguments).await
-            }
-            None => ToolResponse::error(format!("Unknown tool: {name}")),
+    ) -> Option<ToolResponse> {
+        let tool = self.tools.get(name)?;
+        if tool.capabilities().contains(ToolCapabilities::ADMIN_ONLY) && !ctx.is_admin {
+            return Some(ToolResponse::error(format!(
+                "Tool '{name}' requires admin privileges"
+            )));
         }
+        Some(tool.execute(state, ctx, arguments).await)
     }
 }
 
@@ -482,7 +482,8 @@ mod tests {
         let ctx = ToolContext::new();
         let result = registry
             .execute("echo", &state, &ctx, json!({"message": "hello"}))
-            .await;
+            .await
+            .expect("registered tool"); // Safe: test assertion
         assert!(!result.is_error);
         assert_eq!(result.content[0].as_text(), Some("echo: hello"));
     }
@@ -494,23 +495,26 @@ mod tests {
 
         let state = make_state();
         let ctx = ToolContext::new();
-        let result = registry.execute("counter", &state, &ctx, json!({})).await;
+        let result = registry
+            .execute("counter", &state, &ctx, json!({}))
+            .await
+            .expect("registered tool"); // Safe: test assertion
         assert_eq!(result.content[0].as_text(), Some("counter: 42"));
     }
 
     #[tokio::test]
-    async fn execute_unknown_tool_returns_error() {
-        let registry = ToolRegistry::<DummyState>::new();
+    async fn execute_unknown_tool_is_no_result() {
+        let mut registry = ToolRegistry::<DummyState>::new();
+        registry.register(Box::new(EchoTool));
         let state = make_state();
         let ctx = ToolContext::new();
         let result = registry
             .execute("nonexistent", &state, &ctx, json!({}))
             .await;
-        assert!(result.is_error);
-        assert!(result.content[0]
-            .as_text()
-            .expect("text") // Safe: test assertion
-            .contains("Unknown tool"));
+        assert!(
+            result.is_none(),
+            "an unknown tool is a protocol error for the caller to frame, not a tool result"
+        );
     }
 
     #[tokio::test]
@@ -522,7 +526,8 @@ mod tests {
         let non_admin = ToolContext::new();
         let denied = registry
             .execute("admin_reset", &state, &non_admin, json!({}))
-            .await;
+            .await
+            .expect("registered tool"); // Safe: test assertion
         assert!(denied.is_error);
         assert!(denied.content[0]
             .as_text()
@@ -532,7 +537,8 @@ mod tests {
         let admin = ToolContext::new().as_admin(true);
         let allowed = registry
             .execute("admin_reset", &state, &admin, json!({}))
-            .await;
+            .await
+            .expect("registered tool"); // Safe: test assertion
         assert!(!allowed.is_error);
         assert_eq!(allowed.content[0].as_text(), Some("reset"));
     }

@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::error::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    MISSING_REQUIRED_CLIENT_CAPABILITY, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
@@ -27,7 +27,7 @@ use crate::mcp::schema::{
 };
 use crate::mcp::tasks::{
     method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
-    TaskManager, TaskOwner, TaskSubscription, TASKS_EXTENSION_ID,
+    TaskManager, TaskOwner, TASKS_EXTENSION_ID,
 };
 use crate::mcp::tool::{ToolContext, ToolRegistry};
 
@@ -162,9 +162,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
-    /// Restrict the `Origin`s the HTTP transport accepts. An empty list (the
-    /// default) or one containing `"*"` allows any origin; a request whose
-    /// `Origin` header is present and not listed is rejected with 403.
+    /// Set the `Origin`s the HTTP transport accepts, matched exactly.
+    ///
+    /// A request whose `Origin` header is present and not accepted is refused
+    /// with 403, and one without the header (a non-browser client) is always
+    /// accepted. An empty list (the default) accepts only loopback origins —
+    /// `http(s)://localhost`, `127.0.0.0/8` and `[::1]`, on any port — which is
+    /// the DNS-rebinding protection MCP requires of every server (2025-06-18
+    /// basic/transports §Security Warning). A list containing `"*"` accepts
+    /// every origin and is the explicit opt-out.
     #[must_use]
     pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.allowed_origins = origins;
@@ -306,73 +312,6 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
     }
 
-    /// Open a `subscriptions/listen` push stream for an authenticated caller.
-    ///
-    /// Streaming transports intercept the method before unary dispatch and
-    /// call this with the transport-authenticated [`ToolContext`]; the
-    /// engine validates the modern-era metadata (declared protocol version,
-    /// the tasks extension declared on THIS request) and hands back a
-    /// [`TaskSubscription`] of `notifications/tasks` frames scoped to the
-    /// caller. The transport frames them (SSE, NDJSON, ...) and owns
-    /// keep-alives and disconnects.
-    ///
-    /// # Errors
-    ///
-    /// Returns the JSON-RPC response to send instead of a stream: the
-    /// unsupported-version error, `-32021` when the tasks extension was not
-    /// declared, or invalid-params for a legacy-shaped request. When no
-    /// [`TaskManager`] is installed the method does not exist here.
-    pub fn open_task_subscription(
-        &self,
-        request: &JsonRpcRequest,
-        ctx: &ToolContext,
-    ) -> Result<TaskSubscription, Box<JsonRpcResponse>> {
-        let Some(manager) = &self.task_manager else {
-            return Err(Box::new(JsonRpcResponse::error(
-                request.id.clone(),
-                METHOD_NOT_FOUND,
-                format!("Method not found: {}", task_methods::SUBSCRIPTIONS_LISTEN),
-            )));
-        };
-        let meta = match ModernRequestMeta::from_params(request.params.as_ref()) {
-            ModernMeta::Modern(meta) => *meta,
-            ModernMeta::Legacy => {
-                return Err(Box::new(JsonRpcResponse::error(
-                    request.id.clone(),
-                    INVALID_PARAMS,
-                    "subscriptions/listen exists only in the modern era".to_owned(),
-                )));
-            }
-            ModernMeta::Malformed(reason) => {
-                return Err(Box::new(JsonRpcResponse::error(
-                    request.id.clone(),
-                    INVALID_PARAMS,
-                    reason,
-                )));
-            }
-        };
-        if !self.supports_version(&meta.protocol_version) {
-            return Err(Box::new(self.unsupported_version_error(
-                request.id.clone(),
-                &meta.protocol_version,
-            )));
-        }
-        let ctx = ctx
-            .clone()
-            .with_client_capabilities(meta.client_capabilities);
-        if !ctx.supports_tasks() {
-            return Err(Box::new(Self::missing_capability_error(
-                request.id.clone(),
-                TASKS_EXTENSION_ID,
-            )));
-        }
-        let owner = TaskOwner {
-            user_id: ctx.user_id.clone(),
-            tenant_id: ctx.tenant_id,
-        };
-        Ok(manager.subscribe(&owner))
-    }
-
     /// Authenticate a request via the configured [`AuthHook`], or yield the
     /// default anonymous [`ToolContext`] when no hook is installed.
     ///
@@ -387,20 +326,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Route a raw JSON string to the appropriate MCP handler
     ///
-    /// Parses the string as a `JsonRpcRequest`, dispatches it, and returns
-    /// the serialized response. Returns `None` for notifications.
+    /// Reads the string with [`JsonRpcRequest::parse`], dispatches it, and
+    /// returns the response. Returns `None` for notifications; a message that
+    /// is not a Request is answered with the parse error (-32700) or invalid
+    /// request error (-32600) `parse` produced.
     pub async fn handle_raw(&self, raw: &str) -> Option<JsonRpcResponse> {
-        let request: JsonRpcRequest = match serde_json::from_str(raw) {
-            Ok(req) => req,
-            Err(e) => {
-                return Some(JsonRpcResponse::error(
-                    None,
-                    PARSE_ERROR,
-                    format!("Parse error: {e}"),
-                ));
-            }
-        };
-        self.handle_request(request).await
+        match JsonRpcRequest::parse(raw) {
+            Ok(request) => self.handle_request(request).await,
+            Err(refusal) => Some(*refusal),
+        }
     }
 
     /// Route a parsed JSON-RPC request under the default anonymous context.
@@ -504,17 +438,6 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 self.handle_tools_call(request.id, request.params, &ctx, declares_tasks)
                     .await
             }
-            // subscriptions/listen opens a server->client stream, which a
-            // unary request/response path cannot carry. Streaming transports
-            // intercept the method BEFORE dispatch and call
-            // [`Self::open_task_subscription`]; reaching this arm means the
-            // transport cannot stream, and the honest answer says so instead
-            // of method-not-found.
-            task_methods::SUBSCRIPTIONS_LISTEN => JsonRpcResponse::error(
-                request.id,
-                INVALID_REQUEST,
-                "subscriptions/listen requires a streaming transport".to_owned(),
-            ),
             method @ (task_methods::TASKS_GET
             | task_methods::TASKS_UPDATE
             | task_methods::TASKS_CANCEL) => match &self.task_manager {
@@ -722,8 +645,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
     }
 
-    /// Handle `tools/call` — dispatch to the named tool handler under `ctx`
-    /// Handle `tools/call`.
+    /// Handle `tools/call` — dispatch to the named tool handler under `ctx`.
     ///
     /// `allow_tasks` is true only for a modern-era call whose client declared
     /// the tasks extension; it gates whether the dispatcher's
@@ -764,18 +686,24 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         let outcome = match &self.tool_dispatcher {
             Some(dispatcher) => {
                 dispatcher
-                    .call_tool_outcome(&call.name, &self.state, ctx, arguments)
+                    .call_tool(&call.name, &self.state, ctx, arguments)
                     .await
             }
-            None => CallToolOutcome::Immediate(Box::new(
-                self.tools
-                    .execute(&call.name, &self.state, ctx, arguments)
-                    .await,
-            )),
+            None => self
+                .tools
+                .execute(&call.name, &self.state, ctx, arguments)
+                .await
+                .map_or(CallToolOutcome::UnknownTool, CallToolOutcome::from),
         };
 
         match outcome {
             CallToolOutcome::Immediate(result) => Self::tool_response_result(id, &result),
+            // MCP lists an unknown tool among the protocol errors, answered
+            // with a JSON-RPC error rather than an `isError` result (2025-06-18
+            // server/tools §Error Handling, whose example is this code).
+            CallToolOutcome::UnknownTool => {
+                JsonRpcResponse::error(id, INVALID_PARAMS, format!("Unknown tool: {}", call.name))
+            }
             // The specification forbids handing a task to a client that did not
             // declare the extension, so a dispatcher that mints one anyway is a
             // host bug — surface it rather than emitting a non-conformant reply.
@@ -808,6 +736,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::PARSE_ERROR;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities};
     use serde_json::json;
@@ -1120,12 +1049,13 @@ mod tests {
             "params": { "name": "nonexistent" }
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
-        let result = resp.result.expect("result"); // Safe: test assertion
-        assert_eq!(result["isError"], true);
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("text") // Safe: test assertion
-            .contains("Unknown tool"));
+        assert!(
+            resp.result.is_none(),
+            "an unknown tool is a protocol error, not an isError result"
+        );
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: nonexistent");
     }
 
     #[tokio::test]
@@ -1182,6 +1112,37 @@ mod tests {
         let raw = r#"{"jsonrpc": "2.0", "method": "notifications/cancelled"}"#;
         let resp = server.handle_raw(raw).await;
         assert!(resp.is_none());
+    }
+
+    /// `"id": null` is a malformed request, not a notification. serde reads a
+    /// null id as absent, which made the request vanish without an answer.
+    #[tokio::test]
+    async fn a_null_id_is_an_invalid_request_not_a_notification() {
+        let server = make_server();
+        let raw = r#"{"jsonrpc": "2.0", "id": null, "method": "ping"}"#;
+        let resp = server
+            .handle_raw(raw)
+            .await
+            .expect("a null id must be answered, not dropped as a notification"); // Safe: test assertion
+        assert_eq!(resp.error.expect("error").code, INVALID_REQUEST); // Safe: test assertion
+    }
+
+    #[tokio::test]
+    async fn json_that_is_not_a_request_is_an_invalid_request() {
+        let server = make_server();
+        for raw in [
+            r#"[{"jsonrpc": "2.0", "id": 1, "method": "ping"}]"#,
+            r#"{"jsonrpc": "2.0", "id": 1, "result": {}}"#,
+            r#"{"jsonrpc": "2.0", "id": 1.5, "method": "ping"}"#,
+            r#"{"jsonrpc": "2.0", "id": {"n": 1}, "method": "ping"}"#,
+        ] {
+            let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+            assert_eq!(
+                resp.error.expect("error").code, // Safe: test assertion
+                INVALID_REQUEST,
+                "{raw}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1423,10 +1384,11 @@ mod tests {
             _state: &Arc<TestState>,
             _ctx: &ToolContext,
             _arguments: Value,
-        ) -> ToolResponse {
+        ) -> CallToolOutcome {
             match name {
-                "scoped_tool" => ToolResponse::text("dispatched".to_owned()),
-                other => ToolResponse::error(format!("quota exceeded for {other}")),
+                "scoped_tool" => ToolResponse::text("dispatched".to_owned()).into(),
+                "metered_tool" => ToolResponse::error(format!("quota exceeded for {name}")).into(),
+                _ => CallToolOutcome::UnknownTool,
             }
         }
     }
@@ -1569,14 +1531,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_call_reports_host_error() {
-        // The dispatcher decides errors host-side (e.g. quota); even the registry's
-        // own `ping_tool` is invisible to the dispatcher path.
+        // The dispatcher decides execution errors host-side (e.g. quota), and
+        // they reach the client as an isError result the model can read.
         let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
         let raw = r#"{
             "jsonrpc": "2.0",
             "id": 35,
             "method": "tools/call",
-            "params": { "name": "ping_tool", "arguments": {} }
+            "params": { "name": "metered_tool", "arguments": {} }
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         let result = resp.result.expect("result"); // Safe: test assertion
@@ -1585,5 +1547,38 @@ mod tests {
             .as_str()
             .expect("text") // Safe: test assertion
             .contains("quota exceeded"));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_unknown_tool_is_a_protocol_error() {
+        // The registry's own `ping_tool` is invisible to the dispatcher path, so
+        // the dispatcher answers it as unknown and the engine frames -32602.
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 37,
+            "method": "tools/call",
+            "params": { "name": "ping_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: ping_tool");
+    }
+
+    #[tokio::test]
+    async fn modern_unknown_tool_is_a_protocol_error() {
+        // Framing adds `resultType` to results only; the error passes through.
+        let server = make_server();
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 38, "method": "tools/call",
+                "params": {{ "name": "nonexistent", {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: nonexistent");
     }
 }
