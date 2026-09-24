@@ -23,6 +23,8 @@ const METHOD_PROGRESS: &str = "notifications/progress";
 const METHOD_CANCELLED: &str = "notifications/cancelled";
 /// `notifications/oauth_completed` method string.
 const METHOD_OAUTH_COMPLETED: &str = "notifications/oauth_completed";
+/// Key under [`ServerCapabilities::experimental`] carrying an [`OAuth2Capability`].
+const EXPERIMENTAL_OAUTH2: &str = "oauth2";
 
 /// MCP request wire frame (alias for the canonical JSON-RPC request).
 pub type McpRequest = JsonRpcRequest;
@@ -248,14 +250,25 @@ impl Content {
 }
 
 /// MCP server capability declarations.
+///
+/// Exactly the keys the specification defines for a server (2025-06-18 schema
+/// `ServerCapabilities`: `experimental`, `logging`, `completions`, `prompts`,
+/// `resources`, `tools`) plus the revision `2026-07-28` `extensions` map. A
+/// client negotiates only what it finds under these names, so anything else a
+/// server wants to state goes under [`Self::experimental`] — which is where
+/// [`Self::with_oauth2`] puts the OAuth 2.0 endpoints.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
-    /// Experimental capabilities not in the MCP spec.
+    /// Non-standard capabilities, keyed by name. The one place the
+    /// specification lets a server advertise something it does not define.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
     /// Server logging capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Argument auto-completion: the server answers `completion/complete`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completions: Option<CompletionCapability>,
     /// Server prompts capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
@@ -265,18 +278,6 @@ pub struct ServerCapabilities {
     /// Server tools capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
-    /// Server authentication capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthCapability>,
-    /// Server OAuth 2.0 capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth2: Option<OAuth2Capability>,
-    /// Server completion (auto-complete) capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion: Option<CompletionCapability>,
-    /// Server sampling (LLM calls) capability.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sampling: Option<SamplingCapability>,
     /// Extension capabilities, keyed by reverse-DNS identifier (revision
     /// `2026-07-28`). An extension advertises support with an empty object,
     /// e.g. `{"io.modelcontextprotocol/tasks": {}}`.
@@ -297,6 +298,21 @@ impl ServerCapabilities {
             }),
             ..Self::default()
         }
+    }
+
+    /// Advertise the server's OAuth 2.0 endpoints, under
+    /// `experimental["oauth2"]`.
+    ///
+    /// MCP defines no capability for them — a client finds the authorization
+    /// server through RFC 9728 protected-resource metadata — so they are an
+    /// experimental capability, not a top-level key a conforming client would
+    /// read as a negotiated one.
+    #[must_use]
+    pub fn with_oauth2(mut self, oauth2: OAuth2Capability) -> Self {
+        self.experimental
+            .get_or_insert_with(HashMap::new)
+            .insert(EXPERIMENTAL_OAUTH2.to_owned(), oauth2.into_value());
+        self
     }
 }
 
@@ -331,15 +347,8 @@ pub struct ResourcesCapability {
     pub list_changed: Option<bool>,
 }
 
-/// Authentication capability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthCapability {
-    /// OAuth 2.0 authentication details.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth2: Option<OAuth2Capability>,
-}
-
-/// OAuth 2.0 capability.
+/// OAuth 2.0 endpoints a server advertises through
+/// [`ServerCapabilities::with_oauth2`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuth2Capability {
     /// OAuth 2.0 discovery URL.
@@ -356,7 +365,23 @@ pub struct OAuth2Capability {
     pub registration_endpoint: String,
 }
 
-/// Completion (auto-complete) capability.
+impl OAuth2Capability {
+    /// The capability as the JSON object its serde derive writes.
+    ///
+    /// Built by hand because every field is a string, so the conversion
+    /// cannot fail, and `serde_json::to_value` would still hand back a
+    /// `Result` to discard.
+    fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "discoveryUrl": self.discovery_url,
+            "authorizationEndpoint": self.authorization_endpoint,
+            "tokenEndpoint": self.token_endpoint,
+            "registrationEndpoint": self.registration_endpoint,
+        })
+    }
+}
+
+/// Completion (auto-complete) capability, advertised as `completions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionCapability {}
 
@@ -374,7 +399,9 @@ pub struct ClientCapabilities {
     pub roots: Option<RootsCapability>,
 }
 
-/// Sampling capability (declared by either client or server).
+/// Sampling capability: the client can answer `sampling/createMessage`.
+///
+/// A client capability only. A server does not declare it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingCapability {}
 
@@ -1016,6 +1043,83 @@ mod tests {
         assert!(json.get("serverInfo").is_some());
         assert_eq!(json["capabilities"]["tools"]["listChanged"], false);
         assert!(json.get("protocol_version").is_none());
+    }
+
+    fn oauth2() -> OAuth2Capability {
+        OAuth2Capability {
+            discovery_url: "https://auth.example/.well-known/oauth-authorization-server".to_owned(),
+            authorization_endpoint: "https://auth.example/authorize".to_owned(),
+            token_endpoint: "https://auth.example/token".to_owned(),
+            registration_endpoint: "https://auth.example/register".to_owned(),
+        }
+    }
+
+    /// A fully populated set writes only keys the specification defines for a
+    /// server, and completion support under its spec name, `completions`.
+    #[test]
+    fn server_capabilities_write_only_spec_keys() {
+        let caps = ServerCapabilities {
+            experimental: Some(HashMap::new()),
+            logging: Some(LoggingCapability {}),
+            completions: Some(CompletionCapability {}),
+            prompts: Some(PromptsCapability {
+                list_changed: Some(false),
+            }),
+            resources: Some(ResourcesCapability {
+                subscribe: Some(false),
+                list_changed: Some(false),
+            }),
+            tools: Some(ToolsCapability {
+                list_changed: Some(false),
+            }),
+            extensions: Some(HashMap::new()),
+        }
+        .with_oauth2(oauth2());
+        let json = serde_json::to_value(&caps).expect("serialize"); // Safe: test assertion
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object") // Safe: test assertion
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "completions",
+                "experimental",
+                "extensions",
+                "logging",
+                "prompts",
+                "resources",
+                "tools"
+            ]
+        );
+        assert_eq!(json["completions"], json!({}));
+    }
+
+    #[test]
+    fn a_client_reading_spec_completions_sees_them() {
+        let caps: ServerCapabilities =
+            serde_json::from_value(json!({ "completions": {}, "tools": {} })).expect("deserialize"); // Safe: test assertion
+        assert!(caps.completions.is_some());
+    }
+
+    #[test]
+    fn oauth2_endpoints_travel_under_experimental() {
+        let caps = ServerCapabilities::tools_only().with_oauth2(oauth2());
+        let json = serde_json::to_value(&caps).expect("serialize"); // Safe: test assertion
+        assert!(json.get("oauth2").is_none());
+        assert!(json.get("auth").is_none());
+        assert_eq!(
+            json["experimental"]["oauth2"]["tokenEndpoint"],
+            "https://auth.example/token"
+        );
+        // The hand-built object is exactly what the serde derive writes.
+        assert_eq!(
+            json["experimental"]["oauth2"],
+            serde_json::to_value(oauth2()).expect("serialize") // Safe: test assertion
+        );
     }
 
     #[test]
