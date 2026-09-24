@@ -188,7 +188,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Configure auth for private git deps
         # Only the platform needs this — it pins dravr-stripe and dravr-photograveur,
