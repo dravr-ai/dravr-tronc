@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::from_fn;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -23,6 +24,7 @@ use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
 use crate::server::auth::{bearer_credential, is_loopback_host};
+use crate::server::request_guard::guard_requests;
 
 /// The `MCP-Protocol-Version` HTTP header (revision 2026-07-28). The transport
 /// forwards its value into the request metadata for the dispatch layer.
@@ -33,6 +35,12 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 /// Returns a `Router` that can be merged into a larger application router
 /// or served standalone. The router is parameterized over the MCP server's
 /// state type.
+///
+/// It carries no request guard of its own: the application that merges it
+/// layers [`guard_requests`] once over the whole router, and [`serve`] does so
+/// for the standalone case. Two guards on one route would log it twice. Never
+/// layer a request deadline over it — a tool call is dispatched whole before
+/// the response is written.
 pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp_post::<S>))
@@ -41,13 +49,15 @@ pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) 
 
 /// Start a standalone HTTP server serving only the `/mcp` endpoint
 ///
-/// Binds to the given host and port, serves until shutdown.
+/// Binds to the given host and port, serves until shutdown. Every request goes
+/// through [`guard_requests`]: it gets a request id, a completion log line, and
+/// a JSON `500` if a tool handler panics, instead of a dropped connection.
 pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     host: &str,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let app = mcp_router(server);
+    let app = mcp_router(server).layer(from_fn(guard_requests));
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)

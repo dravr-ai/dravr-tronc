@@ -90,6 +90,7 @@ dravr_tronc::mcp::transport::http::serve(server, "127.0.0.1", 3000).await?;
 
 ```rust
 use dravr_tronc::mcp::transport::http::mcp_router;
+use dravr_tronc::server::request_guard::guard_requests;
 
 let app = axum::Router::new()
     .route("/health", axum::routing::get(health_handler))
@@ -97,8 +98,12 @@ let app = axum::Router::new()
     .merge(mcp_router(server))  // adds POST /mcp
     .layer(axum::middleware::from_fn(|req, next| {
         dravr_tronc::server::auth::require_auth("MY_API_KEY", req, next)
-    }));
+    }))
+    .layer(axum::middleware::from_fn(guard_requests));  // outermost, once
 ```
+
+`serve` in step 3 layers `guard_requests` itself; an app that assembles its own router adds it
+once, last. See [Request guard](#request-guard).
 
 ## Modules
 
@@ -114,6 +119,7 @@ let app = axum::Router::new()
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
+| `server::request_guard` | Request ids, panic → JSON `500`, per-router deadline → JSON `504`, completion and dropped-request logs |
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP |
@@ -175,6 +181,42 @@ let mode = resolve_startup_auth(&args.host, true)?;
 Its second argument is **whether anything at all authenticates requests on this bind** — not
 whether a key is set. Read it as "is there a gate", and an identity-gated service that holds no
 key still binds `0.0.0.0`, which every Cloud Run container must.
+
+## Request guard
+
+A handler that panics, or that runs past a deadline, must answer the caller — never leave it with
+a connection that closed before any response, which it cannot tell apart from a network fault.
+`server::request_guard` holds the two middlewares that make that true:
+
+```rust
+use std::time::Duration;
+
+use axum::middleware::from_fn;
+use dravr_tronc::server::request_guard::{enforce_deadline, guard_requests};
+
+let deadline = Duration::from_secs(300);
+let app = rest_routes
+    .layer(from_fn(move |req, next| enforce_deadline(deadline, req, next)))
+    .merge(mcp_router(server))           // no deadline on /mcp
+    .layer(from_fn(guard_requests));     // outermost, once
+```
+
+- **`guard_requests`** gives every request an id — the caller's `x-request-id` when it is 1–128
+  characters of `[A-Za-z0-9-_.:]`, a minted one otherwise — echoes it on the response, and puts it
+  in the request's extensions as `RequestId`. It logs one INFO line per request (`method`, route
+  template as `path`, `status`, `latency_ms`, `request_id`; never the concrete path or its query,
+  which carry ids). A handler panic becomes a `500` with
+  `{"error":{"type":"handler_panic",…}}` and an ERROR line carrying the panic payload. A request
+  dropped before it answered — the client closed the connection mid-request, or the server went
+  down — is logged at WARN with how long it ran.
+- **`enforce_deadline`** answers a `504` with `{"error":{"type":"request_timeout",…}}` when the
+  handler is still running at the deadline, and drops the handler. Put it on the router that holds
+  one-shot REST routes, sized above the slowest legitimate request and below the caller's own
+  client timeout, so the caller gets this answer instead of giving up first. Never on `/mcp` (a
+  tool call is dispatched whole before it answers) or on a WebSocket or streamed response.
+
+**A contained panic needs `panic = "unwind"`.** Under `panic = "abort"` the first panic terminates
+the process and every in-flight request with it; no middleware can answer anything there.
 
 ## Health checks
 
