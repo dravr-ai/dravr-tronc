@@ -9,7 +9,7 @@
 cargo fmt --all
 
 # 2. Clippy with warnings as errors
-cargo clippy --workspace --all-targets -- -D warnings
+CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets
 
 # 3. Architectural validation (MUST exit 0)
 .build/validation/validate.sh
