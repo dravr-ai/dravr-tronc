@@ -19,8 +19,6 @@ use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRP
 
 /// `notifications/progress` method string.
 const METHOD_PROGRESS: &str = "notifications/progress";
-/// `notifications/cancelled` method string.
-const METHOD_CANCELLED: &str = "notifications/cancelled";
 /// `notifications/oauth_completed` method string.
 const METHOD_OAUTH_COMPLETED: &str = "notifications/oauth_completed";
 /// Key under [`ServerCapabilities::experimental`] carrying an [`OAuth2Capability`].
@@ -194,7 +192,13 @@ impl ToolResponse {
     }
 }
 
-/// Content item within an MCP message or tool result.
+/// A content block within a tool result or prompt message, in its spec shape.
+///
+/// The specification's `ContentBlock` also admits `audio`, `resource_link` and
+/// embedded `resource` blocks. No server on this engine produces any of them,
+/// so none is modelled: a variant nothing constructs is a wire shape nothing
+/// checks, which is how a flattened `resource` and a `progress` block that is
+/// not content at all used to sit here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Content {
@@ -213,29 +217,6 @@ pub enum Content {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
-    /// Resource reference with URI.
-    #[serde(rename = "resource")]
-    Resource {
-        /// URI of the resource.
-        uri: String,
-        /// Optional text description of the resource.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        /// MIME type of the resource.
-        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
-    /// Progress update for a long-running operation.
-    #[serde(rename = "progress")]
-    Progress {
-        /// Token identifying the operation.
-        #[serde(rename = "progressToken")]
-        progress_token: String,
-        /// Current progress value.
-        progress: f64,
-        /// Optional total for computing a percentage.
-        total: Option<f64>,
-    },
 }
 
 impl Content {
@@ -244,7 +225,7 @@ impl Content {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
-            _ => None,
+            Self::Image { .. } => None,
         }
     }
 }
@@ -716,7 +697,9 @@ pub struct ProgressParams {
     pub progress_token: String,
     /// Current progress value.
     pub progress: f64,
-    /// Optional total for percentage calculation.
+    /// Total the progress counts toward, when known. Omitted when unknown:
+    /// the spec types it as an optional number, and `null` is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<f64>,
     /// Optional human-readable progress message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -739,21 +722,6 @@ impl ProgressNotification {
                 progress_token,
                 progress,
                 total,
-                message,
-            },
-        }
-    }
-
-    /// Create a cancellation notification.
-    #[must_use]
-    pub fn cancelled(progress_token: String, message: Option<String>) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION.to_owned(),
-            method: METHOD_CANCELLED.to_owned(),
-            params: ProgressParams {
-                progress_token,
-                progress: 0.0,
-                total: None,
                 message,
             },
         }
@@ -1133,6 +1101,57 @@ mod tests {
         assert_eq!(req.protocol_version, "2025-11-25");
         assert_eq!(req.client_info.name, "test-client");
         assert_eq!(req.client_info.version, "1.0");
+    }
+
+    /// Blocks that are not spec content, or not in the spec's shape, are
+    /// refused rather than read: `progress` is a notification, never a
+    /// content type, and an embedded resource nests under `resource`.
+    #[test]
+    fn non_spec_content_blocks_are_refused() {
+        let progress = json!({
+            "type": "progress", "progressToken": "t", "progress": 1.0, "total": null
+        });
+        assert!(serde_json::from_value::<Content>(progress).is_err());
+        let flattened_resource = json!({
+            "type": "resource", "uri": "file:///a.txt", "text": "a", "mimeType": "text/plain"
+        });
+        assert!(serde_json::from_value::<Content>(flattened_resource).is_err());
+    }
+
+    #[test]
+    fn progress_without_a_total_omits_it() {
+        let json = serde_json::to_value(ProgressNotification::new(
+            "tok-1".to_owned(),
+            0.5,
+            None,
+            None,
+        ))
+        .expect("serialize"); // Safe: test assertion
+        assert_eq!(json["method"], "notifications/progress");
+        assert_eq!(
+            json["params"],
+            json!({ "progressToken": "tok-1", "progress": 0.5 })
+        );
+    }
+
+    #[test]
+    fn progress_with_a_total_carries_it() {
+        let json = serde_json::to_value(ProgressNotification::new(
+            "tok-2".to_owned(),
+            3.0,
+            Some(10.0),
+            Some("reading activities".to_owned()),
+        ))
+        .expect("serialize"); // Safe: test assertion
+        assert_eq!(
+            json["params"],
+            json!({
+                "progressToken": "tok-2",
+                "progress": 3.0,
+                "total": 10.0,
+                "message": "reading activities"
+            })
+        );
     }
 
     #[test]
