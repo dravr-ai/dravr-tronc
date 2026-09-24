@@ -57,6 +57,13 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      DRAVR_PRIVATE_DEPS_TOKEN:
+        description: "Read token for private git deps; empty in a repo whose graph is public"
+        required: false
+      DRAVR_CARNET_TOKEN:
+        description: "Files the stall issue on dravr-ai/dravr-carnet"
+        required: false
 
 jobs:
   # ---------------------------------------------------------------------------
