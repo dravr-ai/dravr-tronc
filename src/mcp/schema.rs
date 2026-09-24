@@ -197,8 +197,7 @@ impl ToolResponse {
 /// The specification's `ContentBlock` also admits `audio`, `resource_link` and
 /// embedded `resource` blocks. No server on this engine produces any of them,
 /// so none is modelled: a variant nothing constructs is a wire shape nothing
-/// checks, which is how a flattened `resource` and a `progress` block that is
-/// not content at all used to sit here.
+/// checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Content {
