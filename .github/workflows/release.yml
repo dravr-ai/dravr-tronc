@@ -152,6 +152,7 @@ jobs:
           # cargo package fails on the dangling link (this silently broke
           # every workflow publish before the 2026-07-02 fix).
           submodules: recursive
+          token: ${{ secrets.DRAVR_PRIVATE_DEPS_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@1.96.0
 

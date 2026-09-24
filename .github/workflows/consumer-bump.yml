@@ -183,19 +183,22 @@ jobs:
       branch: ${{ steps.push.outputs.branch }}
       sha: ${{ steps.push.outputs.sha }}
     steps:
+      # No submodules: nothing here reads .build (private), and checking it out
+      # would need DRAVR_PRIVATE_DEPS_TOKEN on the checkout — which persists it as
+      # the push credential, and that token is read-only. The gates this job
+      # dispatches check .build out themselves.
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Configure auth for private git deps
-        # Only the platform needs this — it pins dravr-stripe and dravr-photograveur,
-        # both PRIVATE repos, by git tag, and `cargo update` cannot fetch them
-        # anonymously. The satellites' graphs are entirely public, so the secret is
-        # absent there and this is a no-op rather than a failure. Guarded on emptiness
-        # because `secrets: inherit` passes an unset secret as "".
+        # Only the platform's graph needs this — it pins dravr-stripe and
+        # dravr-photograveur, both PRIVATE repos, by git tag, and `cargo update`
+        # cannot fetch them anonymously. The satellites' graphs are public, so there
+        # it is harmless. Guarded on emptiness because `secrets: inherit` passes an
+        # unset secret as "".
         env:
           PRIVATE_DEPS_TOKEN: ${{ secrets.DRAVR_PRIVATE_DEPS_TOKEN }}
         run: |
