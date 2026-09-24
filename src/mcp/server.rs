@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::error::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    MISSING_REQUIRED_CLIENT_CAPABILITY, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
@@ -162,9 +162,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
-    /// Restrict the `Origin`s the HTTP transport accepts. An empty list (the
-    /// default) or one containing `"*"` allows any origin; a request whose
-    /// `Origin` header is present and not listed is rejected with 403.
+    /// Set the `Origin`s the HTTP transport accepts, matched exactly.
+    ///
+    /// A request whose `Origin` header is present and not accepted is refused
+    /// with 403, and one without the header (a non-browser client) is always
+    /// accepted. An empty list (the default) accepts only loopback origins —
+    /// `http(s)://localhost`, `127.0.0.0/8` and `[::1]`, on any port — which is
+    /// the DNS-rebinding protection MCP requires of every server (2025-06-18
+    /// basic/transports §Security Warning). A list containing `"*"` accepts
+    /// every origin and is the explicit opt-out.
     #[must_use]
     pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.allowed_origins = origins;
@@ -387,20 +393,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Route a raw JSON string to the appropriate MCP handler
     ///
-    /// Parses the string as a `JsonRpcRequest`, dispatches it, and returns
-    /// the serialized response. Returns `None` for notifications.
+    /// Reads the string with [`JsonRpcRequest::parse`], dispatches it, and
+    /// returns the response. Returns `None` for notifications; a message that
+    /// is not a Request is answered with the parse error (-32700) or invalid
+    /// request error (-32600) `parse` produced.
     pub async fn handle_raw(&self, raw: &str) -> Option<JsonRpcResponse> {
-        let request: JsonRpcRequest = match serde_json::from_str(raw) {
-            Ok(req) => req,
-            Err(e) => {
-                return Some(JsonRpcResponse::error(
-                    None,
-                    PARSE_ERROR,
-                    format!("Parse error: {e}"),
-                ));
-            }
-        };
-        self.handle_request(request).await
+        match JsonRpcRequest::parse(raw) {
+            Ok(request) => self.handle_request(request).await,
+            Err(refusal) => Some(*refusal),
+        }
     }
 
     /// Route a parsed JSON-RPC request under the default anonymous context.
@@ -808,6 +809,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::PARSE_ERROR;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities};
     use serde_json::json;
@@ -1182,6 +1184,37 @@ mod tests {
         let raw = r#"{"jsonrpc": "2.0", "method": "notifications/cancelled"}"#;
         let resp = server.handle_raw(raw).await;
         assert!(resp.is_none());
+    }
+
+    /// `"id": null` is a malformed request, not a notification. serde reads a
+    /// null id as absent, which made the request vanish without an answer.
+    #[tokio::test]
+    async fn a_null_id_is_an_invalid_request_not_a_notification() {
+        let server = make_server();
+        let raw = r#"{"jsonrpc": "2.0", "id": null, "method": "ping"}"#;
+        let resp = server
+            .handle_raw(raw)
+            .await
+            .expect("a null id must be answered, not dropped as a notification"); // Safe: test assertion
+        assert_eq!(resp.error.expect("error").code, INVALID_REQUEST); // Safe: test assertion
+    }
+
+    #[tokio::test]
+    async fn json_that_is_not_a_request_is_an_invalid_request() {
+        let server = make_server();
+        for raw in [
+            r#"[{"jsonrpc": "2.0", "id": 1, "method": "ping"}]"#,
+            r#"{"jsonrpc": "2.0", "id": 1, "result": {}}"#,
+            r#"{"jsonrpc": "2.0", "id": 1.5, "method": "ping"}"#,
+            r#"{"jsonrpc": "2.0", "id": {"n": 1}, "method": "ping"}"#,
+        ] {
+            let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+            assert_eq!(
+                resp.error.expect("error").code, // Safe: test assertion
+                INVALID_REQUEST,
+                "{raw}"
+            );
+        }
     }
 
     #[tokio::test]
