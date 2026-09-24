@@ -54,16 +54,6 @@ impl ToolDispatcher<TestState> for TaskingDispatcher {
         &self,
         _name: &str,
         _state: &Arc<TestState>,
-        _ctx: &ToolContext,
-        _arguments: Value,
-    ) -> ToolResponse {
-        ToolResponse::text("sync fallback".to_owned())
-    }
-
-    async fn call_tool_outcome(
-        &self,
-        _name: &str,
-        _state: &Arc<TestState>,
         ctx: &ToolContext,
         _arguments: Value,
     ) -> CallToolOutcome {

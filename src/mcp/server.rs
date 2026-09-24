@@ -723,8 +723,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
     }
 
-    /// Handle `tools/call` — dispatch to the named tool handler under `ctx`
-    /// Handle `tools/call`.
+    /// Handle `tools/call` — dispatch to the named tool handler under `ctx`.
     ///
     /// `allow_tasks` is true only for a modern-era call whose client declared
     /// the tasks extension; it gates whether the dispatcher's
@@ -765,18 +764,24 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         let outcome = match &self.tool_dispatcher {
             Some(dispatcher) => {
                 dispatcher
-                    .call_tool_outcome(&call.name, &self.state, ctx, arguments)
+                    .call_tool(&call.name, &self.state, ctx, arguments)
                     .await
             }
-            None => CallToolOutcome::Immediate(Box::new(
-                self.tools
-                    .execute(&call.name, &self.state, ctx, arguments)
-                    .await,
-            )),
+            None => self
+                .tools
+                .execute(&call.name, &self.state, ctx, arguments)
+                .await
+                .map_or(CallToolOutcome::UnknownTool, CallToolOutcome::from),
         };
 
         match outcome {
             CallToolOutcome::Immediate(result) => Self::tool_response_result(id, &result),
+            // MCP lists an unknown tool among the protocol errors, answered
+            // with a JSON-RPC error rather than an `isError` result (2025-06-18
+            // server/tools §Error Handling, whose example is this code).
+            CallToolOutcome::UnknownTool => {
+                JsonRpcResponse::error(id, INVALID_PARAMS, format!("Unknown tool: {}", call.name))
+            }
             // The specification forbids handing a task to a client that did not
             // declare the extension, so a dispatcher that mints one anyway is a
             // host bug — surface it rather than emitting a non-conformant reply.
@@ -1122,12 +1127,13 @@ mod tests {
             "params": { "name": "nonexistent" }
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
-        let result = resp.result.expect("result"); // Safe: test assertion
-        assert_eq!(result["isError"], true);
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("text") // Safe: test assertion
-            .contains("Unknown tool"));
+        assert!(
+            resp.result.is_none(),
+            "an unknown tool is a protocol error, not an isError result"
+        );
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: nonexistent");
     }
 
     #[tokio::test]
@@ -1456,10 +1462,11 @@ mod tests {
             _state: &Arc<TestState>,
             _ctx: &ToolContext,
             _arguments: Value,
-        ) -> ToolResponse {
+        ) -> CallToolOutcome {
             match name {
-                "scoped_tool" => ToolResponse::text("dispatched".to_owned()),
-                other => ToolResponse::error(format!("quota exceeded for {other}")),
+                "scoped_tool" => ToolResponse::text("dispatched".to_owned()).into(),
+                "metered_tool" => ToolResponse::error(format!("quota exceeded for {name}")).into(),
+                _ => CallToolOutcome::UnknownTool,
             }
         }
     }
@@ -1602,14 +1609,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_call_reports_host_error() {
-        // The dispatcher decides errors host-side (e.g. quota); even the registry's
-        // own `ping_tool` is invisible to the dispatcher path.
+        // The dispatcher decides execution errors host-side (e.g. quota), and
+        // they reach the client as an isError result the model can read.
         let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
         let raw = r#"{
             "jsonrpc": "2.0",
             "id": 35,
             "method": "tools/call",
-            "params": { "name": "ping_tool", "arguments": {} }
+            "params": { "name": "metered_tool", "arguments": {} }
         }"#;
         let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
         let result = resp.result.expect("result"); // Safe: test assertion
@@ -1618,5 +1625,38 @@ mod tests {
             .as_str()
             .expect("text") // Safe: test assertion
             .contains("quota exceeded"));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_unknown_tool_is_a_protocol_error() {
+        // The registry's own `ping_tool` is invisible to the dispatcher path, so
+        // the dispatcher answers it as unknown and the engine frames -32602.
+        let server = make_server().with_tool_dispatcher(Arc::new(ScopedDispatcher));
+        let raw = r#"{
+            "jsonrpc": "2.0",
+            "id": 37,
+            "method": "tools/call",
+            "params": { "name": "ping_tool", "arguments": {} }
+        }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: ping_tool");
+    }
+
+    #[tokio::test]
+    async fn modern_unknown_tool_is_a_protocol_error() {
+        // Framing adds `resultType` to results only; the error passes through.
+        let server = make_server();
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 38, "method": "tools/call",
+                "params": {{ "name": "nonexistent", {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("error"); // Safe: test assertion
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Unknown tool: nonexistent");
     }
 }

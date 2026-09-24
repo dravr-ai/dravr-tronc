@@ -196,14 +196,16 @@ async fn tool_reads_shared_state() {
 }
 
 #[tokio::test]
-async fn unknown_tool_returns_error_in_result() {
+async fn unknown_tool_is_a_protocol_error() {
     let server = make_server();
     let resp = server
         .handle_raw(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bogus"}}"#)
         .await
         .expect("response");
-    let result = resp.result.expect("result");
-    assert_eq!(result["isError"], true);
+    assert!(resp.result.is_none(), "not an isError tool result");
+    let error = resp.error.expect("error");
+    assert_eq!(error.code, -32602);
+    assert_eq!(error.message, "Unknown tool: bogus");
 }
 
 #[tokio::test]
