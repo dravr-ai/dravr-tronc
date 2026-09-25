@@ -80,12 +80,8 @@ impl Visit for NotifyVisitor {
 /// `Debug` formatting of `&str` yields `"hello"` — Slack lines read better
 /// without the quotes for IDs.
 fn strip_debug_quotes(s: &str) -> Cow<'_, str> {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-        Cow::Owned(s[1..s.len() - 1].to_owned())
-    } else {
-        Cow::Borrowed(s)
-    }
+    s.strip_circumfix('"', '"')
+        .map_or(Cow::Borrowed(s), |inner| Cow::Owned(inner.to_owned()))
 }
 
 #[cfg(test)]

@@ -225,11 +225,8 @@ impl SlackClient {
         // Constant-time comparison to avoid leaking the expected HMAC via timing
         // (mirrors the bearer-token check in `crate::server::auth`). Length is not
         // secret, so the length-mismatch short-circuit in `ct_eq` is acceptable.
-        if signature.as_bytes().ct_eq(expected.as_bytes()).into() {
-            Ok(())
-        } else {
-            Err(SignatureError::InvalidSignature)
-        }
+        let equal: bool = signature.as_bytes().ct_eq(expected.as_bytes()).into();
+        equal.ok_or(SignatureError::InvalidSignature)
     }
 }
 
