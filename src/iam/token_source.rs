@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use super::error::IamError;
+use crate::http_client::describe_request_error;
 
 /// Default metadata host, used when [`METADATA_HOST_ENV`] is unset.
 ///
@@ -136,7 +137,7 @@ impl IdTokenSource {
             .header("Metadata-Flavor", "Google")
             .send()
             .await
-            .map_err(|e| IamError::MetadataUnavailable(e.to_string()))?;
+            .map_err(|e| IamError::MetadataUnavailable(describe_request_error(e)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -148,7 +149,7 @@ impl IdTokenSource {
         let token = response
             .text()
             .await
-            .map_err(|e| IamError::MalformedToken(e.to_string()))?;
+            .map_err(|e| IamError::MalformedToken(describe_request_error(e)))?;
 
         // A JWT is three dot-separated segments. Checking the shape here turns a
         // proxy's HTML error page — which arrives with a 200 — into a named

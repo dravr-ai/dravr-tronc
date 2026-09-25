@@ -117,6 +117,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext` |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison |
+| `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
 | `server::request_guard` | Request ids, panic → JSON `500`, per-router deadline → JSON `504`, completion and dropped-request logs |

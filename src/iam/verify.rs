@@ -21,6 +21,7 @@ use tracing::warn;
 
 use super::error::IamError;
 use crate::error::ErrorResponse;
+use crate::http_client::describe_request_error;
 use crate::server::auth::bearer_credential;
 
 /// Google's published signing keys for identity tokens.
@@ -177,10 +178,10 @@ impl GoogleIdTokenVerifier {
             .get(GOOGLE_JWKS_URL)
             .send()
             .await
-            .map_err(|e| IamError::JwksUnavailable(e.to_string()))?
+            .map_err(|e| IamError::JwksUnavailable(describe_request_error(e)))?
             .json()
             .await
-            .map_err(|e| IamError::JwksUnavailable(e.to_string()))?;
+            .map_err(|e| IamError::JwksUnavailable(describe_request_error(e)))?;
 
         let found = jwks.keys.iter().find(|k| k.kid == kid).cloned();
         *self.jwks.write().await = Some(CachedJwks {
