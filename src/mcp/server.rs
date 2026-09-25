@@ -162,6 +162,19 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
+    /// Whether a host authentication hook is installed — whether anything
+    /// authenticates requests reaching this server over HTTP.
+    ///
+    /// [`serve`](crate::mcp::transport::http::serve) reads it to refuse a
+    /// reachable bind with no hook, and a binary that assembles its own router
+    /// passes it to
+    /// [`resolve_startup_auth`](crate::server::auth::resolve_startup_auth) as
+    /// its `gated` argument when the hook is its only gate.
+    #[must_use]
+    pub fn has_auth_hook(&self) -> bool {
+        self.auth_hook.is_some()
+    }
+
     /// Set the `Origin`s the HTTP transport accepts, matched exactly.
     ///
     /// A request whose `Origin` header is present and not accepted is refused

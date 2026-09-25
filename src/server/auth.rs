@@ -9,7 +9,9 @@
 //! [`require_auth`] **fails open**: with its environment variable unset every
 //! request passes through. That is deliberate and pinned by tests — stdio and
 //! local runs depend on it — and it is why [`resolve_startup_auth`] exists, to
-//! refuse a reachable bind that nothing gates.
+//! refuse a reachable bind that nothing gates. [`startup_auth`] is that check
+//! for the common case, a service gated by one shared key, with the posture
+//! logged: every satellite used to carry its own copy of those ten lines.
 //!
 //! **Which mechanism?** This crate ships five, and the choice is made by what
 //! the caller can present, per route — not by which one has no feature flag.
@@ -28,6 +30,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use subtle::ConstantTimeEq;
+use tracing::{info, warn};
 
 use crate::error::ErrorResponse;
 
@@ -136,6 +139,22 @@ pub enum AuthMode {
 pub struct InsecureBindError {
     /// The non-loopback host the server was asked to bind.
     pub host: String,
+    /// The environment variable that arms the gate, when the gate is a shared
+    /// key, so the refusal can say what to set. `None` when the gate is
+    /// something else (an [`AuthHook`](crate::mcp::auth::AuthHook), Google ID
+    /// tokens) and there is no single variable to name.
+    pub gate: Option<String>,
+}
+
+impl InsecureBindError {
+    /// A refusal of `host` for a service whose gate is not a single variable.
+    #[must_use]
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            gate: None,
+        }
+    }
 }
 
 impl fmt::Display for InsecureBindError {
@@ -143,9 +162,19 @@ impl fmt::Display for InsecureBindError {
         write!(
             f,
             "refusing to start: nothing authenticates requests while binding non-loopback host \
-             '{}'. Arm this service's gate, or bind 127.0.0.1 for local development.",
+             '{}'. ",
             self.host
-        )
+        )?;
+        match &self.gate {
+            Some(var) => write!(
+                f,
+                "Set {var} (every request must then carry it as a bearer token), or bind \
+                 127.0.0.1 for local development."
+            ),
+            None => {
+                f.write_str("Arm this service's gate, or bind 127.0.0.1 for local development.")
+            }
+        }
     }
 }
 
@@ -155,9 +184,20 @@ impl Error for InsecureBindError {}
 ///
 /// Accepts `localhost` in any case, `127.0.0.0/8`, `::1`, and `::1` in its
 /// bracketed form. **Everything else is non-loopback, including `0.0.0.0`, `::`
-/// and any name this cannot parse** — an unresolvable name is treated as
-/// reachable so the check fails closed rather than guessing in the caller's
+/// and any other name** — a name this cannot classify from its text is treated
+/// as reachable so the check fails closed rather than guessing in the caller's
 /// favour.
+///
+/// `localhost` counts as loopback because RFC 6761 §6.3 reserves it for the
+/// loopback interface, and browsers hard-wire it there: an origin of
+/// `http://localhost:3000` is a page on this machine. A name is still only a
+/// name, though. Binding one goes through the system resolver, which answers
+/// `localhost` with `127.0.0.1`, `::1`, or both — and, on a host whose resolver
+/// is configured otherwise, with anything at all. So this is a judgement of the
+/// text, made before any socket exists; [`crate::mcp::transport::http::serve`]
+/// goes further and judges every address the name resolves to before it binds.
+/// A binary that binds its own listener and wants the same certainty checks
+/// `local_addr()` of what it bound.
 #[must_use]
 pub fn is_loopback_host(host: &str) -> bool {
     let trimmed = host.trim();
@@ -206,10 +246,46 @@ pub fn resolve_startup_auth(host: &str, gated: bool) -> Result<AuthMode, Insecur
     } else if is_loopback_host(host) {
         Ok(AuthMode::LoopbackDev)
     } else {
-        Err(InsecureBindError {
-            host: host.to_owned(),
-        })
+        Err(InsecureBindError::new(host))
     }
+}
+
+/// Resolve the startup posture of a service gated by the shared bearer key in
+/// `env_var`, and say it: INFO when the key is set, WARN when the service is
+/// serving unauthenticated on loopback.
+///
+/// This is [`resolve_startup_auth`] composed with [`api_key_configured`], the
+/// form every key-gated service in the fleet wrote out by hand. The key it
+/// checks is the one [`require_auth`] and
+/// [`ApiKeyAuthHook`](crate::mcp::auth::ApiKeyAuthHook) enforce, so posture
+/// and enforcement read the same variable by the same rule.
+///
+/// A service gated by something other than one key (Google ID tokens, a
+/// session) calls [`resolve_startup_auth`] with its own `gated` instead.
+///
+/// # Errors
+///
+/// [`InsecureBindError`] naming `env_var` when the key is unset or empty and
+/// `host` is not loopback: nothing would authenticate requests, so the server
+/// must not start.
+pub fn startup_auth(env_var: &str, host: &str) -> Result<AuthMode, InsecureBindError> {
+    let mode = resolve_startup_auth(host, api_key_configured(env_var)).map_err(|refused| {
+        InsecureBindError {
+            gate: Some(env_var.to_owned()),
+            ..refused
+        }
+    })?;
+    match mode {
+        AuthMode::Enforced => info!(
+            gate = env_var,
+            "{env_var} set — every request must carry it as a bearer token"
+        ),
+        AuthMode::LoopbackDev => warn!(
+            gate = env_var,
+            host, "{env_var} unset — serving UNAUTHENTICATED on loopback for local development"
+        ),
+    }
+    Ok(mode)
 }
 
 #[cfg(test)]
@@ -472,6 +548,120 @@ mod tests {
         assert_eq!(
             resolve_startup_auth("127.0.0.1", true),
             Ok(AuthMode::Enforced)
+        );
+    }
+
+    // ---- startup_auth: the key-gated posture, logged ----
+
+    /// Everything a subscriber wrote while `f` ran, as text.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        use std::io;
+        use std::sync::{Arc, Mutex, PoisonError};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        with_default(subscriber, f);
+        let bytes = buffer
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8 log") // Safe: test assertion
+    }
+
+    #[test]
+    fn startup_auth_refuses_a_reachable_bind_and_names_the_key_to_set() {
+        const ENV: &str = "TRONC_STARTUP_AUTH_TEST_REFUSED";
+        env::remove_var(ENV);
+
+        let err =
+            startup_auth(ENV, "0.0.0.0").expect_err("no key on a reachable bind must be refused"); // Safe: test assertion
+
+        assert_eq!(err.host, "0.0.0.0");
+        assert_eq!(err.gate.as_deref(), Some(ENV));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Set {ENV}")),
+            "the refusal must name the variable that arms the gate; message was {msg:?}"
+        );
+    }
+
+    #[test]
+    fn startup_auth_enforces_when_the_key_is_set_and_says_so() {
+        const ENV: &str = "TRONC_STARTUP_AUTH_TEST_ENFORCED";
+        env::set_var(ENV, "k-123");
+
+        let mut mode = None;
+        let logs = captured_logs(|| mode = Some(startup_auth(ENV, "0.0.0.0")));
+
+        assert_eq!(mode, Some(Ok(AuthMode::Enforced)));
+        assert!(logs.contains(" INFO "), "logs were {logs:?}");
+        assert!(
+            logs.contains(&format!("{ENV} set")),
+            "the INFO line must name the key; logs were {logs:?}"
+        );
+        assert!(
+            !logs.contains("k-123"),
+            "the key's value must never be logged"
+        );
+        env::remove_var(ENV);
+    }
+
+    #[test]
+    fn startup_auth_warns_when_loopback_serves_unauthenticated() {
+        const ENV: &str = "TRONC_STARTUP_AUTH_TEST_LOOPBACK";
+        env::set_var(ENV, "");
+
+        let mut mode = None;
+        let logs = captured_logs(|| mode = Some(startup_auth(ENV, "localhost")));
+
+        assert_eq!(mode, Some(Ok(AuthMode::LoopbackDev)));
+        assert!(logs.contains(" WARN "), "logs were {logs:?}");
+        assert!(
+            logs.contains(&format!("{ENV} unset")) && logs.contains("UNAUTHENTICATED"),
+            "the WARN line must say which key is missing; logs were {logs:?}"
+        );
+        env::remove_var(ENV);
+    }
+
+    #[test]
+    fn a_refusal_with_no_single_gate_asks_for_the_gate_generically() {
+        let msg = resolve_startup_auth("0.0.0.0", false)
+            .expect_err("refused") // Safe: test assertion
+            .to_string();
+        assert!(
+            msg.contains("Arm this service's gate"),
+            "message was {msg:?}"
         );
     }
 

@@ -86,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 dravr_tronc::mcp::transport::http::serve(server, "127.0.0.1", 3000).await?;
 ```
 
+`serve` serves only `/mcp`, so the server's `AuthHook` is the only thing that can authenticate a
+request there. **With no hook it serves loopback only**: it resolves the host first and refuses —
+with an `InsecureBindError`, before any socket opens — unless every address the host resolves to
+is loopback. To serve a reachable interface, attach a hook; for a shared key that is
+`mcp::auth::ApiKeyAuthHook` (see [Startup posture](#startup-posture-refuse-a-reachable-bind-nothing-gates)).
+
 ### 4. Merge into an existing Axum app
 
 ```rust
@@ -115,8 +121,8 @@ once, last. See [Request guard](#request-guard).
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: schema generated from its input type, result written at each number's own precision |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
-| `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext` |
-| `server::auth` | Bearer token middleware — env-var driven, constant-time comparison |
+| `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
+| `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
@@ -141,7 +147,7 @@ availability is not an argument for using them.
 | another dravr workload on Google infrastructure | `iam::require_google_id_token` (callee) / `iam::IdTokenSource` (caller) | `google-iam` |
 | a human, through a browser or an app | the host's own session auth; `mcp::auth::AuthHook` for MCP routes | — |
 | a third-party webhook | that vendor's signature — e.g. `notifications::slack::SlackClient::verify_signature` — never a bearer | `notifications` |
-| our own binary, over the wire, with nowhere to put a Google identity | `server::auth::require_auth` | — |
+| our own binary, over the wire, with nowhere to put a Google identity | `server::auth::require_auth` for REST routes, `mcp::auth::ApiKeyAuthHook` for MCP routes | — |
 | on stdio, or a linked crate in the same process | nothing | — |
 
 Mechanisms compose, so the question is never *which one* for a whole service. A server can verify
@@ -169,13 +175,37 @@ dravr_tronc::server::auth::require_auth("MY_API_KEY", request, next).await
 ```
 
 The cost is that a config slip turns a private service public and looks like a healthy boot.
-`resolve_startup_auth` is how you refuse that at startup instead:
+The startup posture check is how you refuse that instead.
+
+### Startup posture: refuse a reachable bind nothing gates
+
+For a service gated by one shared key, `startup_auth` resolves the posture and logs it — INFO
+when the key is set, WARN when it is serving unauthenticated on loopback — and refuses a
+reachable bind without the key, naming the variable to set:
 
 ```rust
-use dravr_tronc::server::auth::{api_key_configured, resolve_startup_auth};
+use dravr_tronc::server::auth::{startup_auth, AuthMode};
+use dravr_tronc::mcp::auth::ApiKeyAuthHook;
 
-// gated by a shared key
-let mode = resolve_startup_auth(&args.host, api_key_configured("MY_API_KEY"))?;
+let mode = startup_auth("MY_API_KEY", &args.host)?;
+
+// MCP routes: the hook fails closed, so attach it only when the key is set.
+let server = match mode {
+    AuthMode::Enforced => server.with_auth_hook(Arc::new(ApiKeyAuthHook::new("MY_API_KEY", "my-service"))),
+    AuthMode::LoopbackDev => server,
+};
+```
+
+`ApiKeyAuthHook` answers a missing or wrong key with the MCP refusal — `401`,
+`WWW-Authenticate: Bearer realm="my-service"` and a JSON-RPC error body — which a REST middleware
+layered over `/mcp` does not. It reads the key per request and admits the holder with
+`auth_method = "api_key"`, never as an admin.
+
+A service gated by something other than one key calls `resolve_startup_auth` with its own gate:
+
+```rust
+use dravr_tronc::server::auth::resolve_startup_auth;
+
 // gated by Google ID tokens — no key exists to check; the middleware is the gate
 let mode = resolve_startup_auth(&args.host, true)?;
 ```
@@ -183,6 +213,14 @@ let mode = resolve_startup_auth(&args.host, true)?;
 Its second argument is **whether anything at all authenticates requests on this bind** — not
 whether a key is set. Read it as "is there a gate", and an identity-gated service that holds no
 key still binds `0.0.0.0`, which every Cloud Run container must.
+
+**What counts as loopback.** `127.0.0.0/8`, `::1` (bracketed or not) and `localhost` in any case —
+RFC 6761 §6.3 reserves `localhost` for loopback, and browsers hard-wire it there. Everything else,
+`0.0.0.0` and `::` included, is reachable, and so is any other name: the text check fails closed.
+A name is still only a name when it is bound, because the system resolver answers it — `localhost`
+with `127.0.0.1`, `::1` or both, and on a misconfigured machine with anything. So the text check is
+a judgement made before any socket exists, and `http::serve` goes further: it judges every address
+the host resolves to before binding.
 
 ## Request guard
 
