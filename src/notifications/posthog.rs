@@ -8,6 +8,8 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::http_client::describe_request_error;
+
 /// Default `PostHog` capture-API host (US cloud).
 const DEFAULT_POSTHOG_HOST: &str = "https://us.i.posthog.com";
 
@@ -74,7 +76,7 @@ impl PostHogClient {
                     warn!(event = %event, status = %resp.status(), "PostHog capture returned non-2xx");
                 }
                 Err(e) => {
-                    warn!(event = %event, error = %e, "PostHog capture failed");
+                    warn!(event = %event, error = %describe_request_error(e), "PostHog capture failed");
                 }
                 Ok(_) => {}
             }

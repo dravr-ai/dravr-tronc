@@ -33,6 +33,8 @@
 )]
 
 pub mod error;
+#[cfg(feature = "http-client")]
+pub mod http_client;
 #[cfg(feature = "google-iam")]
 pub mod iam;
 pub mod mcp;

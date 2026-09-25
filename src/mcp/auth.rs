@@ -1,5 +1,5 @@
 // ABOUTME: Host-supplied authentication seam for the HTTP transport (RFC 9728 resource server)
-// ABOUTME: AuthHook resolves a per-call ToolContext from a request; AuthError maps to 401/403/429/500
+// ABOUTME: AuthHook resolves a per-call ToolContext; ApiKeyAuthHook is the shared-bearer-key hook
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -19,10 +19,15 @@
 //! The table is in the crate README under "Choosing an auth mechanism"; read it
 //! before reaching for a shared bearer key, which is the wrong answer whenever
 //! the caller is another Google workload, a browser session, or a webhook.
+//!
+//! When a shared key *is* the answer — our own binary calling over the wire —
+//! [`ApiKeyAuthHook`] is that hook, so no service writes its own.
 
+use std::env;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 
 use crate::mcp::protocol::JsonRpcRequest;
 use crate::mcp::tool::ToolContext;
@@ -107,4 +112,93 @@ pub trait AuthHook<S: Send + Sync + ?Sized>: Send + Sync {
         request: &JsonRpcRequest,
         state: &Arc<S>,
     ) -> Result<ToolContext, AuthError>;
+}
+
+/// `auth_method` recorded on the [`ToolContext`] of a request [`ApiKeyAuthHook`]
+/// admitted.
+pub const API_KEY_AUTH_METHOD: &str = "api_key";
+
+/// Requires every MCP request to carry, as its bearer token, the shared key
+/// held in an environment variable.
+///
+/// It is the MCP-route counterpart of
+/// [`require_auth`](crate::server::auth::require_auth), and it differs in the
+/// two ways an MCP route needs:
+///
+/// - **It fails closed.** With the variable unset or empty it admits nobody,
+///   where `require_auth` admits everybody. Attach it only when the key is set
+///   — [`startup_auth`](crate::server::auth::startup_auth) answering
+///   [`AuthMode::Enforced`](crate::server::auth::AuthMode::Enforced) — so an
+///   absent key is decided once, at startup, and never becomes an open door.
+/// - **Its refusal is the MCP one:** a `401` with an RFC 6750 §3 bearer
+///   challenge (`Bearer realm="…"`) and a JSON-RPC error body, rendered by the
+///   HTTP transport, instead of `require_auth`'s REST error.
+///
+/// The key is read on every request, so rotating it needs no restart, and it
+/// is compared in constant time. An admitted request runs as a caller that
+/// holds the key and nothing more: no user, no tenant, never admin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyAuthHook {
+    env_var: String,
+    challenge: String,
+}
+
+impl ApiKeyAuthHook {
+    /// A hook enforcing the key in `env_var`, answering refusals with a
+    /// `Bearer realm="<realm>"` challenge.
+    ///
+    /// Name the realm after the service. Two surfaces of one service that share
+    /// a key share a realm, so a client can reuse one credential for both.
+    #[must_use]
+    pub fn new(env_var: impl Into<String>, realm: &str) -> Self {
+        Self {
+            env_var: env_var.into(),
+            challenge: format!("Bearer realm=\"{}\"", quote_escape(realm)),
+        }
+    }
+
+    /// The `WWW-Authenticate` value every refusal carries.
+    #[must_use]
+    pub fn challenge(&self) -> &str {
+        &self.challenge
+    }
+}
+
+/// `value` with `\` and `"` escaped, so it can sit inside an RFC 9110
+/// quoted-string.
+fn quote_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '\\' | '"') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+#[async_trait]
+impl<S: Send + Sync + ?Sized> AuthHook<S> for ApiKeyAuthHook {
+    async fn authenticate(
+        &self,
+        request: &JsonRpcRequest,
+        _state: &Arc<S>,
+    ) -> Result<ToolContext, AuthError> {
+        let expected = env::var(&self.env_var).unwrap_or_default();
+        let presented = request.auth_token.as_deref().unwrap_or_default();
+        // `ct_eq` on slices of different lengths is false without comparing
+        // bytes; the length of a key is not a secret.
+        let admitted =
+            !expected.is_empty() && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()));
+
+        if admitted {
+            let mut ctx = ToolContext::new().with_auth_method(API_KEY_AUTH_METHOD);
+            ctx.request_id.clone_from(&request.id);
+            Ok(ctx)
+        } else {
+            Err(AuthError::Unauthorized {
+                www_authenticate: self.challenge.clone(),
+            })
+        }
+    }
 }

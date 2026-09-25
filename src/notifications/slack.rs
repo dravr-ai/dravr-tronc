@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use tracing::{error, warn};
 
 use super::SlackConfig;
+use crate::http_client::describe_request_error;
 
 /// Slack API endpoint for posting messages
 const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
@@ -245,7 +246,7 @@ async fn send_slack_request(
         .await
     {
         Ok(r) => r,
-        Err(e) => return SlackResult::HttpError(e.to_string()),
+        Err(e) => return SlackResult::HttpError(describe_request_error(e)),
     };
 
     if !response.status().is_success() {
@@ -265,7 +266,7 @@ async fn send_slack_request(
                 SlackResult::ApiError(error.to_owned())
             }
         }
-        Err(e) => SlackResult::HttpError(format!("response parse: {e}")),
+        Err(e) => SlackResult::HttpError(format!("response parse: {}", describe_request_error(e))),
     }
 }
 

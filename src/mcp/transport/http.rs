@@ -6,6 +6,7 @@
 
 use std::convert::Infallible;
 use std::error::Error;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -16,14 +17,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::stream;
-use tokio::net::TcpListener;
+use tokio::net::{lookup_host, TcpListener};
 use tracing::{debug, error, info};
 
 use crate::error::{INTERNAL_ERROR, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
-use crate::server::auth::{bearer_credential, is_loopback_host};
+use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
 
 /// The `MCP-Protocol-Version` HTTP header (revision 2026-07-28). The transport
@@ -52,20 +53,45 @@ pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) 
 /// Binds to the given host and port, serves until shutdown. Every request goes
 /// through [`guard_requests`]: it gets a request id, a completion log line, and
 /// a JSON `500` if a tool handler panics, instead of a dropped connection.
+///
+/// **A server with no [`AuthHook`](crate::mcp::auth::AuthHook) serves loopback
+/// only.** This router is all it serves, so the hook is the only thing that can
+/// authenticate a request here; without one, every caller that can reach the
+/// socket can call every tool. `host` is resolved first and the bind is refused
+/// with an [`InsecureBindError`] — before any socket opens — unless every
+/// address it resolves to is loopback. That judges what would actually be
+/// bound, not the name: `localhost` passes because it resolves to `127.0.0.1`
+/// or `::1`, and would be refused on a machine whose resolver says otherwise.
+/// Attach a hook ([`ApiKeyAuthHook`](crate::mcp::auth::ApiKeyAuthHook) for a
+/// shared key) to serve a reachable interface.
+///
+/// # Errors
+///
+/// An [`InsecureBindError`] for a reachable bind with no hook; otherwise a
+/// resolution, bind or serve failure.
 pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     host: &str,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let app = mcp_router(server).layer(from_fn(guard_requests));
-
+    let authenticated = server.has_auth_hook();
     let addr = format!("{host}:{port}");
-    let listener = TcpListener::bind(&addr)
+    let resolved: Vec<SocketAddr> = lookup_host(&addr)
+        .await
+        .map_err(|e| format!("Failed to resolve {addr}: {e}"))?
+        .collect();
+    if !authenticated && !resolved.iter().all(|a| a.ip().is_loopback()) {
+        return Err(Box::new(InsecureBindError::new(host)));
+    }
+
+    let app = mcp_router(server).layer(from_fn(guard_requests));
+    let listener = TcpListener::bind(resolved.as_slice())
         .await
         .map_err(|e| format!("Failed to bind {addr}: {e}"))?;
 
     info!(
         address = %addr,
+        authenticated,
         protocol_version = PROTOCOL_VERSION,
         "HTTP MCP transport listening"
     );
@@ -90,14 +116,9 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // 1. Origin allowlist (DNS-rebinding protection). A present Origin that is
-    // not readable text is judged as the empty origin, which no list admits
-    // but `"*"`: present-and-invalid is a 403, never read as absent.
-    let origin = headers
-        .get(header::ORIGIN)
-        .map(|v| v.to_str().unwrap_or_default());
-    if !is_origin_allowed(origin, server.allowed_origins()) {
-        debug!(?origin, "Rejected MCP request: origin not allowed");
+    // 1. Origin allowlist (DNS-rebinding protection).
+    if !origin_allowed(&headers, server.allowed_origins()) {
+        debug!(origin = ?headers.get(header::ORIGIN), "Rejected MCP request: origin not allowed");
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
 
@@ -231,6 +252,21 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
     }
 }
 
+/// Whether a request with these `headers` passes the `allowed` `Origin` list —
+/// [`is_origin_allowed`] applied to the request's `Origin` header.
+///
+/// A present `Origin` that is not readable text is judged as the empty origin,
+/// which no list admits but `"*"`: present-and-invalid is refused, never read
+/// as absent. Public so a host serving another route over the same catalog
+/// gates it by reading the header exactly as `POST /mcp` does.
+#[must_use]
+pub fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or_default());
+    is_origin_allowed(origin, allowed)
+}
+
 /// Whether a request carrying `origin` passes the `allowed` list — the gate
 /// MCP requires on every Streamable HTTP request to stop DNS rebinding.
 ///
@@ -241,8 +277,8 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
 /// - a list containing `"*"`: every origin is accepted, by explicit opt-in
 /// - otherwise the origin must be listed exactly
 ///
-/// Public so a host serving another route over the same catalog can apply the
-/// same gate rather than a copy of it.
+/// A host gating an HTTP route reads the header through [`origin_allowed`];
+/// this is the rule it applies, for a caller that already holds the origin.
 #[must_use]
 pub fn is_origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
     origin.is_none_or(|origin| {
@@ -301,7 +337,12 @@ fn is_port(port: &str) -> bool {
 
 /// The bearer credential of the request's `Authorization` header, read with
 /// the crate's one scheme parser ([`bearer_credential`]).
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+///
+/// Public so a host serving another route over the same catalog hands its
+/// [`AuthHook`](crate::mcp::auth::AuthHook) exactly the credential `POST /mcp`
+/// would.
+#[must_use]
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

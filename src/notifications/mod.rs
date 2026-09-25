@@ -9,7 +9,9 @@
 //! Shared notification infrastructure for all dravr-xxx services.
 //!
 //! - [`SlackClient`]: Post and update Slack messages, verify request signatures
-//! - [`EmailClient`]: Send email alerts via SMTP
+//! - [`EmailClient`]: Send email alerts via the Resend API
+//! - [`ResendClient`]: The one Resend send path — alerts and a host's
+//!   transactional mail — retrying a `429` within Resend's advertised reset
 //! - [`PostHogClient`]: Fire-and-forget `PostHog` capture-API analytics sink
 //! - [`ErrorNotificationLayer`]: A `tracing::Layer` that intercepts ERROR-level
 //!   events and dispatches them to configured channels with batching,
@@ -19,10 +21,12 @@ mod config;
 mod email;
 mod error_layer;
 mod posthog;
+mod resend;
 mod slack;
 
 pub use config::{EmailConfig, NotificationConfig, SlackConfig};
 pub use email::EmailClient;
 pub use error_layer::ErrorNotificationLayer;
 pub use posthog::PostHogClient;
+pub use resend::{ResendBody, ResendClient, ResendEmail, ResendError};
 pub use slack::SlackClient;
