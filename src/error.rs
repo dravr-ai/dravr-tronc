@@ -37,6 +37,14 @@ pub const SERVER_ERROR_END: i32 = -32_099;
 /// transport layer for unauthenticated MCP requests.
 pub const UNAUTHORIZED: i32 = -32_001;
 
+/// The credential is valid but its request budget is spent (`-32002`).
+///
+/// Implementation-defined, inside the -32000..=-32019 band the specification
+/// leaves to implementations, and paired with an HTTP 429 and a `Retry-After`
+/// header on the transport layer; `data.retry_after_secs` carries the same
+/// wait as the header.
+pub const RATE_LIMITED: i32 = -32_002;
+
 /// A routing header disagreed with the request body (`-32020`).
 ///
 /// `HeaderMismatchError` (revision 2026-07-28): the Streamable HTTP transport

@@ -164,10 +164,7 @@ pub fn is_loopback_host(host: &str) -> bool {
     if trimmed.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    let stripped = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(trimmed);
+    let stripped = trimmed.strip_circumfix('[', ']').unwrap_or(trimmed);
     stripped.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.1.0] — 2026-09-25
+
+
+
+## [2.0.0] — 2026-09-25
+
+
+
+## [1.5.0] — 2026-09-25
+
+### Added
+
+- feat(server): a panicking or late handler answers JSON, never a drop
+
+### Fixed
+
+- fix(mcp): spec conformance for transport, schema and tool dispatch
+
+### Other
+
+- refactor: bool::ok_or and strip_circumfix (Rust 1.98)
+
+
+
 ## [1.4.0] — 2026-09-23
 
 ### Added

@@ -316,7 +316,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// default anonymous [`ToolContext`] when no hook is installed.
     ///
     /// # Errors
-    /// Returns the hook's [`AuthError`] (401/403) when authentication fails.
+    /// Returns the hook's [`AuthError`] (401/403/429/500) when authentication fails.
     pub async fn authenticate(&self, request: &JsonRpcRequest) -> Result<ToolContext, AuthError> {
         match &self.auth_hook {
             Some(hook) => hook.authenticate(request, &self.state).await,
