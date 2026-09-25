@@ -120,6 +120,7 @@ once, last. See [Request guard](#request-guard).
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
+| `notifications::ResendClient` *(feature `notifications`)* | The one Resend send path — alert and transactional mail — retrying a `429` within the advertised reset |
 | `server::request_guard` | Request ids, panic → JSON `500`, per-router deadline → JSON `504`, completion and dropped-request logs |
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |

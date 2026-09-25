@@ -1,59 +1,38 @@
-// ABOUTME: Email notification client using the Resend HTTP API for sending error alerts
-// ABOUTME: Fire-and-forget or awaitable email delivery to configured recipients
+// ABOUTME: Email alert client: error alerts to the configured recipients, through ResendClient
+// ABOUTME: Fire-and-forget delivery on the same Resend send path and 429 retry policy as host mail
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
 use reqwest::Client;
-use serde::Serialize;
 use tracing::warn;
 
+use super::resend::{ResendBody, ResendClient, ResendEmail, ResendError};
 use super::EmailConfig;
 
-/// Resend API endpoint for sending emails
-const RESEND_API_URL: &str = "https://api.resend.com/emails";
-
 /// Email client for sending alert notifications via the Resend API
+///
+/// Sends through [`ResendClient`], the same client and `429` retry policy a
+/// host's transactional mail uses, so alerts sharing a service's
+/// `RESEND_API_KEY` wait out a rate limit instead of being dropped by it.
 #[derive(Clone)]
 pub struct EmailClient {
-    http: Client,
-    api_key: String,
+    resend: ResendClient,
     from_address: String,
     to_addresses: Vec<String>,
-}
-
-/// Resend API request payload
-#[derive(Serialize)]
-struct ResendPayload {
-    from: String,
-    to: Vec<String>,
-    subject: String,
-    text: String,
-}
-
-/// Result of an email send operation
-#[derive(Debug)]
-pub enum EmailResult {
-    /// Email sent successfully
-    Ok,
-    /// Resend API returned an error
-    ApiError(String),
-    /// HTTP-level failure
-    HttpError(String),
 }
 
 impl EmailClient {
     /// Create a new email client from configuration
     ///
     /// Uses the Resend HTTP API — no SMTP configuration needed.
-    pub fn new(config: &EmailConfig) -> Result<Self, String> {
-        if config.resend_api_key.is_empty() {
-            return Err("RESEND_API_KEY is empty".to_owned());
-        }
-
+    ///
+    /// # Errors
+    ///
+    /// [`ResendError::MissingApiKey`] when the configured key is empty.
+    pub fn new(config: &EmailConfig) -> Result<Self, ResendError> {
         Ok(Self {
-            http: Client::new(),
-            api_key: config.resend_api_key.clone(),
+            resend: ResendClient::new(Client::new(), config.resend_api_key.clone())?,
             from_address: config.from_address.clone(),
             to_addresses: config.to_addresses.clone(),
         })
@@ -63,72 +42,25 @@ impl EmailClient {
     ///
     /// Fire-and-forget: spawns a background task. Errors are logged, never propagated.
     pub fn send_alert(&self, subject: &str, body: &str) {
-        let client = self.http.clone();
-        let api_key = self.api_key.clone();
-        let from = self.from_address.clone();
-        let recipients = self.to_addresses.clone();
-        let subject = subject.to_owned();
-        let body = body.to_owned();
+        let resend = self.resend.clone();
+        let email = self.alert(subject, body);
 
         tokio::spawn(async move {
-            let result =
-                send_via_resend(&client, &api_key, &from, &recipients, &subject, &body).await;
-            if let EmailResult::ApiError(e) | EmailResult::HttpError(e) = result {
+            if let Err(e) = resend.send(&email).await {
                 warn!(error = %e, "Email alert via Resend failed");
             }
         });
     }
 
-    /// Send an error alert email and return the result (awaitable)
-    pub async fn send_alert_await(&self, subject: &str, body: &str) -> EmailResult {
-        send_via_resend(
-            &self.http,
-            &self.api_key,
-            &self.from_address,
-            &self.to_addresses,
-            subject,
-            body,
-        )
-        .await
-    }
-}
-
-/// Send an email to all recipients via the Resend API
-async fn send_via_resend(
-    client: &Client,
-    api_key: &str,
-    from: &str,
-    to: &[String],
-    subject: &str,
-    body: &str,
-) -> EmailResult {
-    let payload = ResendPayload {
-        from: from.to_owned(),
-        to: to.to_vec(),
-        subject: subject.to_owned(),
-        text: body.to_owned(),
-    };
-
-    let response = match client
-        .post(RESEND_API_URL)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return EmailResult::HttpError(e.to_string()),
-    };
-
-    if response.status().is_success() {
-        EmailResult::Ok
-    } else {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "no body".to_owned());
-        EmailResult::ApiError(format!("HTTP {status}: {body}"))
+    /// The alert email for `subject` and `body`, addressed from the configured
+    /// sender to every configured recipient, as plain text.
+    fn alert(&self, subject: &str, body: &str) -> ResendEmail {
+        ResendEmail {
+            from: self.from_address.clone(),
+            to: self.to_addresses.clone(),
+            subject: subject.to_owned(),
+            body: ResendBody::Text(body.to_owned()),
+        }
     }
 }
 
@@ -143,16 +75,29 @@ mod tests {
             from_address: "alerts@dravr.ai".into(),
             to_addresses: vec!["test@dravr.ai".into()],
         };
-        assert!(EmailClient::new(&config).is_err());
+        assert!(matches!(
+            EmailClient::new(&config),
+            Err(ResendError::MissingApiKey)
+        ));
     }
 
     #[test]
-    fn email_client_accepts_valid_config() {
+    fn an_alert_is_plain_text_from_the_sender_to_every_recipient() {
         let config = EmailConfig {
             resend_api_key: "re_test_key".into(),
             from_address: "alerts@dravr.ai".into(),
             to_addresses: vec!["jf@dravr.ai".into(), "phil@dravr.ai".into()],
         };
-        assert!(EmailClient::new(&config).is_ok());
+        let client = EmailClient::new(&config).expect("valid config"); // Safe: test assertion
+
+        assert_eq!(
+            client.alert("ERROR in svc", "trace"),
+            ResendEmail {
+                from: "alerts@dravr.ai".into(),
+                to: vec!["jf@dravr.ai".into(), "phil@dravr.ai".into()],
+                subject: "ERROR in svc".into(),
+                body: ResendBody::Text("trace".into()),
+            }
+        );
     }
 }
