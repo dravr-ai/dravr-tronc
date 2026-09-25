@@ -1,5 +1,5 @@
-// ABOUTME: Tests that http::serve refuses a reachable bind with no auth hook, and ApiKeyAuthHook
-// ABOUTME: Real sockets for serve's posture; the router for the hook's 401 challenge and admission
+// ABOUTME: Tests http::serve refusing a reachable bind with no auth hook, ApiKeyAuthHook's 401/200,
+// ABOUTME: and the Origin/bearer header helpers a host's own route shares with POST /mcp
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -22,9 +22,10 @@ use dravr_tronc::mcp::protocol::JsonRpcRequest;
 use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
-use dravr_tronc::mcp::transport::http::{mcp_router, serve};
+use dravr_tronc::mcp::transport::http::{bearer_token, mcp_router, origin_allowed, serve};
 use dravr_tronc::server::auth::InsecureBindError;
-use http::Request;
+use http::header::{HeaderName, AUTHORIZATION, ORIGIN};
+use http::{HeaderMap, HeaderValue, Request};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -295,4 +296,59 @@ async fn the_hook_fails_closed_when_its_key_is_unset_or_empty() {
 fn the_realm_is_escaped_into_a_quoted_string() {
     let hook = ApiKeyAuthHook::new("UNUSED", r#"a "quoted" \ realm"#);
     assert_eq!(hook.challenge(), r#"Bearer realm="a \"quoted\" \\ realm""#);
+}
+
+// ---- the header helpers a host's own route shares with POST /mcp ----
+
+fn headers(name: HeaderName, value: HeaderValue) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    map.insert(name, value);
+    map
+}
+
+#[test]
+fn origin_allowed_reads_the_header_as_post_mcp_does() {
+    let none: &[String] = &[];
+    // No Origin: a non-browser client.
+    assert!(origin_allowed(&HeaderMap::new(), none));
+    // An empty list admits loopback origins only — not every origin.
+    assert!(origin_allowed(
+        &headers(ORIGIN, HeaderValue::from_static("http://localhost:3000")),
+        none
+    ));
+    assert!(!origin_allowed(
+        &headers(ORIGIN, HeaderValue::from_static("https://evil.example")),
+        none
+    ));
+    // A present Origin that is not text is refused, never read as absent.
+    let opaque = HeaderValue::from_bytes(b"https://\xff.example").expect("header bytes");
+    assert!(!origin_allowed(&headers(ORIGIN, opaque.clone()), none));
+    assert!(!origin_allowed(
+        &headers(ORIGIN, opaque),
+        &["https://app.example".to_owned()]
+    ));
+    assert!(origin_allowed(
+        &headers(ORIGIN, HeaderValue::from_static("https://app.example")),
+        &["https://app.example".to_owned()]
+    ));
+}
+
+#[test]
+fn bearer_token_reads_the_header_as_post_mcp_does() {
+    assert_eq!(
+        bearer_token(&headers(
+            AUTHORIZATION,
+            HeaderValue::from_static("bearer tok-1")
+        )),
+        Some("tok-1".to_owned()),
+        "the scheme is case-insensitive (RFC 7235 §2.1)"
+    );
+    assert_eq!(
+        bearer_token(&headers(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcg==")
+        )),
+        None
+    );
+    assert_eq!(bearer_token(&HeaderMap::new()), None);
 }

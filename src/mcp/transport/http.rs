@@ -116,14 +116,9 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // 1. Origin allowlist (DNS-rebinding protection). A present Origin that is
-    // not readable text is judged as the empty origin, which no list admits
-    // but `"*"`: present-and-invalid is a 403, never read as absent.
-    let origin = headers
-        .get(header::ORIGIN)
-        .map(|v| v.to_str().unwrap_or_default());
-    if !is_origin_allowed(origin, server.allowed_origins()) {
-        debug!(?origin, "Rejected MCP request: origin not allowed");
+    // 1. Origin allowlist (DNS-rebinding protection).
+    if !origin_allowed(&headers, server.allowed_origins()) {
+        debug!(origin = ?headers.get(header::ORIGIN), "Rejected MCP request: origin not allowed");
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
 
@@ -257,6 +252,21 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
     }
 }
 
+/// Whether a request with these `headers` passes the `allowed` `Origin` list —
+/// [`is_origin_allowed`] applied to the request's `Origin` header.
+///
+/// A present `Origin` that is not readable text is judged as the empty origin,
+/// which no list admits but `"*"`: present-and-invalid is refused, never read
+/// as absent. Public so a host serving another route over the same catalog
+/// gates it by reading the header exactly as `POST /mcp` does.
+#[must_use]
+pub fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or_default());
+    is_origin_allowed(origin, allowed)
+}
+
 /// Whether a request carrying `origin` passes the `allowed` list — the gate
 /// MCP requires on every Streamable HTTP request to stop DNS rebinding.
 ///
@@ -267,8 +277,8 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
 /// - a list containing `"*"`: every origin is accepted, by explicit opt-in
 /// - otherwise the origin must be listed exactly
 ///
-/// Public so a host serving another route over the same catalog can apply the
-/// same gate rather than a copy of it.
+/// A host gating an HTTP route reads the header through [`origin_allowed`];
+/// this is the rule it applies, for a caller that already holds the origin.
 #[must_use]
 pub fn is_origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
     origin.is_none_or(|origin| {
@@ -327,7 +337,12 @@ fn is_port(port: &str) -> bool {
 
 /// The bearer credential of the request's `Authorization` header, read with
 /// the crate's one scheme parser ([`bearer_credential`]).
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+///
+/// Public so a host serving another route over the same catalog hands its
+/// [`AuthHook`](crate::mcp::auth::AuthHook) exactly the credential `POST /mcp`
+/// would.
+#[must_use]
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
