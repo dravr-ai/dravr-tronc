@@ -1,5 +1,5 @@
 // ABOUTME: Host-supplied authentication seam for the HTTP transport (RFC 9728 resource server)
-// ABOUTME: AuthHook resolves a per-call ToolContext from a request; AuthError maps to 401/403
+// ABOUTME: AuthHook resolves a per-call ToolContext from a request; AuthError maps to 401/403/429/500
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -11,7 +11,8 @@
 //! a request (whose bearer token + headers the transport has populated) into a
 //! per-call [`crate::mcp::tool::ToolContext`], or to reject it. The HTTP
 //! transport renders an [`AuthError`] as the matching status code: `401` with a
-//! `WWW-Authenticate` challenge (RFC 9728) or `403`.
+//! `WWW-Authenticate` challenge (RFC 9728), `403`, `429` with `Retry-After`, or
+//! `500`.
 //!
 //! **Which mechanism?** This crate ships five, and the choice is made by what
 //! the caller can present, per route — not by which one has no feature flag.
@@ -61,6 +62,32 @@ pub enum AuthError {
         /// `Bearer error="insufficient_scope", scope="fitness:write"`.
         www_authenticate: String,
         /// Human-readable reason (returned in the response body).
+        reason: String,
+    },
+    /// `429 Too Many Requests` with a `Retry-After` header — the credential is
+    /// valid, but its request budget is spent until its window frees capacity.
+    ///
+    /// Distinct from [`Self::Unauthorized`] because the remedies are opposite:
+    /// a client told its token is invalid refreshes it and re-authorizes, which
+    /// a spent budget refuses again, while a client told to slow down waits.
+    /// The transport renders the wait both as the `Retry-After` header and as
+    /// `data.retry_after_secs` on the JSON-RPC error, so the two never differ.
+    RateLimited {
+        /// Seconds until the same request can succeed, floored at one when
+        /// rendered: a refusal still in force never reads as "retry now".
+        retry_after_secs: u64,
+        /// Human-readable reason (returned in the response body).
+        reason: String,
+    },
+    /// `500 Internal Server Error` — a failure on the host's side (a database
+    /// read, a dependency it calls) interrupted authentication before it could
+    /// decide.
+    ///
+    /// It says nothing about the credential, so it must not be rendered as a
+    /// `401`, which sends a client to discard a good token and re-authorize.
+    Internal {
+        /// Human-readable reason (returned in the response body). Never the
+        /// underlying error's text, which is the host's to log.
         reason: String,
     },
 }

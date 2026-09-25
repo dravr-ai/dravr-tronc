@@ -19,7 +19,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use crate::error::{UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
+use crate::error::{INTERNAL_ERROR, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
@@ -81,9 +81,10 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 ///
 /// Enforces the `Origin` allowlist (403), refuses a body that is not a
 /// JSON-RPC Request (400), authenticates via the server's hook (401 +
-/// `WWW-Authenticate` on rejection, per RFC 9728), then dispatches under the
-/// resolved per-call context. A request's response is rendered as JSON or SSE;
-/// an accepted notification is answered 202 Accepted with no body.
+/// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
+/// spent budget; 500 when the host failed to decide), then dispatches under
+/// the resolved per-call context. A request's response is rendered as JSON or
+/// SSE; an accepted notification is answered 202 Accepted with no body.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     headers: HeaderMap,
@@ -144,41 +145,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     // 4. Authenticate (RFC 9728 resource-server posture).
     let ctx = match server.authenticate(&request).await {
         Ok(ctx) => ctx,
-        Err(AuthError::Unauthorized { www_authenticate }) => {
-            // RFC 9728 401 + WWW-Authenticate, with a JSON-RPC error body so
-            // clients can parse the rejection (not a bare text body).
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, www_authenticate)],
-                Json(JsonRpcResponse::error(
-                    None,
-                    UNAUTHORIZED,
-                    "Unauthorized".to_owned(),
-                )),
-            )
-                .into_response();
-        }
-        Err(AuthError::Forbidden { reason }) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
-            )
-                .into_response();
-        }
-        Err(AuthError::InsufficientScope {
-            www_authenticate,
-            reason,
-        }) => {
-            // RFC 6750 §3.1: an insufficient-scope refusal is a 403 that still
-            // carries the challenge, so the client learns which grant it needs
-            // rather than only that it was refused.
-            return (
-                StatusCode::FORBIDDEN,
-                [(header::WWW_AUTHENTICATE, www_authenticate)],
-                Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
-            )
-                .into_response();
-        }
+        Err(refusal) => return auth_refusal_response(refusal),
     };
 
     // 5. Dispatch under the resolved context.
@@ -200,6 +167,67 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         respond_sse(&response)
     } else {
         Json(response).into_response()
+    }
+}
+
+/// Render an [`AuthHook`](crate::mcp::auth::AuthHook) refusal as its status
+/// code, with a JSON-RPC error body so clients can parse it (never a bare text
+/// body).
+fn auth_refusal_response(refusal: AuthError) -> Response {
+    match refusal {
+        AuthError::Unauthorized { www_authenticate } => (
+            // RFC 9728: 401 with the `WWW-Authenticate` challenge.
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, www_authenticate)],
+            Json(JsonRpcResponse::error(
+                None,
+                UNAUTHORIZED,
+                "Unauthorized".to_owned(),
+            )),
+        )
+            .into_response(),
+        AuthError::Forbidden { reason } => (
+            StatusCode::FORBIDDEN,
+            Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
+        )
+            .into_response(),
+        // RFC 6750 §3.1: an insufficient-scope refusal is a 403 that still
+        // carries the challenge, so the client learns which grant it needs
+        // rather than only that it was refused.
+        AuthError::InsufficientScope {
+            www_authenticate,
+            reason,
+        } => (
+            StatusCode::FORBIDDEN,
+            [(header::WWW_AUTHENTICATE, www_authenticate)],
+            Json(JsonRpcResponse::error(None, UNAUTHORIZED, reason)),
+        )
+            .into_response(),
+        // A valid credential over its budget: 429, never 401, so the client
+        // waits instead of discarding a good token. The header and the body
+        // carry the same wait.
+        AuthError::RateLimited {
+            retry_after_secs,
+            reason,
+        } => {
+            let retry_after_secs = retry_after_secs.max(1);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after_secs.to_string())],
+                Json(JsonRpcResponse::error_with_data(
+                    None,
+                    RATE_LIMITED,
+                    reason,
+                    serde_json::json!({ "retry_after_secs": retry_after_secs }),
+                )),
+            )
+                .into_response()
+        }
+        AuthError::Internal { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JsonRpcResponse::error(None, INTERNAL_ERROR, reason)),
+        )
+            .into_response(),
     }
 }
 
@@ -926,6 +954,132 @@ mod tests {
         assert!(
             challenge.contains("fitness:write"),
             "challenge names the scope the client must ask for: {challenge}"
+        );
+    }
+
+    /// A hook that refuses every request with the one [`AuthError`] it holds.
+    struct RefusingHook(AuthError);
+
+    #[async_trait::async_trait]
+    impl AuthHook<TestState> for RefusingHook {
+        async fn authenticate(
+            &self,
+            _request: &JsonRpcRequest,
+            _state: &Arc<TestState>,
+        ) -> Result<ToolContext, AuthError> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// POST a `tools/call` through a server whose hook refuses with `refusal`.
+    async fn refused_call(refusal: AuthError) -> Response {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HelloTool));
+        let server = Arc::new(
+            McpServer::new("test", "0.1.0", registry, Arc::new(TestState))
+                .with_auth_hook(Arc::new(RefusingHook(refusal))),
+        );
+        mcp_router(server)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                               "params":{"name":"hello","arguments":{}}})
+                        .to_string(),
+                    )
+                    .expect("request"), // Safe: test fixture
+            )
+            .await
+            .expect("response") // Safe: test fixture
+    }
+
+    /// The JSON body of `response`.
+    async fn json_body(response: Response) -> Value {
+        serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body") // Safe: test fixture
+                .to_bytes(),
+        )
+        .expect("json body") // Safe: test fixture
+    }
+
+    /// A spent budget is a 429 carrying the wait, never a 401.
+    ///
+    /// A 401 tells an OAuth client its token is dead, so it refreshes and
+    /// re-authorizes, and the budget refuses it again. The header and the
+    /// JSON-RPC error carry the same wait, and no challenge is sent.
+    #[tokio::test]
+    async fn rate_limited_returns_429_with_retry_after() {
+        let response = refused_call(AuthError::RateLimited {
+            retry_after_secs: 42,
+            reason: "Request budget spent".to_owned(),
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("a 429 must carry Retry-After"), // Safe: test assertion
+            "42"
+        );
+        assert!(
+            response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "a spent budget is not a credential challenge"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], RATE_LIMITED);
+        assert_eq!(body["error"]["message"], "Request budget spent");
+        assert_eq!(body["error"]["data"]["retry_after_secs"], 42);
+    }
+
+    /// A zero wait still reads as a wait: the refusal is in force.
+    #[tokio::test]
+    async fn rate_limited_floors_the_wait_at_one_second() {
+        let response = refused_call(AuthError::RateLimited {
+            retry_after_secs: 0,
+            reason: "Request budget spent".to_owned(),
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("a 429 must carry Retry-After"), // Safe: test assertion
+            "1"
+        );
+        assert_eq!(
+            json_body(response).await["error"]["data"]["retry_after_secs"],
+            1
+        );
+    }
+
+    /// A host-side failure during authentication is a 500, never a 401 that
+    /// would send the client to discard a good token.
+    #[tokio::test]
+    async fn internal_returns_500_without_a_challenge() {
+        let response = refused_call(AuthError::Internal {
+            reason: "Authentication is temporarily unavailable".to_owned(),
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(
+            body["error"]["message"],
+            "Authentication is temporarily unavailable"
         );
     }
 
