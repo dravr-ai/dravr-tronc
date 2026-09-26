@@ -64,6 +64,8 @@ tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 
 [dev-dependencies]
+# Encodes a test RSA key's modulus the way a JWK set publishes it.
+base64 = "0.22"
 serial_test = "3"
 http = "1"
 http-body-util = "0.1"

@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -16,46 +15,15 @@ use axum::Json;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::error::IamError;
+use super::key_set::{GoogleKeySet, GOOGLE_OIDC_JWKS_URL};
 use crate::error::ErrorResponse;
-use crate::http_client::describe_request_error;
 use crate::server::auth::bearer_credential;
-
-/// Google's published signing keys for identity tokens.
-const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 
 /// Accepted issuers. Google mints with both spellings.
 const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
-
-/// How long signing keys are reused.
-///
-/// Google rotates on the order of days, so an hour is conservative. A `kid`
-/// miss also forces a refetch, which is what actually covers rotation — this
-/// bound only stops the cache going stale forever on a quiet service.
-const JWKS_TTL: Duration = Duration::from_hours(1);
-
-/// One RSA key from the JWK set.
-#[derive(Debug, Clone, Deserialize)]
-struct Jwk {
-    kid: String,
-    n: String,
-    e: String,
-}
-
-/// The JWK set as Google publishes it.
-#[derive(Debug, Clone, Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
-}
-
-/// A fetched key set and when it arrived.
-struct CachedJwks {
-    jwks: Jwks,
-    fetched_at: Instant,
-}
 
 /// The claims this verifier cares about.
 #[derive(Debug, Deserialize)]
@@ -67,6 +35,9 @@ pub struct IdTokenClaims {
     /// Service account email, present on `format=full` tokens.
     #[serde(default)]
     pub email: Option<String>,
+    /// Whether Google vouches for `email`; present alongside it.
+    #[serde(default)]
+    pub email_verified: Option<bool>,
 }
 
 /// Verifies Google identity tokens for one audience.
@@ -82,22 +53,30 @@ pub struct IdTokenClaims {
 pub struct GoogleIdTokenVerifier {
     audience: String,
     allowed_emails: HashSet<String>,
-    http: Client,
-    jwks: RwLock<Option<CachedJwks>>,
+    keys: GoogleKeySet,
 }
 
 impl GoogleIdTokenVerifier {
     /// Verify tokens minted for `audience`, from any Google caller.
     ///
     /// The audience must match what the caller asked for exactly — for Cloud
-    /// Run, the service URL with no trailing slash.
+    /// Run, the service URL with no trailing slash. Keys come from
+    /// [`GOOGLE_OIDC_JWKS_URL`].
     #[must_use]
     pub fn new(audience: impl Into<String>, http: Client) -> Self {
+        Self::with_key_set(audience, GoogleKeySet::new(GOOGLE_OIDC_JWKS_URL, http))
+    }
+
+    /// Verify tokens minted for `audience` against the keys `keys` serves.
+    ///
+    /// For a host that reads the key-set URL from configuration, or sets the
+    /// cache's refetch interval, rather than taking Google's defaults.
+    #[must_use]
+    pub fn with_key_set(audience: impl Into<String>, keys: GoogleKeySet) -> Self {
         Self {
             audience: audience.into(),
             allowed_emails: HashSet::new(),
-            http,
-            jwks: RwLock::new(None),
+            keys,
         }
     }
 
@@ -105,7 +84,9 @@ impl GoogleIdTokenVerifier {
     ///
     /// An empty allowlist accepts any caller whose token carries the right
     /// audience, which on Cloud Run means anyone IAM granted `run.invoker`.
-    /// Naming the callers narrows that to the ones actually expected.
+    /// Naming the callers narrows that to the ones actually expected, and a
+    /// named caller is accepted only when the token says Google verified its
+    /// email: an unverified address proves nothing about who holds it.
     #[must_use]
     pub fn allowing(mut self, emails: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.allowed_emails = emails.into_iter().map(Into::into).collect();
@@ -118,27 +99,18 @@ impl GoogleIdTokenVerifier {
     ///
     /// [`IamError::Rejected`] when the token is malformed, signed by a key that
     /// is not Google's, minted for another audience, expired, or from a caller
-    /// outside the allowlist. [`IamError::JwksUnavailable`] when the signing
-    /// keys could not be fetched — kept distinct so an outage fetching keys is
-    /// not recorded as somebody presenting a bad token.
+    /// outside the allowlist or whose email Google has not verified.
+    /// [`IamError::JwksUnavailable`] when the signing keys could not be
+    /// fetched — kept distinct so an outage fetching keys is not recorded as
+    /// somebody presenting a bad token.
     pub async fn verify(&self, token: &str) -> Result<IdTokenClaims, IamError> {
         let header = decode_header(token).map_err(|e| IamError::Rejected(e.to_string()))?;
         let kid = header
             .kid
             .ok_or_else(|| IamError::Rejected("token header carries no kid".to_owned()))?;
 
-        let key = match self.key_for(&kid, false).await? {
-            Some(key) => key,
-            // Unknown `kid` means rotation, so refetch once before rejecting.
-            // Without this a rotation locks every caller out until the TTL
-            // lapses, which is an outage caused by the defence rather than by
-            // anything an attacker did.
-            None => self.key_for(&kid, true).await?.ok_or_else(|| {
-                IamError::Rejected(format!("no Google signing key for kid {kid}"))
-            })?,
-        };
-
-        let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e)
+        let key = self.keys.key(&kid).await?;
+        let decoding_key = DecodingKey::from_rsa_components(key.modulus(), key.exponent())
             .map_err(|e| IamError::Rejected(e.to_string()))?;
 
         // Validation enforces exp itself; audience and issuer are set here so a
@@ -158,37 +130,14 @@ impl GoogleIdTokenVerifier {
                     "caller {email} is not in this service's allowlist"
                 )));
             }
-        }
-
-        Ok(data.claims)
-    }
-
-    /// Look up a signing key, optionally forcing a refetch first.
-    async fn key_for(&self, kid: &str, force_refresh: bool) -> Result<Option<Jwk>, IamError> {
-        if !force_refresh {
-            if let Some(cached) = self.jwks.read().await.as_ref() {
-                if cached.fetched_at.elapsed() < JWKS_TTL {
-                    return Ok(cached.jwks.keys.iter().find(|k| k.kid == kid).cloned());
-                }
+            if data.claims.email_verified != Some(true) {
+                return Err(IamError::Rejected(format!(
+                    "caller {email} is not a verified address"
+                )));
             }
         }
 
-        let jwks: Jwks = self
-            .http
-            .get(GOOGLE_JWKS_URL)
-            .send()
-            .await
-            .map_err(|e| IamError::JwksUnavailable(describe_request_error(e)))?
-            .json()
-            .await
-            .map_err(|e| IamError::JwksUnavailable(describe_request_error(e)))?;
-
-        let found = jwks.keys.iter().find(|k| k.kid == kid).cloned();
-        *self.jwks.write().await = Some(CachedJwks {
-            jwks,
-            fetched_at: Instant::now(),
-        });
-        Ok(found)
+        Ok(data.claims)
     }
 }
 

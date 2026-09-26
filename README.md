@@ -124,7 +124,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
-| `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called |
+| `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called; `GoogleKeySet`, the cache of Google's signing keys for one key-set URL, refetching for an unknown `kid` at most every 30s |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
 | `notifications::ResendClient` *(feature `notifications`)* | The one Resend send path — alert and transactional mail — retrying a `429` within the advertised reset |
 | `server::request_guard` | Request ids, panic → JSON `500`, per-router deadline → JSON `504`, completion and dropped-request logs |
