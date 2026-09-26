@@ -1,5 +1,5 @@
 // ABOUTME: Google Cloud service-to-service identity-token auth, both ends of the handshake
-// ABOUTME: IdTokenSource for the caller, GoogleIdTokenVerifier + middleware for the callee
+// ABOUTME: IdTokenSource for the caller; GoogleIdTokenVerifier, its GoogleKeySet and middleware for the callee
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -22,6 +22,19 @@
 //!   checks the signature against Google's published keys, pins the audience so
 //!   a token minted for another service is refused, and optionally names the
 //!   service accounts it expects.
+//! - [`GoogleKeySet`] — the verifier's cache of Google's published keys, one
+//!   per key-set URL. It is public because the same cache serves every
+//!   Google-signed token a service checks: a host verifying Firebase ID tokens
+//!   points one at Firebase's key set and keeps its own claim checks on top.
+//!
+//! ## Unknown key ids
+//!
+//! A token names its signing key by `kid` before anything about it is
+//! verified, and an unknown `kid` is how a key rotation first shows up. The
+//! cache therefore refetches on a miss, but never within
+//! [`MIN_REFETCH_INTERVAL`] of its last fetch: a `kid` still unknown after a
+//! refetch is refused from memory until the next one is allowed, so made-up
+//! key ids cannot turn each request into a fetch from Google.
 //!
 //! ## What this is, relative to Cloud Run's own check
 //!
@@ -52,9 +65,11 @@
 //! workload on Google infrastructure.
 
 mod error;
+mod key_set;
 mod token_source;
 mod verify;
 
 pub use error::IamError;
+pub use key_set::{GoogleKeySet, GoogleSigningKey, GOOGLE_OIDC_JWKS_URL, MIN_REFETCH_INTERVAL};
 pub use token_source::{IdTokenSource, METADATA_HOST_ENV};
 pub use verify::{require_google_id_token, GoogleIdTokenVerifier, IdTokenClaims};
