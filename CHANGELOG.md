@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.0] — 2026-09-26
+
+### Fixed
+
+- fix(iam)!: GoogleKeySet refetches for an unknown kid at most every 30s
+
+
+
 ## [2.1.0] — 2026-09-25
 
 
