@@ -44,7 +44,11 @@ otel = [
 async-trait = "0.1"
 axum = "0.8"
 bitflags = "2"
-jsonwebtoken = { version = "9", optional = true }
+# 10.3 is the first release past the claim type-confusion advisory, and the
+# line the platform verifies its own JWTs on, so a host enabling google-iam
+# resolves one jsonwebtoken. rust_crypto is the platform's backend too; the
+# verifier builds its key from RSA components, so it needs no PEM parsing.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
@@ -66,6 +70,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "s
 [dev-dependencies]
 # Encodes a test RSA key's modulus the way a JWK set publishes it.
 base64 = "0.22"
+# The key-set tests sign with an openssl PEM key, which only use_pem can read.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 serial_test = "3"
 http = "1"
 http-body-util = "0.1"
