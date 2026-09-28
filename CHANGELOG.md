@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.1.0] — 2026-09-28
+
+### Added
+
+- feat(mcp): POST /mcp forwards the request headers to the auth hook
+
+### Fixed
+
+- fix(iam): jsonwebtoken 10.3, past the claim type-confusion advisory
+
+
 ## [3.0.0] — 2026-09-26
 
 ### Fixed
