@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::stream;
+use serde_json::Value;
 use tokio::net::{lookup_host, TcpListener};
 use tracing::{debug, error, info};
 
@@ -135,6 +137,10 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     // comes from the `Authorization` header only; `parse` never reads one out
     // of the body.
     request.auth_token = bearer_token(&headers);
+    // Every other header reaches the hook too, so a host can tell which of its
+    // public origins the client dialed — an RFC 9728 challenge must name that
+    // one — without the transport knowing what a host reads.
+    request.headers = forwarded_headers(&headers);
     // `MCP-Protocol-Version` is the client's standing assertion of what was
     // negotiated at `initialize`. On a stateless server there is no session to
     // check it against, so this is the only place it can be judged — and until
@@ -348,6 +354,39 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_credential)
         .map(str::to_owned)
+}
+
+/// Headers a transport never forwards in [`JsonRpcRequest::headers`]: the
+/// bearer already travels as [`JsonRpcRequest::auth_token`], and a cookie or a
+/// proxy credential is nothing a JSON-RPC handler should hold.
+const WITHHELD_HEADERS: [header::HeaderName; 3] = [
+    header::AUTHORIZATION,
+    header::COOKIE,
+    header::PROXY_AUTHORIZATION,
+];
+
+/// The request's HTTP headers as [`JsonRpcRequest::headers`] carries them.
+///
+/// The [`AuthHook`](crate::mcp::auth::AuthHook) reads them under lower-case
+/// names, as strings, credentials withheld. A value that is not visible ASCII
+/// is dropped, and a repeated header keeps its last value. `None` when nothing
+/// is left.
+///
+/// Public so a host serving another route over the same catalog hands its
+/// hook exactly the headers `POST /mcp` would.
+#[must_use]
+pub fn forwarded_headers(headers: &HeaderMap) -> Option<HashMap<String, Value>> {
+    let forwarded: HashMap<String, Value> = headers
+        .iter()
+        .filter(|(name, _)| !WITHHELD_HEADERS.contains(name))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), Value::String(value.to_owned())))
+        })
+        .collect();
+    (!forwarded.is_empty()).then_some(forwarded)
 }
 
 /// Wrap a JSON-RPC response in a single SSE event
@@ -996,6 +1035,92 @@ mod tests {
             challenge.contains("fitness:write"),
             "challenge names the scope the client must ask for: {challenge}"
         );
+    }
+
+    /// Admits a request only when it sees the forwarded host it was sent and
+    /// no credential among the headers.
+    struct HostReadingHook;
+
+    #[async_trait::async_trait]
+    impl AuthHook<TestState> for HostReadingHook {
+        async fn authenticate(
+            &self,
+            request: &JsonRpcRequest,
+            _state: &Arc<TestState>,
+        ) -> Result<ToolContext, AuthError> {
+            let headers = request.headers.clone().unwrap_or_default();
+            let host = headers.get("x-forwarded-host").and_then(Value::as_str);
+            let leaked = ["authorization", "cookie", "proxy-authorization"]
+                .iter()
+                .any(|name| headers.contains_key(*name));
+            if host == Some("mcp.example.test") && !leaked {
+                Ok(ToolContext::new().with_user("u1"))
+            } else {
+                Err(AuthError::Unauthorized {
+                    www_authenticate: format!("Bearer error=\"host {host:?} leaked {leaked}\""),
+                })
+            }
+        }
+    }
+
+    /// The hook reads the dialed host from the forwarded headers, and never a
+    /// credential: the bearer arrives as `auth_token` only, the cookie not at
+    /// all.
+    #[tokio::test]
+    async fn hook_sees_forwarded_headers_without_credentials() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HelloTool));
+        let server = Arc::new(
+            McpServer::new("test", "0.1.0", registry, Arc::new(TestState))
+                .with_auth_hook(Arc::new(HostReadingHook)),
+        );
+        let response = mcp_router(server)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-host", "mcp.example.test")
+                    .header("authorization", "Bearer secret-token")
+                    .header("cookie", "session=secret")
+                    .header("proxy-authorization", "Basic c2VjcmV0")
+                    .body(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                               "params":{"name":"hello","arguments":{}}})
+                        .to_string(),
+                    )
+                    .expect("request"), // Safe: test fixture
+            )
+            .await
+            .expect("response"); // Safe: test fixture
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert_eq!(status, StatusCode::OK, "hook refused: {challenge:?}");
+    }
+
+    /// Credentials never enter the forwarded map; every other header does,
+    /// under its lower-case name.
+    #[test]
+    fn forwarded_headers_withholds_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer t".parse().expect("value")); // Safe: test fixture
+        headers.insert(header::COOKIE, "a=b".parse().expect("value")); // Safe: test fixture
+        let host = "app.example.test".parse().expect("value"); // Safe: test fixture
+        headers.insert("X-Forwarded-Host", host);
+        let forwarded = forwarded_headers(&headers).expect("one header remains"); // Safe: test fixture
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded.get("x-forwarded-host"),
+            Some(&Value::String("app.example.test".to_owned()))
+        );
+
+        let mut only_credentials = HeaderMap::new();
+        only_credentials.insert(header::COOKIE, "a=b".parse().expect("value")); // Safe: test fixture
+        assert_eq!(forwarded_headers(&only_credentials), None);
     }
 
     /// A hook that refuses every request with the one [`AuthError`] it holds.
