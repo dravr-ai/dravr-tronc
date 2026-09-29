@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, Algorithm, Validation};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::warn;
@@ -104,14 +104,7 @@ impl GoogleIdTokenVerifier {
     /// fetched — kept distinct so an outage fetching keys is not recorded as
     /// somebody presenting a bad token.
     pub async fn verify(&self, token: &str) -> Result<IdTokenClaims, IamError> {
-        let header = decode_header(token).map_err(|e| IamError::Rejected(e.to_string()))?;
-        let kid = header
-            .kid
-            .ok_or_else(|| IamError::Rejected("token header carries no kid".to_owned()))?;
-
-        let key = self.keys.key(&kid).await?;
-        let decoding_key = DecodingKey::from_rsa_components(key.modulus(), key.exponent())
-            .map_err(|e| IamError::Rejected(e.to_string()))?;
+        let decoding_key = self.keys.decoding_key_for(token).await?;
 
         // Validation enforces exp itself; audience and issuer are set here so a
         // token minted for a different service, or by a different issuer, is

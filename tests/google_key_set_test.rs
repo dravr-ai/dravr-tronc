@@ -30,7 +30,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use dravr_tronc::iam::{GoogleIdTokenVerifier, GoogleKeySet, IamError};
 use futures::future::join_all;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{decode, encode, Algorithm, EncodingKey, Header, Validation};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -394,4 +394,75 @@ async fn an_allowlisted_caller_whose_email_google_did_not_verify_is_refused() {
         .expect("the same caller with a verified email is accepted");
     assert_eq!(accepted.email.as_deref(), Some(CALLER));
     assert_eq!(accepted.email_verified, Some(true));
+}
+
+#[tokio::test]
+async fn a_tokens_own_kid_yields_the_key_that_verifies_it() {
+    let signer = Signer::generate();
+    let other = Signer::generate();
+    let server = KeySetServer::start(&[signer.jwk("published-kid"), other.jwk("other-kid")]).await;
+    let keys =
+        GoogleKeySet::new(&server.url, Client::new()).with_min_refetch_interval(LONG_INTERVAL);
+    let token = signer.mint("published-kid", &Claims::for_caller());
+
+    let key = keys
+        .decoding_key_for(&token)
+        .await
+        .expect("the kid is published");
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[AUDIENCE]);
+    let claims = decode::<Value>(&token, &key, &validation)
+        .expect("the key the kid names verifies the token")
+        .claims;
+    assert_eq!(claims["email"], CALLER);
+
+    // The same claims signed by another published key do not verify under
+    // the kid this token claims: the key follows the header, not a guess.
+    let forged = {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("published-kid".to_owned());
+        let key = EncodingKey::from_rsa_pem(other.private_pem.as_bytes()).expect("RSA PEM");
+        encode(&header, &Claims::for_caller(), &key).expect("token encodes")
+    };
+    let key = keys
+        .decoding_key_for(&forged)
+        .await
+        .expect("the kid is published");
+    assert!(decode::<Value>(&forged, &key, &validation).is_err());
+    assert_eq!(server.fetches(), 1, "one fetch answers every lookup");
+}
+
+#[tokio::test]
+async fn a_token_without_a_kid_or_naming_an_unknown_one_is_refused() {
+    let signer = Signer::generate();
+    let server = KeySetServer::start(&[signer.jwk("published-kid")]).await;
+    let keys =
+        GoogleKeySet::new(&server.url, Client::new()).with_min_refetch_interval(LONG_INTERVAL);
+
+    let no_kid = encode(
+        &Header::new(Algorithm::RS256),
+        &Claims::for_caller(),
+        &EncodingKey::from_rsa_pem(signer.private_pem.as_bytes()).expect("RSA PEM"),
+    )
+    .expect("token encodes");
+    match keys.decoding_key_for(&no_kid).await {
+        Err(IamError::Rejected(why)) => assert!(why.contains("kid"), "{why}"),
+        Err(other) => panic!("expected Rejected, got {other}"),
+        Ok(_) => panic!("a token without a kid has no key"),
+    }
+    assert_eq!(
+        server.fetches(),
+        0,
+        "a missing kid is refused without a fetch"
+    );
+
+    assert_unknown_kid(
+        keys.decoding_key_for(&signer.mint("rotated-away-kid", &Claims::for_caller()))
+            .await,
+        "rotated-away-kid",
+    );
+    assert!(matches!(
+        keys.decoding_key_for("not-a-jwt").await,
+        Err(IamError::Rejected(_))
+    ));
 }

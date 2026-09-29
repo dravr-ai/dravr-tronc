@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant};
 
+use jsonwebtoken::{decode_header, DecodingKey};
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
@@ -156,6 +157,29 @@ impl GoogleKeySet {
     pub fn with_min_refetch_interval(mut self, interval: Duration) -> Self {
         self.min_refetch_interval = interval.min(KEY_SET_TTL);
         self
+    }
+
+    /// The key that verifies `token`: the published signing key its header's
+    /// `kid` names, ready for [`jsonwebtoken::decode`].
+    ///
+    /// Only the lookup is shared. Every kind of Google-signed token — an ID
+    /// token for this service, a Firebase ID token, a Google sign-in ID token
+    /// — carries its own issuer, audience and claims, so the caller decodes
+    /// with its own [`jsonwebtoken::Validation`].
+    ///
+    /// # Errors
+    ///
+    /// [`IamError::Rejected`] when the token's header cannot be read, names no
+    /// `kid`, or names a key that cannot verify an RS256 signature, and
+    /// whatever [`Self::key`] answers for that `kid`.
+    pub async fn decoding_key_for(&self, token: &str) -> Result<DecodingKey, IamError> {
+        let header = decode_header(token).map_err(|e| IamError::Rejected(e.to_string()))?;
+        let kid = header
+            .kid
+            .ok_or_else(|| IamError::Rejected("token header carries no kid".to_owned()))?;
+        let key = self.key(&kid).await?;
+        DecodingKey::from_rsa_components(key.modulus(), key.exponent())
+            .map_err(|e| IamError::Rejected(format!("signing key {kid} is unusable: {e}")))
     }
 
     /// The signing key `kid` names.
