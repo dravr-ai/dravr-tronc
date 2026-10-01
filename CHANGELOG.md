@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.3.0] — 2026-10-01
+
+### Added
+
+- feat(client): ServiceClient, the client half of request_guard
+
+
 ## [3.2.0] — 2026-09-29
 
 ### Added
