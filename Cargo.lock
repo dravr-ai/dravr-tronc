@@ -425,6 +425,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "hyper",
  "jsonwebtoken",
  "opentelemetry",
  "opentelemetry-otlp",

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // JSON-RPC Error Codes (per JSON-RPC 2.0 spec)
@@ -79,14 +79,14 @@ pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32_022;
 ///
 /// Used by the bearer auth middleware and health check handlers.
 /// Projects can also use this for their own REST error responses.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     /// Error details
     pub error: ErrorDetail,
 }
 
 /// Details within an error response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorDetail {
     /// Machine-readable error type (e.g. `authentication_error`)
     #[serde(rename = "type")]
@@ -117,6 +117,19 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serialize"); // Safe: test assertion
         assert_eq!(json["error"]["type"], "test_error");
         assert_eq!(json["error"]["message"], "something broke");
+    }
+
+    #[test]
+    fn error_response_round_trips() {
+        let sent = ErrorResponse::new("handler_panic", "m");
+        let wire = serde_json::to_string(&sent).expect("serialize"); // Safe: test assertion
+        let read: ErrorResponse = serde_json::from_str(&wire).expect("deserialize"); // Safe: test assertion
+        assert_eq!(read.error.error_type, "handler_panic");
+        assert_eq!(read.error.message, "m");
+
+        // A service's own flat `{"error": "<marker>"}` is another shape, and
+        // must not be read as this one.
+        assert!(serde_json::from_str::<ErrorResponse>(r#"{"error":"x"}"#).is_err());
     }
 
     #[test]

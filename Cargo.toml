@@ -28,6 +28,11 @@ computation = ["dep:schemars"]
 # Opt-in because it pulls a JWT stack, and a stdio-only MCP server has no use
 # for it — the platform also holds an 80MB binary budget.
 google-iam = ["http-client", "dep:jsonwebtoken"]
+# The client half of `server::request_guard`: `ServiceClient` calls another
+# dravr service under a Google ID token and a fresh request id, and reads the
+# guard's own answers. Opt-in because it names hyper to tell a connection
+# closed before any response from the other ways a send fails.
+service-client = ["google-iam", "dep:hyper"]
 # OTLP-based distributed tracing export. When enabled, `tracing_init::init`
 # also wires a `tracing-opentelemetry` layer that exports spans via OTLP
 # (gRPC) to whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at —
@@ -53,6 +58,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = { version = "0.4", optional = true }
+# Must be the hyper reqwest 0.12 links (1.x): the closed-connection check
+# downcasts to hyper::Error, and a second hyper would never match.
+hyper = { version = "1", default-features = false, optional = true }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"], optional = true }

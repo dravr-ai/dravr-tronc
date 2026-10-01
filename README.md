@@ -125,9 +125,11 @@ once, last. See [Request guard](#request-guard).
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called; `GoogleKeySet`, the cache of Google's signing keys for one key-set URL, refetching for an unknown `kid` at most every 30s |
+| `service_client` *(feature `service-client`)* | `ServiceClient` — the client half of `server::request_guard`: ID-token auth (none on loopback), a fresh `x-request-id` per attempt, one re-send of a GET whose connection closed, shed and could-not-finish answers as typed errors |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
 | `notifications::ResendClient` *(feature `notifications`)* | The one Resend send path — alert and transactional mail — retrying a `429` within the advertised reset |
 | `server::request_guard` | Request ids, panic → JSON `500`, per-router deadline → JSON `504`, completion and dropped-request logs |
+| `server::shed` | `shed_response` — the `503` + `Retry-After` + `retry_after_secs` answer of a service that will not start a request |
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP |
@@ -257,6 +259,55 @@ let app = rest_routes
 
 **A contained panic needs `panic = "unwind"`.** Under `panic = "abort"` the first panic terminates
 the process and every in-flight request with it; no middleware can answer anything there.
+
+## Service client
+
+`service_client::ServiceClient` (feature `service-client`) is the caller's side of the request
+guard: one service calling another over HTTP.
+
+```rust
+use std::time::Duration;
+use dravr_tronc::service_client::{ServiceClient, ServiceError};
+
+let client = ServiceClient::from_env("widgets", "WIDGETS_URL", "WIDGETS_AUDIENCE",
+        Duration::from_secs(330))?
+    .ok_or(MyError::NotConfigured)?;
+
+let answer = client.get("list", "/api/widgets")
+    .query(&[("limit", "5")])
+    .header("x-session-id", session)
+    .send().await?;
+let page: WidgetPage = answer.json()?;
+
+client.post_json("create", "/api/widgets", &widget).send().await?;
+client.delete("drop", "/api/widgets/7").timeout(Duration::from_secs(10)).send().await?;
+```
+
+- **Auth.** Every request carries a Google ID token addressed to the audience, minted by
+  `iam::IdTokenSource`. A loopback base URL is called with no token, the mirror of the server's
+  ungated loopback bind. A reachable URL with no audience is refused at construction, and so is
+  one that is not `https`: the token is never sent in clear. A request path must start with `/`;
+  one that does not is refused unsent, since appended to the base URL it could name another host.
+  `from_env` answers `Ok(None)` only when the URL variable is unset or empty.
+- **Request id.** Each attempt is sent under a fresh `x-request-id`, which `guard_requests` logs
+  and echoes. It is in `Exchange` on every response and every error but `Identity`.
+- **`Ok` means the service's own handler answered**, with any status: read `status()` and
+  `json_value()` for the service's own refusals. Everything else is a `ServiceError`:
+
+| Error | When |
+|---|---|
+| `Identity` | no token could be minted; nothing was sent |
+| `Transport` | no response: `TimedOut`, `Unreachable`, `ClosedBeforeResponse` or `Other` |
+| `Shed` | a `503`, or a non-2xx naming `retry_after_secs` — see `server::shed::shed_response` |
+| `Unfinished` | the guard's `request_timeout` 504 or `handler_panic` 500, or a gateway's 504 / 502 |
+| `Body` | the status arrived and the body did not (a cut `503` / `504` / `502` is still `Shed` / `Unfinished`) |
+| `Decode` | `json::<T>()` on a body of another shape; the error says where and never quotes the body |
+
+- **One re-send.** A `get` whose connection closed before any response is sent once more, under a
+  new id; `Exchange::resent` says so. A `post_json` or `delete` is never re-sent, and neither is
+  a timeout or an answered request.
+- Set the client timeout above the service's `enforce_deadline`, so an overrun arrives as the
+  guard's `504` and not as the client's own timeout.
 
 ## Health checks
 

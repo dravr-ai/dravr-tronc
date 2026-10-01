@@ -364,7 +364,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     ///
     /// Performs era detection on each request: one carrying modern per-request
     /// `_meta` (revision 2026-07-28) is served statelessly via
-    /// [`Self::process_modern`]; otherwise it follows the legacy
+    /// `Self::process_modern`; otherwise it follows the legacy
     /// `initialize`/session path. Returns `None` for notifications (no id).
     pub async fn handle_request_with_context(
         &self,
@@ -493,7 +493,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// `initialize`: on a stateless server that header is the client's standing
     /// assertion of what was negotiated, and there is no session to check it
     /// against. Refusing an unsupported one there is the only place it can be
-    /// refused, which is why this is public while [`Self::supports_version`] is
+    /// refused, which is why this is public while `Self::supports_version` is
     /// not.
     #[must_use]
     pub fn accepts_protocol_version(&self, version: &str) -> bool {
