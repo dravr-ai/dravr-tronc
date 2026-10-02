@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.3.1] — 2026-10-02
+
+### Fixed
+
+- fix(auth): a blank API token is no key
+
+
 ## [3.3.0] — 2026-10-01
 
 ### Added
