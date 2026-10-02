@@ -38,7 +38,7 @@ use crate::error::ErrorResponse;
 ///
 /// Reads the API key from the given environment variable on every request
 /// to allow runtime key rotation without restarting. If the variable is not
-/// set or empty, all requests pass through (development mode).
+/// set, empty or blank, all requests pass through (development mode).
 ///
 /// # Usage
 ///
@@ -53,9 +53,8 @@ use crate::error::ErrorResponse;
 ///     }));
 /// ```
 pub async fn require_auth(env_var: &str, request: Request, next: Next) -> Response {
-    let expected_key = match env::var(env_var) {
-        Ok(key) if !key.is_empty() => key,
-        _ => return next.run(request).await,
+    let Some(expected_key) = configured_key(env_var) else {
+        return next.run(request).await;
     };
 
     let auth_header = request
@@ -101,14 +100,25 @@ fn auth_error(message: &str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
 
+/// The API key `env_var` holds, or `None` when it is unset or blank after
+/// trimming whitespace.
+///
+/// A blank value (`" "`, or a lone newline from a secret written with `echo`)
+/// is not a secret, so it counts as no key at all. [`require_auth`] and
+/// [`api_key_configured`] both read the key through here, so a server cannot
+/// boot believing it is enforced under a key the middleware treats otherwise.
+fn configured_key(env_var: &str) -> Option<String> {
+    env::var(env_var).ok().filter(|key| !key.trim().is_empty())
+}
+
 /// Whether `env_var` holds a usable API key.
 ///
-/// The same rule [`require_auth`] applies: unset **or** empty means no key. One
-/// definition, so a caller cannot decide "configured" differently from the
-/// middleware that enforces it.
+/// The same rule [`require_auth`] applies: unset, empty **or** blank after
+/// trimming means no key. One definition, so a caller cannot decide
+/// "configured" differently from the middleware that enforces it.
 #[must_use]
 pub fn api_key_configured(env_var: &str) -> bool {
-    matches!(env::var(env_var), Ok(key) if !key.is_empty())
+    configured_key(env_var).is_some()
 }
 
 /// The authentication posture a server resolved at startup.
@@ -338,6 +348,24 @@ mod tests {
 
         let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 200);
+        env::remove_var(ENV);
+    }
+
+    #[tokio::test]
+    async fn blank_env_is_treated_as_unset() {
+        // The middleware and api_key_configured read the key one way: a
+        // blank value is no key, so the server's posture and its gate agree.
+        const ENV: &str = "TRONC_AUTH_TEST_BLANK";
+        env::set_var(ENV, " \n");
+        let app = make_app(ENV);
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request"); // Safe: test assertion
+
+        let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
+        assert_eq!(resp.status(), 200);
+        assert!(!api_key_configured(ENV));
         env::remove_var(ENV);
     }
 
@@ -674,6 +702,22 @@ mod tests {
         env::set_var(ENV, "");
         assert!(!api_key_configured(ENV));
         assert!(resolve_startup_auth("0.0.0.0", api_key_configured(ENV)).is_err());
+        env::remove_var(ENV);
+    }
+
+    #[test]
+    fn a_blank_key_is_no_key() {
+        // A whitespace-only value is not a secret: a reachable server holding
+        // only that must refuse to start, exactly as with no key at all.
+        const ENV: &str = "TRONC_AUTH_TEST_POSTURE_BLANK";
+        for blank in [" ", "\n", " \t\r\n"] {
+            env::set_var(ENV, blank);
+            assert!(!api_key_configured(ENV), "{blank:?} counted as a key");
+            assert!(
+                resolve_startup_auth("0.0.0.0", api_key_configured(ENV)).is_err(),
+                "{blank:?} let a reachable server start"
+            );
+        }
         env::remove_var(ENV);
     }
 }
