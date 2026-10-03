@@ -32,6 +32,7 @@ use crate::mcp::tasks::{
     TaskManager, TaskOwner, TASKS_EXTENSION_ID,
 };
 use crate::mcp::tool::{RequestMeta, ToolContext, ToolRegistry};
+use crate::mcp::transport::mirror::{carries_param_header, check_param_headers};
 
 /// The protocol revisions a default [`McpServer`] advertises, in preference
 /// order: the modern stateless era first, then the current legacy revision.
@@ -513,7 +514,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             // era, so a legacy client can never be handed a task handle it has
             // no contract for (and whose response would skip `resultType`).
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, ctx, false, false)
+                let headers = request.headers.as_ref();
+                self.handle_tools_call(request.id, request.params, ctx, false, false, headers)
                     .await
             }
             "server/discover" => self.handle_server_discover(request.id),
@@ -565,8 +567,16 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             "server/discover" => self.handle_server_discover(request.id),
             "tools/list" => self.handle_tools_list(request.id, &ctx).await,
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, &ctx, true, declares_tasks)
-                    .await
+                let headers = request.headers.as_ref();
+                self.handle_tools_call(
+                    request.id,
+                    request.params,
+                    &ctx,
+                    true,
+                    declares_tasks,
+                    headers,
+                )
+                .await
             }
             method @ (task_methods::TASKS_GET
             | task_methods::TASKS_UPDATE
@@ -783,6 +793,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// only for a modern-era call whose client declared the tasks extension;
     /// it gates whether the dispatcher's [`CallToolOutcome::Task`] may be
     /// framed as a handle.
+    ///
+    /// `headers` are the HTTP headers a transport forwarded, `None` for one
+    /// that carries none (stdio, an in-process call). With them, the call's
+    /// `Mcp-Param-*` mirrors are held to the arguments the tool's input schema
+    /// annotates with `x-mcp-header` before it runs, and a `modern` call must
+    /// carry every mirror whose argument it passes (SEP-2243). That check
+    /// needs the tool's schema, so it is made here and not by the transport:
+    /// only dispatch knows which tool, under which caller's view, the name
+    /// resolves to.
     async fn handle_tools_call(
         &self,
         id: Option<Value>,
@@ -790,6 +809,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         ctx: &ToolContext,
         modern: bool,
         allow_tasks: bool,
+        headers: Option<&HashMap<String, Value>>,
     ) -> JsonRpcResponse {
         let call: ToolCall = match params {
             Some(p) => match serde_json::from_value(p) {
@@ -810,6 +830,16 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 );
             }
         };
+
+        if let Some(headers) = headers.filter(|h| modern || carries_param_header(h)) {
+            if let Some(schema) = self.input_schema_of(&call.name, ctx).await {
+                if let Err(reason) =
+                    check_param_headers(&schema, call.arguments.as_ref(), headers, modern)
+                {
+                    return JsonRpcResponse::error(id, HEADER_MISMATCH, reason);
+                }
+            }
+        }
 
         let arguments = call
             .arguments
@@ -866,6 +896,21 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 "Tool asked for input, but a legacy-era call cannot carry an input-required result"
                     .to_owned(),
             ),
+        }
+    }
+
+    /// The input schema of the tool `name` resolves to for this caller: the
+    /// host dispatcher's view when one is installed, else the registry's.
+    /// `None` for a name nothing resolves, which the call then reports.
+    async fn input_schema_of(&self, name: &str, ctx: &ToolContext) -> Option<Value> {
+        match &self.tool_dispatcher {
+            Some(dispatcher) => dispatcher
+                .list_tools(&self.state, ctx)
+                .await
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| tool.input_schema),
+            None => self.tools.definition_of(name).map(|tool| tool.input_schema),
         }
     }
 

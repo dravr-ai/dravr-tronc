@@ -62,6 +62,9 @@ otel = [
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
+# Decodes the `=?base64?…?=` sentinel a mirrored MCP request header may
+# carry (SEP-2243).
+base64 = "0.22"
 bitflags = "2"
 # 10.3 is the first release past the claim type-confusion advisory, and the
 # line the platform verifies its own JWTs on, so a host enabling google-iam
@@ -101,8 +104,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "s
 [dev-dependencies]
 # The crate's own tests drive it through the testkit, as a consumer would.
 dravr-tronc = { path = ".", features = ["testkit"] }
-# Encodes a test RSA key's modulus the way a JWK set publishes it.
-base64 = "0.22"
 # The key-set tests sign with an openssl PEM key, which only use_pem can read.
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 # The otel tests export spans and metrics to memory, which only the testing

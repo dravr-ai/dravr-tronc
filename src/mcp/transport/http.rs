@@ -32,6 +32,7 @@ use crate::mcp::modern::{
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
+use crate::mcp::transport::mirror::check_standard_headers;
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
 
@@ -215,6 +216,10 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         );
     }
     let modern = version.is_some_and(is_modern_revision);
+    // SEP-2243: the mirrors a gateway routes on must say what the body says.
+    if let Err(reason) = check_standard_headers(&headers, &request, modern) {
+        return header_mismatch(request.id, &reason);
+    }
 
     // 5. Authenticate (RFC 9728 resource-server posture).
     let ctx = match server.authenticate(&request).await {
@@ -615,6 +620,7 @@ mod tests {
     use crate::mcp::auth::AuthHook;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
+    use crate::mcp::transport::mirror::{MCP_METHOD_HEADER, MCP_NAME_HEADER};
     use http::Request;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -1629,6 +1635,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("accept", TEST_ACCEPT)
                     .header(PROTOCOL_VERSION_HEADER, supported.as_str())
+                    .header(MCP_METHOD_HEADER, "tools/list")
                     .body(
                         json!({"jsonrpc":"2.0","id":1,"method":"tools/list",
                                "params": modern_params(&supported, json!({}))})
@@ -1654,8 +1661,18 @@ mod tests {
     }
 
     /// POST `body` with the version header (when given) and `extra` headers,
-    /// returning the status and the JSON body.
+    /// returning the status and the JSON body. `Mcp-Method` mirrors the body
+    /// unless `extra` sets it.
     async fn post_versioned(
+        version: Option<&str>,
+        extra: &[(&str, &str)],
+        body: &Value,
+    ) -> (StatusCode, Value) {
+        post_versioned_to(make_app(), version, extra, body).await
+    }
+
+    async fn post_versioned_to(
+        app: Router,
         version: Option<&str>,
         extra: &[(&str, &str)],
         body: &Value,
@@ -1664,7 +1681,11 @@ mod tests {
         if let Some(version) = version {
             headers.push((PROTOCOL_VERSION_HEADER, version));
         }
-        let (status, raw) = post(make_app(), &body.to_string(), &headers).await;
+        let method = body["method"].as_str().unwrap_or_default();
+        if !extra.iter().any(|(name, _)| *name == MCP_METHOD_HEADER) {
+            headers.push((MCP_METHOD_HEADER, method));
+        }
+        let (status, raw) = post(app, &body.to_string(), &headers).await;
         let json = if raw.is_empty() {
             Value::Null
         } else {
@@ -1744,5 +1765,239 @@ mod tests {
         let (status, json) = post_versioned(Some(PROTOCOL_VERSION), &[], &body).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    /// A tool whose `region` argument is mirrored into `Mcp-Param-Region`,
+    /// and whose nested `target.shard` into `Mcp-Param-Shard`.
+    struct RegionTool;
+
+    #[async_trait::async_trait]
+    impl McpTool<TestState> for RegionTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "run_query".to_owned(),
+                description: "Runs a query in a region".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "region": { "type": "string", "x-mcp-header": "Region" },
+                        "limit": { "type": "integer", "x-mcp-header": "Limit" },
+                        "target": {
+                            "type": "object",
+                            "properties": {
+                                "shard": { "type": "integer", "x-mcp-header": "Shard" }
+                            }
+                        },
+                        "query": { "type": "string" }
+                    }
+                }),
+                output_schema: None,
+                annotations: None,
+                execution: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text("ran".to_owned())
+        }
+    }
+
+    fn make_region_app() -> Router {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RegionTool));
+        mcp_router(Arc::new(McpServer::new(
+            "test",
+            "0.1.0",
+            registry,
+            Arc::new(TestState),
+        )))
+    }
+
+    /// A modern `tools/call` of `run_query` with `arguments`.
+    fn region_call(arguments: &Value) -> Value {
+        json!({"jsonrpc":"2.0","id":20,"method":"tools/call",
+               "params": modern_params(MODERN, json!({"name":"run_query","arguments":arguments}))})
+    }
+
+    /// POST a modern `run_query` call carrying `headers` beside the version.
+    async fn call_region(arguments: &Value, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+        post_versioned_to(
+            make_region_app(),
+            Some(MODERN),
+            headers,
+            &region_call(arguments),
+        )
+        .await
+    }
+
+    /// The canonical conforming call: every mirror present and matching.
+    #[tokio::test]
+    async fn a_call_carrying_matching_mirrors_is_served() {
+        let (status, json) = call_region(
+            &json!({"region":"us-west1","limit":42,"target":{"shard":7},"query":"q"}),
+            &[
+                (MCP_NAME_HEADER, "run_query"),
+                ("mcp-param-region", "us-west1"),
+                ("Mcp-Param-Limit", "42.0"),
+                ("mcp-param-shard", "7"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["result"]["content"][0]["text"], "ran");
+    }
+
+    /// Every SEP-2243 failure is a 400 `HeaderMismatchError` echoing the id.
+    #[tokio::test]
+    async fn header_mirror_failures_are_400_header_mismatch() {
+        let args = json!({"region":"us-west1","query":"q"});
+        let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("Mcp-Name missing", vec![("mcp-param-region", "us-west1")]),
+            (
+                "Mcp-Name names another tool",
+                vec![(MCP_NAME_HEADER, "other"), ("mcp-param-region", "us-west1")],
+            ),
+            (
+                "Mcp-Method names another method",
+                vec![
+                    (MCP_METHOD_HEADER, "tools/list"),
+                    (MCP_NAME_HEADER, "run_query"),
+                    ("mcp-param-region", "us-west1"),
+                ],
+            ),
+            (
+                "Mcp-Param-Region missing",
+                vec![(MCP_NAME_HEADER, "run_query")],
+            ),
+            (
+                "Mcp-Param-Region disagrees",
+                vec![
+                    (MCP_NAME_HEADER, "run_query"),
+                    ("mcp-param-region", "eu-west1"),
+                ],
+            ),
+            (
+                "Mcp-Param-Limit with no limit in the body",
+                vec![
+                    (MCP_NAME_HEADER, "run_query"),
+                    ("mcp-param-region", "us-west1"),
+                    ("mcp-param-limit", "1"),
+                ],
+            ),
+            (
+                "malformed Base64 padding",
+                vec![
+                    (MCP_NAME_HEADER, "run_query"),
+                    ("mcp-param-region", "=?base64?dXMtd2VzdDE?="),
+                ],
+            ),
+            (
+                "repeated Mcp-Name",
+                vec![
+                    (MCP_NAME_HEADER, "run_query"),
+                    (MCP_NAME_HEADER, "run_query"),
+                    ("mcp-param-region", "us-west1"),
+                ],
+            ),
+        ];
+        for (case, headers) in cases {
+            let (status, json) = call_region(&args, &headers).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {json}");
+            assert_eq!(json["error"]["code"], HEADER_MISMATCH, "{case}");
+            assert_eq!(json["id"], 20, "{case}");
+        }
+    }
+
+    /// Mcp-Method is required on every modern request.
+    #[tokio::test]
+    async fn a_modern_request_without_mcp_method_is_refused() {
+        let body = json!({"jsonrpc":"2.0","id":21,"method":"tools/list",
+                          "params": modern_params(MODERN, json!({}))});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
+            .header(PROTOCOL_VERSION_HEADER, MODERN)
+            .body(body.to_string())
+            .expect("request"); // Safe: test fixture
+        let response = make_app().oneshot(request).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"]["code"], HEADER_MISMATCH);
+    }
+
+    /// The Base64 sentinel carries what a plain field value cannot, and is
+    /// decoded before the comparison.
+    #[tokio::test]
+    async fn base64_wrapped_mirrors_are_decoded_before_comparison() {
+        let (status, json) = call_region(
+            &json!({"region":"Hello, 世界"}),
+            &[
+                (MCP_NAME_HEADER, "=?base64?cnVuX3F1ZXJ5?="),
+                ("mcp-param-region", "=?base64?SGVsbG8sIOS4lueVjA==?="),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    /// An `Mcp-Param-*` value outside visible ASCII must travel wrapped.
+    #[tokio::test]
+    async fn a_param_header_with_raw_non_ascii_is_refused() {
+        let body = region_call(&json!({"region":"x"}));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
+            .header(PROTOCOL_VERSION_HEADER, MODERN)
+            .header(MCP_METHOD_HEADER, "tools/call")
+            .header(MCP_NAME_HEADER, "run_query")
+            .header(
+                "mcp-param-region",
+                header::HeaderValue::from_bytes(b"caf\xe9").expect("obs-text"), // Safe: test fixture
+            )
+            .body(body.to_string())
+            .expect("request"); // Safe: test fixture
+        let response = make_region_app().oneshot(request).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An integer beyond the JavaScript safe range could not have been
+    /// mirrored faithfully.
+    #[tokio::test]
+    async fn an_unsafe_integer_mirror_is_refused() {
+        let (status, json) = call_region(
+            &json!({"region":"r","limit":9_007_199_254_740_993_u64}),
+            &[
+                (MCP_NAME_HEADER, "run_query"),
+                ("mcp-param-region", "r"),
+                ("mcp-param-limit", "9007199254740993"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    }
+
+    /// A legacy request needs no mirror, but one it carries must still match.
+    #[tokio::test]
+    async fn legacy_mirrors_are_optional_but_must_match() {
+        let legacy = json!({"jsonrpc":"2.0","id":22,"method":"tools/call",
+                            "params":{"name":"run_query","arguments":{"region":"us-west1"}}});
+        let (status, json) = post(make_region_app(), &legacy.to_string(), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let (status, json) = post(
+            make_region_app(),
+            &legacy.to_string(),
+            &[("mcp-param-region", "eu-west1")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     }
 }

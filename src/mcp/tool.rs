@@ -409,6 +409,11 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
             .collect()
     }
 
+    /// Look up a registered tool's definition.
+    pub fn definition_of(&self, name: &str) -> Option<Tool> {
+        self.tools.get(name).map(|t| t.definition())
+    }
+
     /// Look up a registered tool's declared capabilities.
     pub fn capabilities_of(&self, name: &str) -> Option<ToolCapabilities> {
         self.tools.get(name).map(|t| t.capabilities())
