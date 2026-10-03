@@ -6,10 +6,6 @@
 server:
   # Completion: no completion/complete handler.
   - completion-complete
-  # Content blocks the engine does not model (schema.rs Content: text and image only).
-  - tools-call-audio
-  - tools-call-embedded-resource
-  - tools-call-mixed-content
   # Notifications sent during a call: a tools/call answers with one response.
   - tools-call-with-progress
   # Resources and prompts: served by a host MethodHandler, none in the engine.

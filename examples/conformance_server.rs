@@ -9,8 +9,8 @@
 //! It is a plain [`McpServer`] with no host extensions — no dispatcher, no
 //! method handler — so the suite measures the engine as every host gets it.
 //! It registers the fixture tools whose specified answer the engine can give
-//! today: text, image and error results, and the JSON Schema 2020-12 input
-//! schema. A scenario that needs more — audio or embedded-resource content,
+//! today: text, image, audio, embedded-resource, mixed and error results, and
+//! the JSON Schema 2020-12 input schema. A scenario that needs more —
 //! notifications sent during a call, resources, prompts — fails, and is
 //! listed in the expected-failure baselines under `conformance/`, which is
 //! where a fix shows up as a line removed.
@@ -24,7 +24,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::mcp::schema::{Content, ResourceContents, Tool, ToolResponse};
 use dravr_tronc::mcp::transport::http::serve;
 use dravr_tronc::{McpServer, McpTool, ToolContext, ToolRegistry};
 use serde_json::{json, Value};
@@ -35,11 +35,17 @@ const DEFAULT_PORT: u16 = 3001;
 /// A 1x1 PNG, base64.
 const MINI_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
 
+/// A WAV of two silent samples, 8 kHz mono 8-bit PCM, base64.
+const MINI_WAV_BASE64: &str = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQIAAACAgA==";
+
 /// What a fixture tool answers.
 #[derive(Clone)]
 enum Answer {
     Text(&'static str),
     Image,
+    Audio,
+    EmbeddedResource,
+    Mixed,
     Error(&'static str),
 }
 
@@ -74,6 +80,25 @@ impl McpTool<()> for Fixture {
             Answer::Text(text) => ToolResponse::text((*text).to_owned()),
             Answer::Error(message) => ToolResponse::error((*message).to_owned()),
             Answer::Image => ToolResponse::image(MINI_PNG_BASE64, "image/png"),
+            Answer::Audio => ToolResponse::audio(MINI_WAV_BASE64, "audio/wav"),
+            Answer::EmbeddedResource => ToolResponse::resource(
+                ResourceContents::text(
+                    "test://embedded-resource",
+                    "This is an embedded resource content.",
+                )
+                .with_mime_type("text/plain"),
+            ),
+            Answer::Mixed => ToolResponse::blocks(vec![
+                Content::text("Multiple content types test:"),
+                Content::image(MINI_PNG_BASE64, "image/png"),
+                Content::resource(
+                    ResourceContents::text(
+                        "test://mixed-content-resource",
+                        r#"{"test":"data","value":123}"#,
+                    )
+                    .with_mime_type("application/json"),
+                ),
+            ]),
         }
     }
 }
@@ -130,6 +155,24 @@ fn registry() -> ToolRegistry<()> {
             description: "Returns image content",
             input_schema: no_arguments(),
             answer: Answer::Image,
+        },
+        Fixture {
+            name: "test_audio_content",
+            description: "Returns audio content",
+            input_schema: no_arguments(),
+            answer: Answer::Audio,
+        },
+        Fixture {
+            name: "test_embedded_resource",
+            description: "Returns embedded resource content",
+            input_schema: no_arguments(),
+            answer: Answer::EmbeddedResource,
+        },
+        Fixture {
+            name: "test_multiple_content_types",
+            description: "Returns multiple content types",
+            input_schema: no_arguments(),
+            answer: Answer::Mixed,
         },
         Fixture {
             name: "test_error_handling",
