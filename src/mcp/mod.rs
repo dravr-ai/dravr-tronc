@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub(crate) mod cancellation;
+pub mod client_channel;
 #[cfg(feature = "computation")]
 pub mod computation;
 pub mod elicitation;
@@ -19,6 +20,7 @@ pub(crate) mod random_id;
 pub mod resource_metadata;
 pub mod schema;
 pub mod server;
+pub(crate) mod session;
 pub mod tasks;
 pub mod tool;
 pub mod transport;

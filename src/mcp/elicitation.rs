@@ -20,6 +20,8 @@
 //! client — titles in two places, a multi-select without `items` — cannot be
 //! written.
 //!
+//! A tool sends one with
+//! [`ClientChannel::elicit`](crate::mcp::client_channel::ClientChannel::elicit).
 //! Revision 2026-07-28 carries no server-to-client request inside a call: a
 //! tool there asks through
 //! [`CallToolOutcome::InputRequired`](crate::mcp::host::CallToolOutcome::InputRequired)

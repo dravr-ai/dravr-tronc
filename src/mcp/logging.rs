@@ -12,7 +12,8 @@
 //! wants: with `logging/setLevel` on an `initialize`-era session, or with the
 //! `io.modelcontextprotocol/logLevel` `_meta` key on each request in revision
 //! 2026-07-28. A call sends a message only at or above that level, and none
-//! at all when the client named no level.
+//! at all when the client named no level. A tool sends one through
+//! [`ClientChannel::log`](crate::mcp::client_channel::ClientChannel::log).
 
 use std::fmt;
 

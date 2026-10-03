@@ -12,6 +12,7 @@ use bitflags::bitflags;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+use crate::mcp::client_channel::ClientChannel;
 use crate::mcp::modern::{meta_keys, ModernClientInfo};
 use crate::mcp::schema::{ProgressToken, Tool, ToolResponse};
 use crate::mcp::tasks::{CancellationToken, TASKS_EXTENSION_ID};
@@ -207,6 +208,14 @@ pub struct ToolContext {
     ///
     /// Set by the server on every request it dispatches, in both eras.
     pub meta: RequestMeta,
+    /// This call's channel to its client: progress, log messages, and the
+    /// requests a tool may send it (sampling, elicitation) while it runs.
+    ///
+    /// The transport connects it and the server binds it to the request, so
+    /// a tool only uses it. The default channel — a context built by hand, a
+    /// call dispatched in-process — reaches no client: see
+    /// [`ClientChannel`] for what each operation then does.
+    pub client: ClientChannel,
 }
 
 impl ToolContext {

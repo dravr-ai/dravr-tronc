@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -18,7 +19,9 @@ use crate::error::{
 };
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICATIONS_CANCELLED};
+use crate::mcp::client_channel::DEFAULT_CLIENT_REQUEST_TIMEOUT;
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
+use crate::mcp::logging::{LogLevel, LOGGING_SET_LEVEL};
 use crate::mcp::modern::{
     frame_cacheable_result, DiscoverResult, ModernMeta, ModernRequestMeta,
     PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER, REMOVED_METHODS,
@@ -106,6 +109,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     in_flight: InFlightRequests,
     observer: Option<Arc<dyn Observer>>,
     payload_capture: PayloadCapturePolicy,
+    client_request_timeout: Duration,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -140,6 +144,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             in_flight: InFlightRequests::default(),
             observer: None,
             payload_capture: PayloadCapturePolicy::disabled(),
+            client_request_timeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
         }
     }
 
@@ -350,6 +355,21 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     pub fn with_payload_capture(mut self, policy: PayloadCapturePolicy) -> Self {
         self.payload_capture = policy;
         self
+    }
+
+    /// How long a call waits for its client to answer a server request
+    /// (sampling, elicitation) before giving up with
+    /// [`ClientRequestError::TimedOut`](crate::mcp::client_channel::ClientRequestError::TimedOut)
+    /// ([`DEFAULT_CLIENT_REQUEST_TIMEOUT`] unless set).
+    #[must_use]
+    pub fn with_client_request_timeout(mut self, timeout: Duration) -> Self {
+        self.client_request_timeout = timeout;
+        self
+    }
+
+    /// How long a call waits for its client's answer.
+    pub(crate) const fn client_request_timeout(&self) -> Duration {
+        self.client_request_timeout
     }
 
     /// The capabilities to advertise, with the tasks extension merged in when a
@@ -573,6 +593,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         let header = request
             .get_metadata(PROTOCOL_VERSION_HEADER)
             .map(String::as_str);
+        let progress_token = ctx.meta.progress_token();
+        let logging = self.capabilities.logging.is_some();
         match ModernRequestMeta::detect(header, request.params.as_ref()) {
             ModernMeta::Malformed(reason) => {
                 JsonRpcResponse::error(request.id, INVALID_PARAMS, reason)
@@ -580,8 +602,24 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             ModernMeta::HeaderMismatch(reason) => {
                 JsonRpcResponse::error(request.id, HEADER_MISMATCH, reason)
             }
-            ModernMeta::Modern(meta) => self.process_modern(request, *meta, &ctx).await,
-            ModernMeta::Legacy => self.process_legacy(request, &ctx).await,
+            ModernMeta::Modern(meta) => {
+                let log_level = meta.log_level.as_deref().and_then(LogLevel::from_wire);
+                let client = ctx.client.for_modern_call(
+                    progress_token,
+                    log_level,
+                    logging,
+                    ctx.cancellation.clone(),
+                );
+                let ctx = ToolContext { client, ..ctx };
+                self.process_modern(request, *meta, &ctx).await
+            }
+            ModernMeta::Legacy => {
+                let client =
+                    ctx.client
+                        .for_legacy_call(progress_token, logging, ctx.cancellation.clone());
+                let ctx = ToolContext { client, ..ctx };
+                self.process_legacy(request, &ctx).await
+            }
         }
     }
 
@@ -604,7 +642,12 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Dispatch a legacy (`initialize`/session) request.
     async fn process_legacy(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
         match request.method.as_str() {
-            "initialize" => self.handle_initialize(request.id, request.params.as_ref()),
+            "initialize" => self.handle_initialize(request.id, request.params.as_ref(), ctx),
+            // Served only by a server that declares `logging`; otherwise the
+            // method is as unknown here as the capability is unadvertised.
+            LOGGING_SET_LEVEL if self.capabilities.logging.is_some() => {
+                Self::handle_set_level(request.id, request.params.as_ref(), ctx)
+            }
             "tools/list" => {
                 self.handle_tools_list(request.id, request.params.as_ref(), ctx)
                     .await
@@ -753,8 +796,19 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Echoes the client's requested version when supported; otherwise responds
     /// with the server's current legacy revision (the spec lets the client then
     /// decide whether to proceed).
-    fn handle_initialize(&self, id: Option<Value>, params: Option<&Value>) -> JsonRpcResponse {
+    ///
+    /// On a transport that keeps a session the client's declared capabilities
+    /// are recorded there, which is what lets a later call sample or elicit.
+    fn handle_initialize(
+        &self,
+        id: Option<Value>,
+        params: Option<&Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
         let init = params.and_then(|p| serde_json::from_value::<InitializeRequest>(p.clone()).ok());
+        if let Some(session) = ctx.client.session() {
+            session.record_capabilities(params.and_then(|p| p.get("capabilities")).cloned());
+        }
 
         if let Some(req) = &init {
             debug!(
@@ -780,6 +834,42 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         );
 
         Self::success_or_error(id, &result)
+    }
+
+    /// Handle `logging/setLevel` — record the minimum level the client wants
+    /// log messages at on its session.
+    ///
+    /// A request with no session — one over HTTP, which keeps none — has
+    /// nowhere to keep the level, and is refused rather than told `{}` for a
+    /// level no later call would honour.
+    fn handle_set_level(
+        id: Option<Value>,
+        params: Option<&Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
+        let Some(level) = params
+            .and_then(|p| p.get("level"))
+            .and_then(Value::as_str)
+            .and_then(LogLevel::from_wire)
+        else {
+            return JsonRpcResponse::error(
+                id,
+                INVALID_PARAMS,
+                "logging/setLevel needs a 'level' naming one of debug, info, notice, warning, \
+                 error, critical, alert, emergency"
+                    .to_owned(),
+            );
+        };
+        let Some(session) = ctx.client.session() else {
+            return JsonRpcResponse::error(
+                id,
+                INVALID_REQUEST,
+                "logging/setLevel needs a session to keep the level in: initialize over stdio"
+                    .to_owned(),
+            );
+        };
+        session.set_log_level(level);
+        JsonRpcResponse::success(id, Value::Object(serde_json::Map::new()))
     }
 
     /// Handle the modern `server/discover` RPC — advertise the supported
