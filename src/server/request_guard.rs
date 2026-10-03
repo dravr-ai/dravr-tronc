@@ -10,7 +10,9 @@
 //! - [`guard_requests`] goes **outermost**, over the whole router, once. It
 //!   gives every request an id — the caller's [`REQUEST_ID_HEADER`] when it
 //!   sends a usable one, a minted one otherwise — and echoes it on the
-//!   response. It logs one INFO line per request when the response is ready
+//!   response. With the `otel` feature, its `request` span continues the
+//!   trace a W3C `traceparent` header names
+//!   ([`trace_context`](crate::server::trace_context)). It logs one INFO line per request when the response is ready
 //!   (method, route template, status, latency, id) — a WARN line instead when
 //!   the request ran past the [slow-request threshold](slow_request_threshold)
 //!   — and it turns a handler
@@ -77,6 +79,8 @@ use tokio::time;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::error::ErrorResponse;
+#[cfg(feature = "otel")]
+use crate::server::trace_context::{join_trace, TraceContext};
 
 /// Header carrying the id a request is logged under, in both directions.
 ///
@@ -361,8 +365,13 @@ pub async fn guard_requests_with_threshold(
         slow_threshold,
     );
 
-    // Every event the handler logs carries the id through this span.
+    // Every event the handler logs carries the id through this span. With
+    // `otel`, the span continues the caller's trace when it sent one.
     let span = info_span!("request", request_id = %request_id);
+    #[cfg(feature = "otel")]
+    if let Some(context) = TraceContext::from_headers(request.headers()) {
+        join_trace(&span, &context);
+    }
     let outcome = AssertUnwindSafe(next.run(request))
         .catch_unwind()
         .instrument(span)

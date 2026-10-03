@@ -20,6 +20,8 @@ use crate::http_client::describe_request_error;
 use crate::iam::{IamError, IdTokenSource};
 use crate::server::auth::is_loopback_host;
 use crate::server::request_guard::{RequestId, REQUEST_ID_HEADER};
+#[cfg(feature = "otel")]
+use crate::server::trace_context::inject_current_context;
 
 /// Wait reported for a shed that names none (a gateway's bare 503).
 pub const DEFAULT_SHED_RETRY_AFTER_SECS: u64 = 30;
@@ -333,6 +335,11 @@ impl ServiceClient {
         let id_value = HeaderValue::from_str(request_id.as_str())
             .map_err(|error| unsendable(error.to_string()))?;
         request.headers_mut().insert(REQUEST_ID_HEADER, id_value);
+
+        // The attempt joins the caller's trace, so the service's spans land in
+        // it rather than starting a trace of their own.
+        #[cfg(feature = "otel")]
+        inject_current_context(request.headers_mut());
 
         let started = Instant::now();
         let response = match self.http.execute(request).await {

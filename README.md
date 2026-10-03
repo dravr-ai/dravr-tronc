@@ -134,6 +134,7 @@ once, last. See [Request guard](#request-guard).
 | `server::shed` | `shed_response` — the `503` + `Retry-After` + `retry_after_secs` answer of a service that will not start a request |
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |
+| `server::trace_context` | W3C `traceparent` / `tracestate`, read from HTTP headers and MCP `params._meta`; joined and propagated with feature `otel` |
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
 
@@ -296,6 +297,9 @@ client.delete("drop", "/api/widgets/7").timeout(Duration::from_secs(10)).send().
   `from_env` answers `Ok(None)` only when the URL variable is unset or empty.
 - **Request id.** Each attempt is sent under a fresh `x-request-id`, which `guard_requests` logs
   and echoes. It is in `Exchange` on every response and every error but `Identity`.
+- **Trace.** With the `otel` feature, each attempt also carries the current span's W3C
+  `traceparent` / `tracestate`, and `guard_requests` on the other side makes its `request` span a
+  child of it: one trace spans both services.
 - **`Ok` means the service's own handler answered**, with any status: read `status()` and
   `json_value()` for the service's own refusals. Everything else is a `ServiceError`:
 

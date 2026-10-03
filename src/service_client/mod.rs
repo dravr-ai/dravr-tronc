@@ -21,6 +21,8 @@
 //! - goes out under a fresh [`REQUEST_ID_HEADER`](crate::server::request_guard::REQUEST_ID_HEADER),
 //!   which the guard logs and echoes, so one id finds the request in both
 //!   services' logs;
+//! - with the `otel` feature, carries the current span's W3C `traceparent`
+//!   and `tracestate`, so the service's spans join the caller's trace;
 //! - comes back as a [`ServiceResponse`] when the service's own handler
 //!   answered, with any status, and as a [`ServiceError`] otherwise.
 //!

@@ -102,6 +102,9 @@ dravr-tronc = { path = ".", features = ["testkit"] }
 base64 = "0.22"
 # The key-set tests sign with an openssl PEM key, which only use_pem can read.
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+# The otel tests export spans and metrics to memory, which only the testing
+# feature builds.
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 serial_test = "3"
 http = "1"
 http-body-util = "0.1"
