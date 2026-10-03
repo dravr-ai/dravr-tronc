@@ -20,6 +20,44 @@ use crate::mcp::schema::{ServerCapabilities, ServerInfo};
 /// The modern (stateless, per-request-metadata) MCP protocol revision string.
 pub const PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 
+/// The `MCP-Protocol-Version` HTTP header, lower-cased as HTTP/2 carries it.
+///
+/// The Streamable HTTP transport stores its value under this key in
+/// [`JsonRpcRequest::metadata`](crate::mcp::protocol::JsonRpcRequest::metadata),
+/// where era detection reads it back.
+pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+
+/// Methods revision 2026-07-28 removed with the `initialize` handshake.
+///
+/// A modern request naming one is answered method-not-found by the
+/// engine itself, never offered to a host handler that may still serve it
+/// for the legacy era.
+pub const REMOVED_METHODS: [&str; 5] = [
+    "initialize",
+    "ping",
+    "logging/setLevel",
+    "resources/subscribe",
+    "resources/unsubscribe",
+];
+
+/// Whether `version` names a per-request-metadata revision (2026-07-28 or
+/// later) rather than an `initialize`-era one.
+///
+/// Revisions are `YYYY-MM-DD` dates, so they order as text; anything not
+/// shaped like one is no modern revision.
+#[must_use]
+pub fn is_modern_revision(version: &str) -> bool {
+    let shaped = version.len() == PROTOCOL_VERSION_2026_07_28.len()
+        && version.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    shaped && version >= PROTOCOL_VERSION_2026_07_28
+}
+
 /// Reserved `_meta` keys carrying per-request protocol metadata (revision 2026-07-28).
 ///
 /// All keys use the reserved `io.modelcontextprotocol/` prefix.
@@ -117,9 +155,15 @@ pub enum ModernMeta {
     Legacy,
     /// A well-formed modern request.
     Modern(Box<ModernRequestMeta>),
-    /// A modern request (protocol version present) missing a required field.
-    /// The caller maps this to JSON-RPC `-32602` (Invalid params) / HTTP 400.
+    /// A modern request (protocol version present) missing a required field,
+    /// or a request whose transport header names a modern revision while its
+    /// body carries no `_meta` protocol version. The caller maps this to
+    /// JSON-RPC `-32602` (Invalid params).
     Malformed(String),
+    /// The transport's `MCP-Protocol-Version` header names another revision
+    /// than the body's `_meta`. The caller maps this to `HeaderMismatchError`
+    /// (`-32020`), which Streamable HTTP pairs with HTTP 400.
+    HeaderMismatch(String),
 }
 
 impl ModernRequestMeta {
@@ -166,6 +210,41 @@ impl ModernRequestMeta {
             client_capabilities,
             log_level,
         }))
+    }
+
+    /// Detect the era of a request whose transport may carry the protocol
+    /// version beside the body: `header` is the `MCP-Protocol-Version` value,
+    /// or `None` when the transport carries no such header (stdio, an
+    /// in-process call).
+    ///
+    /// The body stays the source of truth, but the two must agree: a modern
+    /// header over a body with no `_meta` protocol version is
+    /// [`ModernMeta::Malformed`] — it used to be served as legacy, so a
+    /// modern client that left `_meta` out reached the `initialize`-era
+    /// dispatch — and a header naming another revision than the body is
+    /// [`ModernMeta::HeaderMismatch`]. A legacy header over a legacy body is
+    /// legacy.
+    #[must_use]
+    pub fn detect(header: Option<&str>, params: Option<&Value>) -> ModernMeta {
+        let body = Self::from_params(params);
+        let Some(header) = header.map(str::trim) else {
+            return body;
+        };
+        match body {
+            ModernMeta::Modern(meta) if meta.protocol_version != header => {
+                ModernMeta::HeaderMismatch(format!(
+                    "Header mismatch: MCP-Protocol-Version header value '{header}' does not \
+                     match body _meta '{}' value '{}'",
+                    meta_keys::PROTOCOL_VERSION,
+                    meta.protocol_version
+                ))
+            }
+            ModernMeta::Legacy if is_modern_revision(header) => ModernMeta::Malformed(format!(
+                "missing required _meta field '{}'",
+                meta_keys::PROTOCOL_VERSION
+            )),
+            other => other,
+        }
     }
 }
 
@@ -317,6 +396,56 @@ mod tests {
         assert!(matches!(
             ModernRequestMeta::from_params(Some(&params)),
             ModernMeta::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn modern_revisions_are_dated_on_or_after_2026_07_28() {
+        assert!(is_modern_revision("2026-07-28"));
+        assert!(is_modern_revision("2027-01-01"));
+        assert!(!is_modern_revision("2025-11-25"));
+        assert!(!is_modern_revision("2024-11-05"));
+        assert!(!is_modern_revision("9999"));
+        assert!(!is_modern_revision("2026-07-28x"));
+        assert!(!is_modern_revision("2026/07/28"));
+    }
+
+    fn modern_body(version: &str) -> Value {
+        json!({ "_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }})
+    }
+
+    #[test]
+    fn detect_without_a_header_reads_the_body_alone() {
+        assert!(matches!(
+            ModernRequestMeta::detect(None, Some(&modern_body("2026-07-28"))),
+            ModernMeta::Modern(_)
+        ));
+        assert!(matches!(
+            ModernRequestMeta::detect(None, None),
+            ModernMeta::Legacy
+        ));
+    }
+
+    #[test]
+    fn detect_holds_the_header_to_the_body() {
+        assert!(matches!(
+            ModernRequestMeta::detect(Some(" 2026-07-28 "), Some(&modern_body("2026-07-28"))),
+            ModernMeta::Modern(_)
+        ));
+        assert!(matches!(
+            ModernRequestMeta::detect(Some("2025-11-25"), Some(&modern_body("2026-07-28"))),
+            ModernMeta::HeaderMismatch(_)
+        ));
+        assert!(matches!(
+            ModernRequestMeta::detect(Some("2026-07-28"), Some(&json!({ "name": "x" }))),
+            ModernMeta::Malformed(_)
+        ));
+        assert!(matches!(
+            ModernRequestMeta::detect(Some("2025-11-25"), None),
+            ModernMeta::Legacy
         ));
     }
 

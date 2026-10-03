@@ -23,17 +23,17 @@ use tokio::net::{lookup_host, TcpListener};
 use tracing::{debug, error, info};
 
 use crate::error::{
-    INTERNAL_ERROR, INVALID_REQUEST, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
+    HEADER_MISMATCH, INTERNAL_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::AuthError;
+use crate::mcp::modern::{
+    is_modern_revision, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_HEADER,
+};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
-
-/// The `MCP-Protocol-Version` HTTP header (revision 2026-07-28). The transport
-/// forwards its value into the request metadata for the dispatch layer.
-const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 /// Build an Axum router with the `/mcp` POST endpoint
 ///
@@ -120,7 +120,8 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 /// Enforces the `Origin` allowlist (403), refuses a body not declared
 /// `application/json` (415) and a client that does not accept both
 /// `application/json` and `text/event-stream` (406), refuses a body that is
-/// not a JSON-RPC Request (400), authenticates via the server's hook (401 +
+/// not a JSON-RPC Request (400), refuses an unsupported `MCP-Protocol-Version`
+/// (400, -32022) and a modern body sent without one (400, -32020), authenticates via the server's hook (401 +
 /// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
 /// spent budget; 500 when the host failed to decide), then dispatches under
 /// the resolved per-call context. A request's response is rendered as JSON or
@@ -173,21 +174,24 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     // public origins the client dialed — an RFC 9728 challenge must name that
     // one — without the transport knowing what a host reads.
     request.headers = forwarded_headers(&headers);
-    // `MCP-Protocol-Version` is the client's standing assertion of what was
-    // negotiated at `initialize`. On a stateless server there is no session to
-    // check it against, so this is the only place it can be judged — and until
-    // it was, the header was read into metadata that nothing read back, which
-    // reads as wired and is not. A revision we do not speak is refused here
-    // with -32004 rather than being served as if we did.
-    if let Some(version) = headers
-        .get(MCP_PROTOCOL_VERSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    // `MCP-Protocol-Version` names the revision the request speaks. On a
+    // stateless server there is no session to check it against, so this is
+    // the only place an unsupported one can be refused (-32022) rather than
+    // served as if we spoke it. A request with no header is an
+    // `initialize`-era one (a pre-2025-06-18 client sends none); a body
+    // carrying modern `_meta` without it is refused, since every modern POST
+    // must carry the header. Era detection reads the header back from the
+    // metadata and holds it to the body's `_meta` (-32020 on disagreement).
+    let version = match protocol_version_header(&headers) {
+        Ok(version) => version,
+        Err(reason) => return header_mismatch(request.id, &reason),
+    };
+    if let Some(version) = version {
         if !server.accepts_protocol_version(version) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(JsonRpcResponse::error_with_data(
-                    None,
+                    request.id,
                     UNSUPPORTED_PROTOCOL_VERSION,
                     "Unsupported protocol version".to_owned(),
                     serde_json::json!({
@@ -198,8 +202,19 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
             )
                 .into_response();
         }
-        request = request.with_metadata(MCP_PROTOCOL_VERSION_HEADER, version);
+        request = request.with_metadata(PROTOCOL_VERSION_HEADER, version);
+    } else if request.id.is_some()
+        && !matches!(
+            ModernRequestMeta::from_params(request.params.as_ref()),
+            ModernMeta::Legacy
+        )
+    {
+        return header_mismatch(
+            request.id,
+            "Header mismatch: MCP-Protocol-Version header is required",
+        );
     }
+    let modern = version.is_some_and(is_modern_revision);
 
     // 5. Authenticate (RFC 9728 resource-server posture).
     let ctx = match server.authenticate(&request).await {
@@ -216,8 +231,13 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
 
     debug!(method = "mcp", "Handled HTTP MCP request");
 
-    // 7. Render as JSON or a single SSE event, whichever the client weighs
-    // higher; a tie is answered as an event stream.
+    // 7. A modern refusal carries its HTTP status; anything else is a 200
+    // rendered as JSON or a single SSE event, whichever the client weighs
+    // higher (a tie is answered as an event stream).
+    let status = response_status(&response, modern);
+    if status != StatusCode::OK {
+        return (status, Json(response)).into_response();
+    }
     if prefers_event_stream(&headers) {
         respond_sse(&response)
     } else {
@@ -283,6 +303,59 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
             Json(JsonRpcResponse::error(None, INTERNAL_ERROR, reason)),
         )
             .into_response(),
+    }
+}
+
+/// The request's `MCP-Protocol-Version`, trimmed, or `None` when it carries
+/// none.
+///
+/// # Errors
+///
+/// The `HeaderMismatchError` reason when the header is repeated or is not
+/// visible ASCII: neither names one revision the body could agree with.
+fn protocol_version_header(headers: &HeaderMap) -> Result<Option<&str>, String> {
+    let mut values = headers.get_all(PROTOCOL_VERSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("Header mismatch: MCP-Protocol-Version is repeated".to_owned());
+    }
+    value.to_str().map(|v| Some(v.trim())).map_err(|_| {
+        "Header mismatch: MCP-Protocol-Version contains characters not permitted in an HTTP field value"
+            .to_owned()
+    })
+}
+
+/// A `HeaderMismatchError` (-32020) answered with HTTP 400, echoing `id`.
+fn header_mismatch(id: Option<Value>, reason: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(JsonRpcResponse::error(
+            id,
+            HEADER_MISMATCH,
+            reason.to_owned(),
+        )),
+    )
+        .into_response()
+}
+
+/// The HTTP status a dispatched response travels under.
+///
+/// A header that disagrees with its body is a 400 in any era. A modern
+/// (2026-07-28) request's protocol refusals carry their status too, which is
+/// how a client probing the era tells a modern server from a legacy one: 400
+/// for an unsupported revision or an undeclared client capability, 404 for a
+/// method the server does not implement. An `initialize`-era client expects
+/// those as JSON-RPC errors under 200, and keeps getting them that way.
+fn response_status(response: &JsonRpcResponse, modern: bool) -> StatusCode {
+    match response.error.as_ref().map(|error| error.code) {
+        Some(HEADER_MISMATCH) => StatusCode::BAD_REQUEST,
+        Some(UNSUPPORTED_PROTOCOL_VERSION | MISSING_REQUIRED_CLIENT_CAPABILITY) if modern => {
+            StatusCode::BAD_REQUEST
+        }
+        Some(METHOD_NOT_FOUND) if modern => StatusCode::NOT_FOUND,
+        _ => StatusCode::OK,
     }
 }
 
@@ -538,7 +611,7 @@ fn respond_sse(response: &JsonRpcResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::PARSE_ERROR;
+    use crate::error::{INVALID_PARAMS, PARSE_ERROR};
     use crate::mcp::auth::AuthHook;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
@@ -1513,7 +1586,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", TEST_ACCEPT)
-                    .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
+                    .header(PROTOCOL_VERSION_HEADER, "1999-01-01")
                     .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
                     .expect("request"), // Safe: test fixture
             )
@@ -1555,13 +1628,121 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", TEST_ACCEPT)
-                    .header(MCP_PROTOCOL_VERSION_HEADER, supported.as_str())
-                    .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
+                    .header(PROTOCOL_VERSION_HEADER, supported.as_str())
+                    .body(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/list",
+                               "params": modern_params(&supported, json!({}))})
+                        .to_string(),
+                    )
                     .expect("request"), // Safe: test fixture
             )
             .await
             .expect("response"); // Safe: test fixture
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body["result"]["tools"].is_array(), "{body}");
+    }
+
+    /// `params` with the modern `_meta` for `version` merged into `rest`.
+    fn modern_params(version: &str, mut rest: Value) -> Value {
+        rest["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        rest
+    }
+
+    /// POST `body` with the version header (when given) and `extra` headers,
+    /// returning the status and the JSON body.
+    async fn post_versioned(
+        version: Option<&str>,
+        extra: &[(&str, &str)],
+        body: &Value,
+    ) -> (StatusCode, Value) {
+        let mut headers: Vec<(&str, &str)> = extra.to_vec();
+        if let Some(version) = version {
+            headers.push((PROTOCOL_VERSION_HEADER, version));
+        }
+        let (status, raw) = post(make_app(), &body.to_string(), &headers).await;
+        let json = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&raw).expect("json body") // Safe: test assertion
+        };
+        (status, json)
+    }
+
+    const MODERN: &str = "2026-07-28";
+
+    /// A modern body without the header used to be served as modern from the
+    /// body alone; every modern POST must carry `MCP-Protocol-Version`.
+    #[tokio::test]
+    async fn a_modern_body_without_the_version_header_is_a_header_mismatch() {
+        let body = json!({"jsonrpc":"2.0","id":4,"method":"tools/list",
+                          "params": modern_params(MODERN, json!({}))});
+        let (status, json) = post_versioned(None, &[], &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], HEADER_MISMATCH);
+        assert_eq!(json["id"], 4, "the refusal echoes the request id");
+    }
+
+    /// A modern header over a body with no `_meta` used to be served as
+    /// legacy; it is a malformed modern request.
+    #[tokio::test]
+    async fn a_modern_header_over_a_legacy_body_is_invalid_params() {
+        let body = json!({"jsonrpc":"2.0","id":5,"method":"tools/list"});
+        let (status, json) = post_versioned(Some(MODERN), &[], &body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// The header and the body's `_meta` must name the same revision.
+    #[tokio::test]
+    async fn a_header_naming_another_revision_than_the_body_is_refused() {
+        let body = json!({"jsonrpc":"2.0","id":6,"method":"tools/list",
+                          "params": modern_params(MODERN, json!({}))});
+        let (status, json) = post_versioned(Some(PROTOCOL_VERSION), &[], &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], HEADER_MISMATCH);
+        assert_eq!(json["id"], 6);
+    }
+
+    /// A repeated version header names no one revision.
+    #[tokio::test]
+    async fn a_repeated_version_header_is_refused() {
+        let body = json!({"jsonrpc":"2.0","id":7,"method":"tools/list",
+                          "params": modern_params(MODERN, json!({}))});
+        let (status, json) =
+            post_versioned(Some(MODERN), &[(PROTOCOL_VERSION_HEADER, MODERN)], &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], HEADER_MISMATCH);
+    }
+
+    /// A method the revision removed is a 404 method-not-found for a modern
+    /// request, while a legacy client still gets `ping` answered.
+    #[tokio::test]
+    async fn a_removed_method_is_a_modern_404_and_still_served_to_legacy() {
+        for method in ["ping", "initialize", "logging/setLevel"] {
+            let body = json!({"jsonrpc":"2.0","id":8,"method":method,
+                              "params": modern_params(MODERN, json!({}))});
+            let (status, json) = post_versioned(Some(MODERN), &[], &body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+            assert_eq!(json["error"]["code"], METHOD_NOT_FOUND, "{method}");
+        }
+
+        let legacy = json!({"jsonrpc":"2.0","id":9,"method":"ping"});
+        let (status, json) = post_versioned(Some(PROTOCOL_VERSION), &[], &legacy).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.get("result").is_some(), "{json}");
+    }
+
+    /// An `initialize`-era client keeps getting protocol errors under 200.
+    #[tokio::test]
+    async fn a_legacy_unknown_method_stays_a_200() {
+        let body = json!({"jsonrpc":"2.0","id":10,"method":"nope/nothing"});
+        let (status, json) = post_versioned(Some(PROTOCOL_VERSION), &[], &body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["error"]["code"], METHOD_NOT_FOUND);
     }
 }

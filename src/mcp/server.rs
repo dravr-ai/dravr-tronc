@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::error::{
-    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
     MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
@@ -20,7 +20,7 @@ use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICAT
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::modern::{
     frame_cacheable_result, DiscoverResult, ModernMeta, ModernRequestMeta,
-    PROTOCOL_VERSION_2026_07_28,
+    PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER, REMOVED_METHODS,
 };
 use crate::mcp::observe::{observe, Observer, PayloadCapturePolicy};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
@@ -402,7 +402,10 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Performs era detection on each request: one carrying modern per-request
     /// `_meta` (revision 2026-07-28) is served statelessly via
     /// `Self::process_modern`; otherwise it follows the legacy
-    /// `initialize`/session path. Returns `None` for notifications (no id).
+    /// `initialize`/session path. A transport that carried an
+    /// `MCP-Protocol-Version` header leaves it in the request metadata, and
+    /// the header and body must agree (see [`ModernRequestMeta::detect`]).
+    /// Returns `None` for notifications (no id).
     pub async fn handle_request_with_context(
         &self,
         request: JsonRpcRequest,
@@ -470,9 +473,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         let ctx = ctx
             .clone()
             .with_meta(RequestMeta::from_params(request.params.as_ref()));
-        match ModernRequestMeta::from_params(request.params.as_ref()) {
+        let header = request
+            .get_metadata(PROTOCOL_VERSION_HEADER)
+            .map(String::as_str);
+        match ModernRequestMeta::detect(header, request.params.as_ref()) {
             ModernMeta::Malformed(reason) => {
                 JsonRpcResponse::error(request.id, INVALID_PARAMS, reason)
+            }
+            ModernMeta::HeaderMismatch(reason) => {
+                JsonRpcResponse::error(request.id, HEADER_MISMATCH, reason)
             }
             ModernMeta::Modern(meta) => self.process_modern(request, *meta, &ctx).await,
             ModernMeta::Legacy => self.process_legacy(request, &ctx).await,
@@ -520,9 +529,12 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     ///
     /// Rejects unsupported protocol versions with `UnsupportedProtocolVersionError`
     /// (-32004), routes the operation through the shared handlers, and frames a
-    /// successful result with `resultType`. Legacy-only lifecycle methods
-    /// (`initialize`, `ping`) are not valid here and fall through to
-    /// method-not-found.
+    /// successful result with `resultType`. The methods the revision removed
+    /// ([`REMOVED_METHODS`]: `initialize`, `ping`, `logging/setLevel`,
+    /// `resources/subscribe`, `resources/unsubscribe`) are answered
+    /// method-not-found here, before any host [`MethodHandler`] sees them: a
+    /// host serving one for its legacy clients would otherwise serve it to a
+    /// modern client the revision says must not get it.
     async fn process_modern(
         &self,
         request: JsonRpcRequest,
@@ -540,6 +552,14 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             .clone()
             .with_client_capabilities(meta.client_capabilities);
         let declares_tasks = ctx.supports_tasks();
+
+        if REMOVED_METHODS.contains(&request.method.as_str()) {
+            return JsonRpcResponse::error(
+                request.id,
+                METHOD_NOT_FOUND,
+                format!("Method not found: {}", request.method),
+            );
+        }
 
         let response = match request.method.as_str() {
             "server/discover" => self.handle_server_discover(request.id),
@@ -1570,6 +1590,90 @@ mod tests {
         let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "scoped_tool");
+    }
+
+    /// Serves every method it is offered, the legacy lifecycle ones included,
+    /// the way a host bridging an older engine might.
+    struct ServesEverything;
+
+    #[async_trait::async_trait]
+    impl MethodHandler<TestState> for ServesEverything {
+        async fn handle(
+            &self,
+            method: &str,
+            id: Option<Value>,
+            _params: Option<Value>,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+        ) -> Option<JsonRpcResponse> {
+            Some(JsonRpcResponse::success(id, json!({ "servedBy": method })))
+        }
+    }
+
+    /// The methods 2026-07-28 removed are method-not-found for a modern
+    /// request even when a host handler would serve them: they used to fall
+    /// through to it.
+    #[tokio::test]
+    async fn modern_removed_methods_never_reach_the_host_handler() {
+        let server = make_server().with_method_handler(Arc::new(ServesEverything));
+        for method in REMOVED_METHODS {
+            let raw = json!({
+                "jsonrpc": "2.0", "id": 60, "method": method,
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }}
+            })
+            .to_string();
+            let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+            let err = resp.error.expect("error"); // Safe: test assertion
+            assert_eq!(err.code, METHOD_NOT_FOUND, "{method}");
+        }
+
+        // A legacy request is still offered to the handler.
+        let raw = r#"{"jsonrpc": "2.0", "id": 61, "method": "resources/subscribe"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        assert_eq!(
+            resp.result.expect("result")["servedBy"], // Safe: test assertion
+            "resources/subscribe"
+        );
+    }
+
+    /// A transport's version header is held to the body: a modern header
+    /// over a body with no `_meta` is malformed, not legacy, and a header
+    /// naming another revision is a header mismatch.
+    #[tokio::test]
+    async fn era_detection_reads_the_transport_header() {
+        let server = make_server();
+
+        let legacy_body = JsonRpcRequest::with_id("tools/list", None, json!(62))
+            .with_metadata(PROTOCOL_VERSION_HEADER, "2026-07-28");
+        let resp = server.handle_request(legacy_body).await.expect("response"); // Safe: test assertion
+        assert_eq!(resp.error.expect("error").code, INVALID_PARAMS); // Safe: test assertion
+
+        let modern_body = JsonRpcRequest::with_id(
+            "tools/list",
+            Some(json!({ "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }})),
+            json!(63),
+        );
+        let resp = server
+            .handle_request(
+                modern_body
+                    .clone()
+                    .with_metadata(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION),
+            )
+            .await
+            .expect("response"); // Safe: test assertion
+        assert_eq!(resp.error.expect("error").code, HEADER_MISMATCH); // Safe: test assertion
+
+        let resp = server
+            .handle_request(modern_body.with_metadata(PROTOCOL_VERSION_HEADER, "2026-07-28"))
+            .await
+            .expect("response"); // Safe: test assertion
+        assert!(resp.result.is_some(), "an agreeing header is served");
     }
 
     #[tokio::test]
