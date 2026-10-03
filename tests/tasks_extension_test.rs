@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dravr_tronc::mcp::host::{CallToolOutcome, ToolDispatcher};
+use dravr_tronc::mcp::protocol::JsonRpcResponse;
 use dravr_tronc::mcp::schema::{TaskSupport, Tool, ToolExecution, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tasks::{
@@ -26,6 +27,7 @@ use dravr_tronc::mcp::tasks::{
 use dravr_tronc::mcp::tool::{ToolContext, ToolRegistry};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
+use tokio::task::yield_now;
 use tokio::time::timeout;
 
 /// State for the test server.
@@ -388,26 +390,204 @@ async fn a_terminal_task_refuses_further_transitions() {
 async fn tasks_update_requires_the_task_to_be_awaiting_input() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let id = manager.create(&owner).await.expect("created").id().clone();
+    let run = manager.create(&owner).await.expect("created");
 
     assert!(
-        manager.apply_input(&owner, &id).await.is_err(),
+        matches!(
+            manager.apply_input(&owner, run.id(), Map::new()).await,
+            Err(TaskError::InvalidState {
+                status: TaskStatus::Working,
+                ..
+            })
+        ),
         "a working task has no outstanding input to answer"
     );
+}
 
+/// One elicitation request, keyed the way the client must echo it back.
+fn one_input_request() -> Map<String, Value> {
+    let mut requests = Map::new();
+    requests.insert(
+        "confirm".to_owned(),
+        json!({ "method": "elicitation/create", "params": { "message": "Proceed?" } }),
+    );
+    requests
+}
+
+/// Send a modern `tasks/update` for `task_id` with the given responses.
+async fn tasks_update(
+    server: &McpServer<TestState>,
+    task_id: &TaskId,
+    responses: Value,
+) -> JsonRpcResponse {
+    let raw = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tasks/update",
+        "params": {
+            "taskId": task_id.as_str(),
+            "inputResponses": responses,
+            "_meta": modern_meta(true)
+        }
+    })
+    .to_string();
+    server.handle_raw(&raw).await.expect("response")
+}
+
+/// `tasks/update` must carry the client's answers to the operation that asked,
+/// not merely flip the status back to working.
+#[tokio::test]
+async fn tasks_update_hands_the_responses_to_the_waiting_operation() {
+    let manager = manager();
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let server = server_with_runs(Arc::clone(&manager), Arc::clone(&runs));
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "slow", "arguments": {}, "_meta": modern_meta(true) }
+    })
+    .to_string();
+    server.handle_raw(&call).await.expect("created");
+    let mut run = runs
+        .lock()
+        .await
+        .pop()
+        .expect("the dispatcher parked its run");
+    let id = run.id().clone();
+
+    let operation = tokio::spawn(async move {
+        let answers = run.request_input(one_input_request()).await;
+        (run, answers)
+    });
+
+    // Wait for the operation to publish its request, as a polling client would.
+    let owner = TaskOwner::default();
+    let blocked = timeout(Duration::from_secs(1), async {
+        loop {
+            let task = manager.get(&owner, &id).await.expect("readable");
+            if task.status() == TaskStatus::InputRequired {
+                return task;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("the operation asks for input");
+    let TaskPayload::InputRequired { input_requests } = blocked.payload else {
+        panic!("input_required carries its requests");
+    };
+    assert!(input_requests.contains_key("confirm"));
+
+    let answer = json!({ "confirm": { "action": "accept", "content": { "ok": true } } });
+    let response = tasks_update(&server, &id, answer.clone()).await;
+    assert_eq!(
+        response.result.expect("acknowledged")["resultType"],
+        "complete"
+    );
+
+    let (_run, answers) = timeout(Duration::from_secs(1), operation)
+        .await
+        .expect("the operation is woken")
+        .expect("joined");
+    assert_eq!(
+        Value::Object(answers.expect("the answers arrive")),
+        answer,
+        "the operation receives exactly what the client sent"
+    );
+    assert_eq!(
+        manager.get(&owner, &id).await.expect("readable").status(),
+        TaskStatus::Working
+    );
+}
+
+/// The spec requires every `inputRequests` key to be answered, and a key that
+/// names no request answers nothing; either mismatch is refused and the task
+/// keeps waiting.
+#[tokio::test]
+async fn tasks_update_refuses_responses_that_do_not_match_the_requests() {
+    let manager = manager();
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let server = server_with_runs(Arc::clone(&manager), Arc::clone(&runs));
+    let owner = TaskOwner::default();
+    let run = manager.create(&owner).await.expect("created");
     manager
-        .request_input(&owner, &id, Map::new())
+        .request_input(&owner, run.id(), one_input_request())
         .await
         .expect("blocks on input");
+
+    for responses in [json!({}), json!({ "confirm": {}, "extra": {} })] {
+        let response = tasks_update(&server, run.id(), responses.clone()).await;
+        assert_eq!(
+            response.error.expect("refused").code,
+            -32_602,
+            "mismatched keys are invalid params: {responses}"
+        );
+    }
+    let response = tasks_update(&server, run.id(), json!("not an object")).await;
+    assert_eq!(response.error.expect("refused").code, -32_602);
+
     assert_eq!(
         manager
-            .apply_input(&owner, &id)
+            .get(&owner, run.id())
             .await
-            .expect("accepts input")
+            .expect("readable")
             .status(),
-        TaskStatus::Working,
-        "answering input returns the task to working"
+        TaskStatus::InputRequired,
+        "a refused update leaves the task waiting"
     );
+}
+
+/// A task whose operation is gone has nobody to hand the answers to: the
+/// update is refused and the task is not moved to a `working` nothing will
+/// finish.
+#[tokio::test]
+async fn tasks_update_without_a_running_operation_is_refused() {
+    let manager = manager();
+    let server = server_with_tasks(Arc::clone(&manager));
+    let owner = TaskOwner::default();
+    let id = manager.create(&owner).await.expect("created").id().clone();
+    manager
+        .request_input(&owner, &id, one_input_request())
+        .await
+        .expect("blocks on input");
+
+    let response = tasks_update(&server, &id, json!({ "confirm": {} })).await;
+    assert_eq!(response.error.expect("refused").code, -32_603);
+    assert_eq!(
+        manager.get(&owner, &id).await.expect("readable").status(),
+        TaskStatus::InputRequired
+    );
+}
+
+/// Cancelling a task wakes an operation blocked on input instead of leaving it
+/// waiting for answers that will never come.
+#[tokio::test]
+async fn cancel_wakes_an_operation_waiting_for_input() {
+    let manager = manager();
+    let owner = TaskOwner::default();
+    let mut run = manager.create(&owner).await.expect("created");
+    let id = run.id().clone();
+    let operation = tokio::spawn(async move { run.request_input(one_input_request()).await });
+
+    timeout(Duration::from_secs(1), async {
+        while manager.get(&owner, &id).await.expect("readable").status()
+            != TaskStatus::InputRequired
+        {
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("the operation asks for input");
+    manager.cancel(&owner, &id).await.expect("cancelled");
+
+    let outcome = timeout(Duration::from_secs(1), operation)
+        .await
+        .expect("the operation is woken")
+        .expect("joined");
+    assert!(matches!(
+        outcome,
+        Err(TaskError::InvalidState {
+            status: TaskStatus::Cancelled,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

@@ -260,10 +260,14 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// forbidden, so a response cannot confirm that someone else's task exists.
     fn task_error_response(id: Option<Value>, error: &TaskError) -> JsonRpcResponse {
         match error {
-            TaskError::NotFound(_) | TaskError::InvalidState { .. } => {
+            TaskError::NotFound(_)
+            | TaskError::InvalidState { .. }
+            | TaskError::InvalidInput { .. } => {
                 JsonRpcResponse::error(id, INVALID_PARAMS, error.to_string())
             }
-            TaskError::Store(_) => JsonRpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
+            TaskError::Detached(_) | TaskError::Store(_) => {
+                JsonRpcResponse::error(id, INTERNAL_ERROR, error.to_string())
+            }
         }
     }
 
@@ -303,14 +307,20 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 Err(e) => Self::task_error_response(id, &e),
             },
             task_methods::TASKS_UPDATE => {
-                if params.and_then(|p| p.get("inputResponses")).is_none() {
+                let Some(responses) = params
+                    .and_then(|p| p.get("inputResponses"))
+                    .and_then(Value::as_object)
+                else {
                     return JsonRpcResponse::error(
                         id,
                         INVALID_PARAMS,
-                        "Missing required parameter 'inputResponses'".to_owned(),
+                        "Missing required object parameter 'inputResponses'".to_owned(),
                     );
-                }
-                match manager.apply_input(&owner, &task_id).await {
+                };
+                match manager
+                    .apply_input(&owner, &task_id, responses.clone())
+                    .await
+                {
                     Ok(_) => Self::success_or_error(id, &TaskAck::new()),
                     Err(e) => Self::task_error_response(id, &e),
                 }

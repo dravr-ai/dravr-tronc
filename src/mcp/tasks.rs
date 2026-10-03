@@ -33,7 +33,9 @@ use chrono::{SecondsFormat, Utc};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
+
+use crate::error::INTERNAL_ERROR;
+use tokio::sync::{mpsc, RwLock};
 
 /// The token a [`TaskRun`] carries, re-exported so a host names it without a
 /// direct `tokio-util` dependency.
@@ -425,6 +427,18 @@ pub enum TaskError {
         /// Its current status.
         status: TaskStatus,
     },
+    /// The client's input responses do not answer the task's outstanding
+    /// input requests: a key is missing, or names no outstanding request.
+    InvalidInput {
+        /// The task in question.
+        task_id: TaskId,
+        /// What is wrong with the responses.
+        reason: String,
+    },
+    /// The task is visible but no operation in this process is running it,
+    /// so there is nothing to hand client input to. Seen when the operation
+    /// ended without settling the task, or ran on another instance.
+    Detached(TaskId),
     /// The backing store failed.
     Store(String),
 }
@@ -437,6 +451,12 @@ impl Display for TaskError {
                 f,
                 "task '{task_id}' is {status:?} and cannot accept this operation"
             ),
+            Self::InvalidInput { task_id, reason } => {
+                write!(f, "input for task '{task_id}' rejected: {reason}")
+            }
+            Self::Detached(id) => {
+                write!(f, "task '{id}' has no running operation to receive input")
+            }
             Self::Store(reason) => write!(f, "task store failure: {reason}"),
         }
     }
@@ -577,11 +597,42 @@ impl Default for TaskOptions {
     }
 }
 
+/// Client answers to a task's outstanding input requests, keyed like the
+/// `inputRequests` they answer.
+pub type InputResponses = Map<String, Value>;
+
 /// What the manager holds for a task whose operation is running in this
-/// process: the signal [`TaskManager::cancel`] fires.
+/// process: the signal [`TaskManager::cancel`] fires, and where
+/// [`TaskManager::apply_input`] delivers the client's answers.
 #[derive(Debug)]
 struct LiveRun {
     cancel: CancellationToken,
+    inputs: mpsc::UnboundedSender<InputResponses>,
+}
+
+/// Check that `responses` answers exactly the outstanding `requests`: the spec
+/// requires every key of `inputRequests` to appear in `inputResponses`, and a
+/// key naming no request answers nothing the operation asked.
+fn validate_input_keys(
+    task_id: &TaskId,
+    requests: &Map<String, Value>,
+    responses: &InputResponses,
+) -> Result<(), TaskError> {
+    let invalid = |reason: String| TaskError::InvalidInput {
+        task_id: task_id.clone(),
+        reason,
+    };
+    if let Some(missing) = requests.keys().find(|key| !responses.contains_key(*key)) {
+        return Err(invalid(format!(
+            "no response for input request '{missing}'"
+        )));
+    }
+    if let Some(unknown) = responses.keys().find(|key| !requests.contains_key(*key)) {
+        return Err(invalid(format!(
+            "'{unknown}' names no outstanding input request"
+        )));
+    }
+    Ok(())
 }
 
 /// Owns the task store and applies the lifecycle rules on top of it.
@@ -658,10 +709,12 @@ impl TaskManager {
         let detailed = DetailedTask::new(task.clone(), TaskPayload::Working);
         self.store.create(owner, detailed).await?;
         let cancel = CancellationToken::new();
+        let (inputs_tx, inputs) = mpsc::unbounded_channel();
         self.runs().insert(
             task.task_id.clone(),
             LiveRun {
                 cancel: cancel.clone(),
+                inputs: inputs_tx,
             },
         );
         Ok(TaskRun {
@@ -669,6 +722,7 @@ impl TaskManager {
             owner: owner.clone(),
             task,
             cancel,
+            inputs,
         })
     }
 
@@ -742,23 +796,59 @@ impl TaskManager {
             .await
     }
 
-    /// Apply client input responses, returning the task to `working`.
+    /// Apply a client's `tasks/update`: check `responses` against the task's
+    /// outstanding input requests, return the task to `working`, and hand the
+    /// responses to the operation waiting in [`TaskRun::request_input`].
     ///
     /// Rejects a task that is not currently awaiting input, so a stray
-    /// `tasks/update` cannot resurrect a settled task.
+    /// `tasks/update` cannot resurrect a settled task, and responses whose keys
+    /// differ from the outstanding requests'. A task no operation in this
+    /// process is running is refused with [`TaskError::Detached`] and left
+    /// awaiting input, rather than moved to a `working` nothing will finish.
     pub async fn apply_input(
         &self,
         owner: &TaskOwner,
         id: &TaskId,
+        responses: InputResponses,
     ) -> Result<DetailedTask, TaskError> {
-        let current = self.get(owner, id).await?;
-        if current.status() != TaskStatus::InputRequired {
-            return Err(TaskError::InvalidState {
-                task_id: id.clone(),
-                status: current.status(),
-            });
+        // Ownership first, so another owner's task reads as absent rather than
+        // as detached.
+        self.get(owner, id).await?;
+        let inputs = self
+            .runs()
+            .get(id)
+            .map(|run| run.inputs.clone())
+            .ok_or_else(|| TaskError::Detached(id.clone()))?;
+
+        let working = self
+            .store
+            .update(owner, id, &|current| {
+                let TaskPayload::InputRequired { input_requests } = &current.payload else {
+                    return Err(TaskError::InvalidState {
+                        task_id: id.clone(),
+                        status: current.status(),
+                    });
+                };
+                validate_input_keys(id, input_requests, &responses)?;
+                let mut task = current.task.clone();
+                task.last_updated_at = current_timestamp();
+                Ok(DetailedTask::new(task, TaskPayload::Working))
+            })
+            .await?;
+
+        if inputs.send(responses).is_err() {
+            // The run was dropped between the lookup and the send: the task is
+            // `working` with nobody working it, so settle it as failed.
+            let mut error = Map::new();
+            error.insert("code".to_owned(), Value::from(INTERNAL_ERROR));
+            error.insert(
+                "message".to_owned(),
+                Value::String("task operation ended before receiving its input".to_owned()),
+            );
+            self.fail(owner, id, error).await?;
+            return Err(TaskError::Detached(id.clone()));
         }
-        self.transition(owner, id, TaskPayload::Working).await
+        Ok(working)
     }
 
     /// Cancel a task: record `cancelled`, then fire the cancellation token of
@@ -809,6 +899,7 @@ pub struct TaskRun {
     owner: TaskOwner,
     task: Task,
     cancel: CancellationToken,
+    inputs: mpsc::UnboundedReceiver<InputResponses>,
 }
 
 impl Debug for TaskRun {
@@ -851,6 +942,33 @@ impl TaskRun {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Ask the client for input and wait for its answers.
+    ///
+    /// Moves the task to `input_required` carrying `input_requests` (keyed by
+    /// identifiers the client echoes back), then waits for the `tasks/update`
+    /// that answers every one of them, by which point the task is `working`
+    /// again. Returns [`TaskError::InvalidState`] with status `cancelled` if
+    /// the task is cancelled or expires while waiting.
+    pub async fn request_input(
+        &mut self,
+        input_requests: Map<String, Value>,
+    ) -> Result<InputResponses, TaskError> {
+        self.manager
+            .request_input(&self.owner, &self.task.task_id, input_requests)
+            .await?;
+        let cancelled = || TaskError::InvalidState {
+            task_id: self.task.task_id.clone(),
+            status: TaskStatus::Cancelled,
+        };
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(cancelled()),
+            responses = self.inputs.recv() => {
+                responses.ok_or_else(|| TaskError::Detached(self.task.task_id.clone()))
+            }
+        }
     }
 
     /// Complete the task with the original request's result shape.
