@@ -18,7 +18,10 @@
 //! span [`Observer::start`] returns is the one the dispatch runs in, so every
 //! span and event a tool handler emits nests under it.
 //!
-//! A server with no observer does none of this work.
+//! A server with no observer does none of this work. With the `otel` feature,
+//! [`OtelObserver`] records the `OpenTelemetry` MCP semantic conventions: a
+//! span per operation, joined to a `params._meta.traceparent` when the request
+//! carries one, and the `mcp.server.operation.duration` histogram.
 //!
 //! # Payloads
 //!
@@ -33,6 +36,9 @@
 //! [`McpServer::with_observer`]: crate::mcp::server::McpServer::with_observer
 //! [`McpServer::with_payload_capture`]: crate::mcp::server::McpServer::with_payload_capture
 
+#[cfg(feature = "otel")]
+mod otel;
+
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -44,6 +50,9 @@ use tracing::{Instrument, Span};
 use crate::mcp::modern::meta_keys;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::server::trace_context::TraceContext;
+
+#[cfg(feature = "otel")]
+pub use otel::{semconv, OtelObserver};
 
 /// `tools/call`, the method whose arguments and results are payloads.
 pub const TOOLS_CALL: &str = "tools/call";

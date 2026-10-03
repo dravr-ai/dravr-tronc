@@ -1,5 +1,5 @@
 // ABOUTME: Tracing subscriber initialization shared across all dravr-xxx server binaries
-// ABOUTME: Routes logs to stderr for stdio transport, optionally adds error notification + OTLP layers
+// ABOUTME: Routes logs to stderr for stdio transport, optionally adds error notification + OTLP trace and metric export
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -15,7 +15,9 @@ use opentelemetry::trace::TracerProvider as _;
 #[cfg(feature = "otel")]
 use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 #[cfg(feature = "otel")]
@@ -43,8 +45,13 @@ use tracing_subscriber::EnvFilter;
 /// every span (including downstream `#[instrument]` spans across the
 /// dravr workspace) is exported to a collector — Tempo, Jaeger,
 /// Honeycomb, or the GCP managed `OpenTelemetry` collector that fronts
-/// Cloud Trace on Cloud Run. The `OTEL_SERVICE_NAME` env var labels the
-/// service in the trace UI; falls back to `"dravr-service"` when unset.
+/// Cloud Trace on Cloud Run. The same endpoint receives metrics — the
+/// `mcp.server.operation.duration` histogram an
+/// [`OtelObserver`](crate::mcp::observe::OtelObserver) records — through a
+/// global meter provider, and the W3C trace-context propagator is installed
+/// for [`trace_context`](crate::server::trace_context). The
+/// `OTEL_SERVICE_NAME` env var labels the service in the trace UI; falls back
+/// to `"dravr-service"` when unset.
 pub fn init(transport: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -65,8 +72,8 @@ pub fn init(transport: &str) {
     }
 }
 
-/// Build the OpenTelemetry tracing layer when `OTEL_EXPORTER_OTLP_ENDPOINT`
-/// is configured.
+/// Build the OpenTelemetry tracing layer, and install the propagator and the
+/// meter provider beside it, when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured.
 ///
 /// Returns `None` when the env var is unset (so the local dev experience
 /// stays log-only without needing a collector running) or when exporter
@@ -85,7 +92,7 @@ where
 
     let exporter = match SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint)
+        .with_endpoint(endpoint.clone())
         .build()
     {
         Ok(exp) => exp,
@@ -101,13 +108,39 @@ where
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .build();
 
     let tracer = provider.tracer(service_name);
     global::set_tracer_provider(provider);
+    install_meter_provider(endpoint, resource);
 
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+/// Install the global meter provider, exporting over OTLP/gRPC to `endpoint`
+/// on the SDK's periodic schedule.
+///
+/// A metric exporter that fails to build is logged and skipped: traces still
+/// export, and the meters stay no-ops.
+#[cfg(feature = "otel")]
+fn install_meter_provider(endpoint: String, resource: Resource) {
+    match MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+    {
+        Ok(exporter) => {
+            let provider = SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            global::set_meter_provider(provider);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OTLP metric exporter init failed; exporting traces only");
+        }
+    }
 }
 
 /// Initialize tracing with the error notification layer enabled

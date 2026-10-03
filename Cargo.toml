@@ -44,11 +44,14 @@ google-iam = ["http-client", "dep:jsonwebtoken"]
 # guard's own answers. Opt-in because it names hyper to tell a connection
 # closed before any response from the other ways a send fails.
 service-client = ["google-iam", "dep:hyper"]
-# OTLP-based distributed tracing export. When enabled, `tracing_init::init`
-# also wires a `tracing-opentelemetry` layer that exports spans via OTLP
-# (gRPC) to whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at —
-# a self-hosted Tempo/Jaeger, Honeycomb, or the GCP managed OTel collector
-# fronting Cloud Trace on Cloud Run.
+# OTLP-based distributed tracing and metrics export. When enabled,
+# `tracing_init::init` also wires a `tracing-opentelemetry` layer that exports
+# spans, and a meter provider that exports metrics, via OTLP (gRPC) to
+# whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at — a self-hosted
+# Tempo/Jaeger, Honeycomb, or the GCP managed OTel collector fronting Cloud
+# Trace on Cloud Run. Also brings `mcp::observe::OtelObserver` (MCP
+# semantic-convention spans and the operation-duration histogram) and W3C
+# trace-context propagation through the request guard and `ServiceClient`.
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -79,7 +82,7 @@ hex = { version = "0.4", optional = true }
 hyper = { version = "1", default-features = false, optional = true }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics"], optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 ring = { version = "0.17", optional = true }
 schemars = { version = "1.2", optional = true }

@@ -319,6 +319,50 @@ client.delete("drop", "/api/widgets/7").timeout(Duration::from_secs(10)).send().
 - Set the client timeout above the service's `enforce_deadline`, so an overrun arrives as the
   guard's `504` and not as the client's own timeout.
 
+## Observability
+
+`mcp::observe::Observer` is a passive hook around every message `McpServer` dispatches, on every
+transport: `start` before dispatch with what the message says about itself (method, id, tool,
+protocol revision, session, `_meta` trace context), `complete` after with a typed
+`OperationOutcome` — `Completed`, `ToolError` (`isError: true`), `TaskCreated`, `Failed` (JSON-RPC
+code), `NotificationAccepted`, or `Cancelled` when the dispatch was dropped unanswered. The span
+`start` returns is the one dispatch runs in, so a tool handler's spans nest under it. No observer
+is installed by default, and an unobserved server does none of this work.
+
+With the `otel` feature, `OtelObserver` records the OpenTelemetry MCP semantic conventions, and
+`tracing_init` exports its spans and metrics to `OTEL_EXPORTER_OTLP_ENDPOINT`:
+
+```rust
+use dravr_tronc::mcp::observe::{OtelObserver, PayloadCapturePolicy, PayloadKind, PayloadSite};
+
+let server = McpServer::new("my-server", "0.1.0", registry, state)
+    .with_observer(Arc::new(OtelObserver::new()))
+    .with_payload_capture(
+        PayloadCapturePolicy::disabled()
+            .with_request_arguments(true)
+            .with_max_bytes(2048)
+            .with_redactor(Arc::new(|site: &PayloadSite<'_>, mut args: Value| {
+                args.as_object_mut()?.remove("athlete_id");
+                Some(args)
+            })),
+    );
+```
+
+- **Span** `"{mcp.method.name} {target}"` (`tools/call get_sleep`), kind `SERVER`, with
+  `mcp.method.name`, `jsonrpc.protocol.version`, `mcp.protocol.version`, `jsonrpc.request.id`,
+  `mcp.session.id`, and `gen_ai.tool.name` + `gen_ai.operation.name=execute_tool` (or
+  `gen_ai.prompt.name`). A JSON-RPC error sets `rpc.response.status_code` and `error.type` to its
+  code; a tool result with `isError` sets `error.type=tool_error`; both set an error status.
+- **Histogram** `mcp.server.operation.duration` (seconds), on the low-cardinality attributes only.
+- **Trace context.** A valid `params._meta.traceparent` parents the span; otherwise it is a child of
+  the HTTP `request` span, which continues the `traceparent` header. `ServiceClient` writes the
+  current context on every outbound call. See `server::trace_context`.
+- **Payloads** (`gen_ai.tool.call.arguments` / `.result`) are captured only when a
+  `PayloadCapturePolicy` asks for them. The host's `PayloadRedactor` runs on the JSON value first —
+  returning `None` keeps nothing — and the text is cut to `max_bytes` (default 4096) on a UTF-8
+  boundary with a `…(truncated)` marker. Payload attributes go to OpenTelemetry directly, never into
+  a log line.
+
 ## Health checks
 
 ```rust
