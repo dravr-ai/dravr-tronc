@@ -340,6 +340,7 @@ async fn a_deadline_layered_on_rest_routes_leaves_a_merged_mcp_route_uncut() {
         .oneshot(
             Request::post("/mcp")
                 .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream;q=0.5")
                 .body(Body::from(
                     json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                            "params": {"name": "slow", "arguments": {}}})
@@ -691,7 +692,7 @@ async fn the_standalone_mcp_transport_is_guarded() {
     let raw = raw_exchange(
         addr,
         &format!(
-            "POST /mcp HTTP/1.1\r\ncontent-type: application/json\r\n{REQUEST_ID_HEADER}: serve-check-1"
+            "POST /mcp HTTP/1.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream;q=0.5\r\n{REQUEST_ID_HEADER}: serve-check-1"
         ),
         r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
     )

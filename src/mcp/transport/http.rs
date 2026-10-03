@@ -22,7 +22,9 @@ use serde_json::Value;
 use tokio::net::{lookup_host, TcpListener};
 use tracing::{debug, error, info};
 
-use crate::error::{INTERNAL_ERROR, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION};
+use crate::error::{
+    INTERNAL_ERROR, INVALID_REQUEST, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
+};
 use crate::mcp::auth::AuthError;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
@@ -115,12 +117,14 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 
 /// Handle an incoming MCP POST request
 ///
-/// Enforces the `Origin` allowlist (403), refuses a body that is not a
-/// JSON-RPC Request (400), authenticates via the server's hook (401 +
+/// Enforces the `Origin` allowlist (403), refuses a body not declared
+/// `application/json` (415) and a client that does not accept both
+/// `application/json` and `text/event-stream` (406), refuses a body that is
+/// not a JSON-RPC Request (400), authenticates via the server's hook (401 +
 /// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
 /// spent budget; 500 when the host failed to decide), then dispatches under
 /// the resolved per-call context. A request's response is rendered as JSON or
-/// SSE; an accepted notification is answered 202 Accepted with no body.
+/// SSE, whichever the client's `Accept` weighs higher; an accepted notification is answered 202 Accepted with no body.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     headers: HeaderMap,
@@ -132,7 +136,27 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
 
-    // 2. Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
+    // 2. Media types. A body that is not `application/json` is refused before
+    // it is parsed: a browser sends `text/plain` and form bodies cross-origin
+    // without a CORS preflight, so admitting them would let a page reach the
+    // tools without the CORS policy ever being consulted. And the client must
+    // accept both answers this endpoint may give.
+    if !is_json_content_type(&headers) {
+        return transport_refusal(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            INVALID_REQUEST,
+            "Unsupported Media Type: Content-Type must be application/json",
+        );
+    }
+    if !accepts_json_and_event_stream(&headers) {
+        return transport_refusal(
+            StatusCode::NOT_ACCEPTABLE,
+            INVALID_REQUEST,
+            "Not Acceptable: Accept must list application/json and text/event-stream",
+        );
+    }
+
+    // 3. Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
     // a batch, a client's response, an id that is neither a string nor an
     // integer — is one this server cannot accept, which Streamable HTTP
     // answers with an HTTP error status, never a 2xx.
@@ -141,7 +165,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         Err(refusal) => return (StatusCode::BAD_REQUEST, Json(*refusal)).into_response(),
     };
 
-    // 3. Populate transport-derived fields for the auth hook. The credential
+    // 4. Populate transport-derived fields for the auth hook. The credential
     // comes from the `Authorization` header only; `parse` never reads one out
     // of the body.
     request.auth_token = bearer_token(&headers);
@@ -177,13 +201,13 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         request = request.with_metadata(MCP_PROTOCOL_VERSION_HEADER, version);
     }
 
-    // 4. Authenticate (RFC 9728 resource-server posture).
+    // 5. Authenticate (RFC 9728 resource-server posture).
     let ctx = match server.authenticate(&request).await {
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
     };
 
-    // 5. Dispatch under the resolved context.
+    // 6. Dispatch under the resolved context.
     let Some(response) = server.handle_request_with_context(request, &ctx).await else {
         // An accepted notification: Streamable HTTP requires 202 Accepted with
         // no body (basic/transports §Sending Messages to the Server).
@@ -192,13 +216,9 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
 
     debug!(method = "mcp", "Handled HTTP MCP request");
 
-    // 6. Render as JSON or a single SSE event.
-    let wants_sse = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|accept| accept.contains("text/event-stream"));
-
-    if wants_sse {
+    // 7. Render as JSON or a single SSE event, whichever the client weighs
+    // higher; a tie is answered as an event stream.
+    if prefers_event_stream(&headers) {
         respond_sse(&response)
     } else {
         Json(response).into_response()
@@ -264,6 +284,109 @@ fn auth_refusal_response(refusal: AuthError) -> Response {
         )
             .into_response(),
     }
+}
+
+/// A refusal the transport makes before dispatch: `status`, with a JSON-RPC
+/// error carrying no `id` — the request was never read far enough to have one
+/// that is answered.
+fn transport_refusal(status: StatusCode, code: i32, message: &str) -> Response {
+    (
+        status,
+        Json(JsonRpcResponse::error(None, code, message.to_owned())),
+    )
+        .into_response()
+}
+
+/// The media type every `POST /mcp` body must carry.
+const APPLICATION_JSON: &str = "application/json";
+
+/// The media type of the streamed answer.
+const TEXT_EVENT_STREAM: &str = "text/event-stream";
+
+/// Whether the request's `Content-Type` is `application/json`, parameters
+/// such as `charset` allowed. A missing or unreadable header is not.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case(APPLICATION_JSON))
+        })
+}
+
+/// One media range of an `Accept` header: its `type/subtype` and its weight.
+struct MediaRange<'a> {
+    media: &'a str,
+    quality: f32,
+}
+
+impl MediaRange<'_> {
+    /// Whether this range names `media` (`type/subtype`), exactly or through a
+    /// `*/*` or `type/*` wildcard, compared case-insensitively.
+    fn covers(&self, media: &str) -> bool {
+        if self.media == "*/*" || self.media.eq_ignore_ascii_case(media) {
+            return true;
+        }
+        match (self.media.split_once('/'), media.split_once('/')) {
+            (Some((range_type, "*")), Some((wanted_type, _))) => {
+                range_type.eq_ignore_ascii_case(wanted_type)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The media ranges of the request's `Accept` header (RFC 9110 §12.5.1). A
+/// range without a readable `q` weighs 1; an unreadable header lists none.
+fn accept_ranges(headers: &HeaderMap) -> Vec<MediaRange<'_>> {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|range| {
+            let mut parts = range.split(';');
+            let media = parts.next()?.trim();
+            if media.is_empty() {
+                return None;
+            }
+            let quality = parts
+                .filter_map(|param| param.trim().split_once('='))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .and_then(|(_, q)| q.trim().parse::<f32>().ok())
+                .unwrap_or(1.0);
+            Some(MediaRange { media, quality })
+        })
+        .collect()
+}
+
+/// The weight the client gives `media`: the highest `q` among the ranges
+/// covering it, or 0 when none does.
+fn accept_weight(ranges: &[MediaRange<'_>], media: &str) -> f32 {
+    ranges
+        .iter()
+        .filter(|range| range.covers(media))
+        .map(|range| range.quality)
+        .fold(0.0, f32::max)
+}
+
+/// Whether the client accepts both answers a POST may get — the Streamable
+/// HTTP rule that its `Accept` list `application/json` and
+/// `text/event-stream`. A range weighted `q=0` refuses its type.
+fn accepts_json_and_event_stream(headers: &HeaderMap) -> bool {
+    let ranges = accept_ranges(headers);
+    accept_weight(&ranges, APPLICATION_JSON) > 0.0
+        && accept_weight(&ranges, TEXT_EVENT_STREAM) > 0.0
+}
+
+/// Whether to answer as an event stream: the client weighs it at least as
+/// high as JSON.
+fn prefers_event_stream(headers: &HeaderMap) -> bool {
+    let ranges = accept_ranges(headers);
+    accept_weight(&ranges, TEXT_EVENT_STREAM) >= accept_weight(&ranges, APPLICATION_JSON)
 }
 
 /// Whether a request with these `headers` passes the `allowed` `Origin` list —
@@ -415,7 +538,7 @@ fn respond_sse(response: &JsonRpcResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{INVALID_REQUEST, PARSE_ERROR};
+    use crate::error::PARSE_ERROR;
     use crate::mcp::auth::AuthHook;
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
@@ -423,6 +546,9 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    /// What a conforming client sends, weighted so the answer is plain JSON.
+    const TEST_ACCEPT: &str = "application/json, text/event-stream;q=0.5";
 
     struct TestState;
 
@@ -530,6 +656,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -555,6 +682,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -576,6 +704,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body("not json".to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -612,7 +741,8 @@ mod tests {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/mcp")
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -686,6 +816,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .header(
                 "origin",
                 header::HeaderValue::from_bytes(b"http://localhost\xff")
@@ -792,7 +923,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
+            .header("accept", "application/json, text/event-stream")
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -806,6 +937,107 @@ mod tests {
         assert!(content_type.contains("text/event-stream"));
     }
 
+    /// POST a ping carrying exactly `headers`, returning the status and body.
+    async fn post_raw(headers: &[(&str, &str)]) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("POST").uri("/mcp");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_owned())
+            .expect("request"); // Safe: test fixture
+        let response = make_app().oneshot(request).await.expect("response"); // Safe: test assertion
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body") // Safe: test assertion
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A body that is not declared JSON is refused with 415 before it is
+    /// read: a browser sends `text/plain` and form bodies cross-origin without
+    /// a preflight, so admitting them would bypass the CORS policy.
+    #[tokio::test]
+    async fn a_body_not_declared_json_is_refused_with_415() {
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data; boundary=x"),
+            Some("application/jsonp"),
+        ] {
+            let mut headers = vec![("accept", TEST_ACCEPT)];
+            if let Some(content_type) = content_type {
+                headers.push(("content-type", content_type));
+            }
+            let (status, body) = post_raw(&headers).await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type:?}"
+            );
+            let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+            assert_eq!(json["error"]["code"], INVALID_REQUEST);
+            assert_eq!(json["id"], Value::Null);
+        }
+    }
+
+    /// `application/json` is matched on its media type alone: parameters and
+    /// case do not matter.
+    #[tokio::test]
+    async fn a_json_content_type_with_parameters_is_accepted() {
+        for content_type in ["application/json; charset=utf-8", "Application/JSON"] {
+            let (status, _) =
+                post_raw(&[("content-type", content_type), ("accept", TEST_ACCEPT)]).await;
+            assert_eq!(status, StatusCode::OK, "{content_type}");
+        }
+    }
+
+    /// A client that does not accept both answers this endpoint may give is
+    /// refused with 406.
+    #[tokio::test]
+    async fn an_accept_missing_either_type_is_refused_with_406() {
+        for accept in [
+            None,
+            Some("application/json"),
+            Some("text/event-stream"),
+            Some("text/html"),
+            Some("application/json, text/event-stream;q=0"),
+            Some("*/*;q=0"),
+        ] {
+            let mut headers = vec![("content-type", APPLICATION_JSON)];
+            if let Some(accept) = accept {
+                headers.push(("accept", accept));
+            }
+            let (status, body) = post_raw(&headers).await;
+            assert_eq!(status, StatusCode::NOT_ACCEPTABLE, "{accept:?}");
+            let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+            assert_eq!(json["error"]["code"], INVALID_REQUEST);
+        }
+    }
+
+    /// Wildcards cover both types, and the higher weight picks the rendering;
+    /// a tie is answered as an event stream.
+    #[tokio::test]
+    async fn accept_wildcards_pass_and_weights_pick_the_rendering() {
+        for (accept, sse) in [
+            ("*/*", true),
+            ("application/*, text/*", true),
+            ("application/json, text/event-stream", true),
+            ("application/json;q=0.4, text/event-stream;q=0.9", true),
+            ("application/json, text/event-stream;q=0.5", false),
+            ("application/json, */*;q=0.1", false),
+        ] {
+            let (status, body) =
+                post_raw(&[("content-type", APPLICATION_JSON), ("accept", accept)]).await;
+            assert_eq!(status, StatusCode::OK, "{accept}");
+            assert_eq!(body.starts_with("data:"), sse, "{accept}: {body}");
+        }
+    }
+
     #[tokio::test]
     async fn mcp_post_tools_list() {
         let app = make_app();
@@ -814,6 +1046,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -847,6 +1080,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -869,6 +1103,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .header("origin", "https://evil.test")
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
@@ -885,6 +1120,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -908,6 +1144,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .header("origin", "https://app.example.test")
             .header("authorization", "Bearer user")
             .body(body.to_owned())
@@ -933,6 +1170,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .header("authorization", "Bearer admin")
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
@@ -957,6 +1195,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
             .header("authorization", "Bearer user")
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
@@ -1018,6 +1257,7 @@ mod tests {
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
+                    .header("accept", TEST_ACCEPT)
                     .body(
                         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
                                "params":{"name":"hello","arguments":{}}})
@@ -1088,6 +1328,7 @@ mod tests {
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
+                    .header("accept", TEST_ACCEPT)
                     .header("x-forwarded-host", "mcp.example.test")
                     .header("authorization", "Bearer secret-token")
                     .header("cookie", "session=secret")
@@ -1159,6 +1400,7 @@ mod tests {
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
+                    .header("accept", TEST_ACCEPT)
                     .body(
                         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
                                "params":{"name":"hello","arguments":{}}})
@@ -1270,6 +1512,7 @@ mod tests {
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
+                    .header("accept", TEST_ACCEPT)
                     .header(MCP_PROTOCOL_VERSION_HEADER, "1999-01-01")
                     .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
                     .expect("request"), // Safe: test fixture
@@ -1311,6 +1554,7 @@ mod tests {
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
+                    .header("accept", TEST_ACCEPT)
                     .header(MCP_PROTOCOL_VERSION_HEADER, supported.as_str())
                     .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string())
                     .expect("request"), // Safe: test fixture

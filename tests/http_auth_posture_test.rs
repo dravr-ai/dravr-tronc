@@ -100,7 +100,7 @@ async fn post_mcp(port: u16, bearer: Option<&str>, body: &str) -> String {
     let auth = bearer.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
-         Accept: application/json\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         Accept: application/json, text/event-stream;q=0.5\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.expect("write");
@@ -210,7 +210,8 @@ async fn call(env_var: &str, bearer: Option<&str>) -> (u16, Option<String>, Valu
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream;q=0.5");
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
