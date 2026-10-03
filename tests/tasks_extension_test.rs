@@ -57,7 +57,7 @@ impl ToolDispatcher<TestState> for TaskingDispatcher {
             user_id: ctx.user_id.clone(),
             tenant_id: ctx.tenant_id.clone(),
         };
-        match self.manager.create(&owner, TaskId::new("task-1")).await {
+        match self.manager.create(&owner).await {
             Ok(task) => CallToolOutcome::Task(Box::new(task)),
             Err(e) => CallToolOutcome::Immediate(Box::new(ToolResponse::error(e.to_string()))),
         }
@@ -223,7 +223,23 @@ async fn tools_call_returns_a_task_handle_only_when_declared() {
     let response = server.handle_raw(&raw).await.expect("response");
     let result = response.result.expect("success");
     assert_eq!(result["resultType"], "task");
-    assert_eq!(result["taskId"], "task-1");
+    let task_id = result["taskId"].as_str().expect("a string task id");
+    assert_eq!(task_id.len(), 32, "128 bits of hex: {task_id}");
+    assert!(task_id.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+/// Anonymous callers all share the default owner, so the id is the only thing
+/// between one caller's task and another's: two tasks never share one, and an
+/// id is never a predictable sequence.
+#[tokio::test]
+async fn task_ids_are_minted_unguessable_by_the_engine() {
+    let manager = manager();
+    let owner = TaskOwner::default();
+    let first = manager.create(&owner).await.expect("created").task_id;
+    let second = manager.create(&owner).await.expect("created").task_id;
+    assert_ne!(first, second);
+    assert_eq!(first.as_str().len(), 32);
+    assert_ne!(first.as_str(), "0".repeat(32));
 }
 
 #[tokio::test]
@@ -319,17 +335,14 @@ async fn a_task_is_invisible_to_a_different_owner() {
         tenant_id: Some("t2".to_owned()),
     };
 
-    manager
-        .create(&alice, TaskId::new("secret"))
-        .await
-        .expect("created");
+    let secret = manager.create(&alice).await.expect("created").task_id;
 
     assert!(
-        manager.get(&alice, &TaskId::new("secret")).await.is_ok(),
+        manager.get(&alice, &secret).await.is_ok(),
         "the owner can read their own task"
     );
     assert!(
-        manager.get(&mallory, &TaskId::new("secret")).await.is_err(),
+        manager.get(&mallory, &secret).await.is_err(),
         "a guessed task id must not resolve for another owner"
     );
 }
@@ -338,8 +351,7 @@ async fn a_task_is_invisible_to_a_different_owner() {
 async fn a_terminal_task_refuses_further_transitions() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let id = TaskId::new("done");
-    manager.create(&owner, id.clone()).await.expect("created");
+    let id = manager.create(&owner).await.expect("created").task_id;
     manager
         .complete(&owner, &id, Map::new())
         .await
@@ -356,8 +368,7 @@ async fn a_terminal_task_refuses_further_transitions() {
 async fn tasks_update_requires_the_task_to_be_awaiting_input() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let id = TaskId::new("working");
-    manager.create(&owner, id.clone()).await.expect("created");
+    let id = manager.create(&owner).await.expect("created").task_id;
 
     assert!(
         manager.apply_input(&owner, &id).await.is_err(),
@@ -391,7 +402,11 @@ async fn tasks_get_returns_the_result_inline_once_complete() {
         "params": { "name": "slow", "arguments": {}, "_meta": modern_meta(true) }
     })
     .to_string();
-    server.handle_raw(&call).await.expect("created");
+    let created = server.handle_raw(&call).await.expect("created");
+    let task_id = created.result.expect("a task handle")["taskId"]
+        .as_str()
+        .expect("a string task id")
+        .to_owned();
 
     let mut result = Map::new();
     result.insert(
@@ -399,13 +414,13 @@ async fn tasks_get_returns_the_result_inline_once_complete() {
         json!([{"type": "text", "text": "done"}]),
     );
     manager
-        .complete(&TaskOwner::default(), &TaskId::new("task-1"), result)
+        .complete(&TaskOwner::default(), &TaskId::new(task_id.clone()), result)
         .await
         .expect("completes");
 
     let get = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
-        "params": { "taskId": "task-1", "_meta": modern_meta(true) }
+        "params": { "taskId": task_id, "_meta": modern_meta(true) }
     })
     .to_string();
     let response = server.handle_raw(&get).await.expect("response");
@@ -428,11 +443,15 @@ async fn tasks_cancel_moves_the_task_to_cancelled() {
         "params": { "name": "slow", "arguments": {}, "_meta": modern_meta(true) }
     })
     .to_string();
-    server.handle_raw(&call).await.expect("created");
+    let created = server.handle_raw(&call).await.expect("created");
+    let task_id = created.result.expect("a task handle")["taskId"]
+        .as_str()
+        .expect("a string task id")
+        .to_owned();
 
     let cancel = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tasks/cancel",
-        "params": { "taskId": "task-1", "_meta": modern_meta(true) }
+        "params": { "taskId": task_id, "_meta": modern_meta(true) }
     })
     .to_string();
     let response = server.handle_raw(&cancel).await.expect("response");
@@ -440,7 +459,7 @@ async fn tasks_cancel_moves_the_task_to_cancelled() {
 
     assert_eq!(
         manager
-            .get(&TaskOwner::default(), &TaskId::new("task-1"))
+            .get(&TaskOwner::default(), &TaskId::new(task_id))
             .await
             .expect("still readable")
             .status(),

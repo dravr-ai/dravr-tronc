@@ -58,16 +58,43 @@ pub mod method_names {
     pub const TASKS_CANCEL: &str = "tasks/cancel";
 }
 
+/// Bytes of OS randomness behind a minted [`TaskId`]: 128 bits, the same
+/// strength as a random UUID, rendered as 32 lowercase hex characters.
+const TASK_ID_BYTES: usize = 16;
+
+/// Lowercase hexadecimal alphabet for rendering a minted [`TaskId`].
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 /// Opaque, server-minted task identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(String);
 
 impl TaskId {
-    /// Wrap an existing identifier string.
+    /// Wrap an existing identifier string — one read off the wire or out of a
+    /// store. New tasks get theirs from [`Self::generate`].
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    /// Mint a fresh identifier from the operating system's CSPRNG.
+    ///
+    /// A task id is a bearer capability: every caller the auth hook cannot
+    /// tell apart — all anonymous callers of an unauthenticated server — maps
+    /// to the same [`TaskOwner`], so for them the id is the only thing between
+    /// one caller's task and another's `tasks/get` or `tasks/cancel`. That is
+    /// why the engine mints it rather than taking one from the host.
+    pub fn generate() -> Result<Self, TaskError> {
+        let mut bytes = [0_u8; TASK_ID_BYTES];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| TaskError::Store(format!("no OS randomness for a task id: {e}")))?;
+        let mut id = String::with_capacity(TASK_ID_BYTES * 2);
+        for byte in bytes {
+            id.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            id.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+        }
+        Ok(Self(id))
     }
 
     /// Borrow the identifier as a string slice.
@@ -368,6 +395,10 @@ impl TaskAck {
 /// one caller's tasks to another; this engine enforces the same boundary on
 /// every lookup, so a task id guessed or leaked across tenants still reads as
 /// absent.
+///
+/// Callers the auth hook resolves to no identity all share the default owner,
+/// so between them the boundary is the id alone — which is why ids come from
+/// [`TaskId::generate`] and never from the host.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct TaskOwner {
     /// Authenticated caller id, if any.
@@ -554,12 +585,11 @@ impl TaskManager {
 
     /// Create a working task owned by `owner` and return its seed state.
     ///
-    /// The identifier must be unguessable; callers pass one minted from a
-    /// cryptographic source (the engine does not choose a generator so a host
-    /// can align ids with its own database keys).
-    pub async fn create(&self, owner: &TaskOwner, task_id: TaskId) -> Result<Task, TaskError> {
+    /// The engine mints the id with [`TaskId::generate`]; a host that keys its
+    /// own records on it reads it back from the returned task.
+    pub async fn create(&self, owner: &TaskOwner) -> Result<Task, TaskError> {
         let task = Task::new(
-            task_id,
+            TaskId::generate()?,
             self.options.ttl_ms,
             Some(self.options.poll_interval_ms),
         );

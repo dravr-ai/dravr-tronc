@@ -422,6 +422,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "http-body-util",

@@ -57,6 +57,8 @@ jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_c
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+# Task ids are bearer capabilities, so they are minted from the OS CSPRNG.
+getrandom = "0.3"
 hex = { version = "0.4", optional = true }
 # Must be the hyper reqwest 0.12 links (1.x): the closed-connection check
 # downcasts to hyper::Error, and a second hyper would never match.
