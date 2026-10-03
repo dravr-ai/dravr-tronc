@@ -213,6 +213,25 @@ fn transport_failure(error: &ServiceError) -> TransportFailure {
     }
 }
 
+/// Whether a consumer would retry after `error`, decided per variant with no
+/// wildcard arm — the way pierre maps a failure to its error code. This file
+/// stops building when either enum grows a variant or turns
+/// `non_exhaustive`, which is the guard that mapping relies on.
+fn retryable(error: &ServiceError) -> bool {
+    match error {
+        ServiceError::Transport { failure, .. } => match failure {
+            TransportFailure::TimedOut
+            | TransportFailure::Unreachable
+            | TransportFailure::ClosedBeforeResponse => true,
+            TransportFailure::Other => false,
+        },
+        ServiceError::Shed { .. } | ServiceError::Unfinished { .. } => true,
+        ServiceError::Identity { .. } | ServiceError::Body { .. } | ServiceError::Decode { .. } => {
+            false
+        }
+    }
+}
+
 /// A loopback address nothing listens on.
 fn closed_port() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -406,6 +425,7 @@ async fn an_unreachable_service_is_classified() {
     assert_eq!(transport_failure(&error), TransportFailure::Unreachable);
     let text = error.to_string();
     assert!(text.contains("could not connect"), "{text}");
+    assert!(retryable(&error));
 }
 
 #[tokio::test]
@@ -423,6 +443,7 @@ async fn a_request_that_cannot_be_built_is_other() {
     assert_eq!(transport_failure(&error), TransportFailure::Other);
     let text = error.to_string();
     assert!(text.contains("could not be sent"), "{text}");
+    assert!(!retryable(&error));
     assert!(requests(&seen).is_empty(), "nothing reaches the network");
 }
 

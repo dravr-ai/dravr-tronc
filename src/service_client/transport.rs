@@ -16,8 +16,12 @@ use std::error::Error as StdError;
 use std::io;
 
 /// How a request failed when no HTTP response came back.
+///
+/// Exhaustive on purpose: a consumer decides per variant whether the service
+/// is unavailable or the request was malformed, with no wildcard arm, so a
+/// variant added here must fail its build. See
+/// [`ServiceError`](super::ServiceError).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TransportFailure {
     /// The client's own timeout elapsed first.
     TimedOut,

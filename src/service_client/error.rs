@@ -51,8 +51,12 @@ impl Unfinished {
 ///
 /// The [`Exchange`] is boxed so that a `Result` carrying this error stays
 /// small on the path where nothing failed.
+///
+/// Exhaustive on purpose, as is [`TransportFailure`]: a consumer maps each
+/// variant to its own error code, status and retry policy, and matches them
+/// with no wildcard arm so that a variant added here fails its build until
+/// it is given one. A new variant is a major release.
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum ServiceError {
     /// No identity token could be minted. Nothing was sent, so there is no
     /// request id.
