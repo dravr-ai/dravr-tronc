@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitflags::bitflags;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::mcp::schema::{Tool, ToolResponse};
 use crate::mcp::tasks::{CancellationToken, TASKS_EXTENSION_ID};
@@ -96,6 +96,14 @@ pub struct ToolContext {
     /// stop it. A transport may install its own token here (one tied to the
     /// connection, say); the engine derives each request's token from it.
     pub cancellation: CancellationToken,
+    /// The client's answers to an earlier
+    /// [`CallToolOutcome::InputRequired`](crate::mcp::host::CallToolOutcome::InputRequired),
+    /// carried by the retried call's `inputResponses` (SEP-2322). `None` on a
+    /// first attempt.
+    pub input_responses: Option<Map<String, Value>>,
+    /// The `requestState` an earlier input-required answer handed the client,
+    /// echoed back on its retry. Client-held, so verify anything relied on.
+    pub request_state: Option<String>,
 }
 
 impl ToolContext {

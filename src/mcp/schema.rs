@@ -149,12 +149,88 @@ pub struct Tool {
 
 /// Parameters for a `tools/call` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     /// Name of the tool to invoke.
     pub name: String,
     /// Tool arguments as JSON.
     #[serde(default)]
     pub arguments: Option<serde_json::Value>,
+    /// The client's answers to the `inputRequests` of an earlier
+    /// [`InputRequiredResult`], when this call retries one (SEP-2322), keyed
+    /// like the requests they answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_responses: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The opaque `requestState` of an earlier [`InputRequiredResult`],
+    /// echoed back by the client on retry (SEP-2322).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_state: Option<String>,
+}
+
+/// SEP-2322 `InputRequiredResult`: the server needs more from the client
+/// before it can answer, and says so instead of a result.
+///
+/// The client fulfils `inputRequests` (elicitation, sampling, roots) and
+/// retries the original request carrying `inputResponses` under the same keys,
+/// plus `requestState` verbatim. Serializes flat beside
+/// `resultType: "input_required"`. At least one of the two fields is always
+/// present, which the constructors guarantee.
+///
+/// `requestState` round-trips through the client, which must treat it as
+/// opaque but can change it: a server that puts anything it relies on there
+/// authenticates it (a MAC, an AEAD) before trusting it on retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputRequiredResult {
+    /// Always `"input_required"`.
+    result_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_requests: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_state: Option<String>,
+}
+
+impl InputRequiredResult {
+    /// Ask the client to fulfil `input_requests`, keyed by identifiers it
+    /// echoes back in `inputResponses`.
+    #[must_use]
+    pub const fn new(input_requests: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self {
+            result_type: "input_required",
+            input_requests: Some(input_requests),
+            request_state: None,
+        }
+    }
+
+    /// Ask the client only to retry with `request_state` — no input needed,
+    /// the shape a server shedding load uses to resume work later.
+    #[must_use]
+    pub fn retry_with_state(request_state: impl Into<String>) -> Self {
+        Self {
+            result_type: "input_required",
+            input_requests: None,
+            request_state: Some(request_state.into()),
+        }
+    }
+
+    /// Attach state the client echoes back on retry.
+    #[must_use]
+    pub fn with_request_state(mut self, request_state: impl Into<String>) -> Self {
+        self.request_state = Some(request_state.into());
+        self
+    }
+
+    /// The outstanding requests, if any.
+    #[must_use]
+    pub const fn input_requests(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.input_requests.as_ref()
+    }
+
+    /// The state the client echoes back, if any.
+    #[must_use]
+    pub fn request_state(&self) -> Option<&str> {
+        self.request_state.as_deref()
+    }
 }
 
 /// Result of a `tools/call` invocation.

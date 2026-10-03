@@ -455,7 +455,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             // era, so a legacy client can never be handed a task handle it has
             // no contract for (and whose response would skip `resultType`).
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, ctx, false)
+                self.handle_tools_call(request.id, request.params, ctx, false, false)
                     .await
             }
             "server/discover" => self.handle_server_discover(request.id),
@@ -496,7 +496,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             "server/discover" => self.handle_server_discover(request.id),
             "tools/list" => self.handle_tools_list(request.id, &ctx).await,
             "tools/call" => {
-                self.handle_tools_call(request.id, request.params, &ctx, declares_tasks)
+                self.handle_tools_call(request.id, request.params, &ctx, true, declares_tasks)
                     .await
             }
             method @ (task_methods::TASKS_GET
@@ -708,14 +708,18 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Handle `tools/call` — dispatch to the named tool handler under `ctx`.
     ///
-    /// `allow_tasks` is true only for a modern-era call whose client declared
-    /// the tasks extension; it gates whether the dispatcher's
-    /// [`CallToolOutcome::Task`] may be framed as a handle.
+    /// `modern` is true for a modern-era call, the only kind whose result can
+    /// carry a `resultType` and so the only kind a
+    /// [`CallToolOutcome::InputRequired`] may answer. `allow_tasks` is true
+    /// only for a modern-era call whose client declared the tasks extension;
+    /// it gates whether the dispatcher's [`CallToolOutcome::Task`] may be
+    /// framed as a handle.
     async fn handle_tools_call(
         &self,
         id: Option<Value>,
         params: Option<Value>,
         ctx: &ToolContext,
+        modern: bool,
         allow_tasks: bool,
     ) -> JsonRpcResponse {
         let call: ToolCall = match params {
@@ -741,6 +745,13 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         let arguments = call
             .arguments
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        // A retry after an input-required answer carries the client's answers
+        // and the echoed state; the tool reads them off its context.
+        let ctx = &ToolContext {
+            input_responses: call.input_responses,
+            request_state: call.request_state,
+            ..ctx.clone()
+        };
 
         // A host dispatcher owns the whole call (quota, exec, usage); otherwise
         // execute against the built-in registry, which is always synchronous.
@@ -775,6 +786,15 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 id,
                 INTERNAL_ERROR,
                 "Tool returned a task handle, but this call may not be answered asynchronously"
+                    .to_owned(),
+            ),
+            CallToolOutcome::InputRequired(input) if modern => Self::success_or_error(id, &input),
+            // A legacy result has no `resultType`, so a legacy client would
+            // read the request for input as a malformed tool result.
+            CallToolOutcome::InputRequired(_) => JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                "Tool asked for input, but a legacy-era call cannot carry an input-required result"
                     .to_owned(),
             ),
         }

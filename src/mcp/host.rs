@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::mcp::protocol::JsonRpcResponse;
-use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::schema::{InputRequiredResult, Tool, ToolResponse};
 use crate::mcp::tasks::Task;
 use crate::mcp::tool::ToolContext;
 
@@ -56,6 +56,18 @@ pub enum CallToolOutcome {
     /// is true; the engine refuses it otherwise, because the specification
     /// forbids handing a task to a client that did not declare the extension.
     Task(Box<Task>),
+    /// The tool needs more from the client before it can answer (SEP-2322
+    /// multi round-trip, outside any task). The engine frames this as a
+    /// `resultType: "input_required"` result; the client's retry carries its
+    /// answers and the echoed state in
+    /// [`ToolContext::input_responses`](crate::mcp::tool::ToolContext::input_responses)
+    /// and [`ToolContext::request_state`](crate::mcp::tool::ToolContext::request_state).
+    ///
+    /// Only a modern-era call (revision `2026-07-28`) can carry it — a legacy
+    /// result has no `resultType` — so the engine refuses it on a legacy call.
+    /// The host asks only for input the client declared it can provide
+    /// (elicitation, sampling, roots) on this request.
+    InputRequired(Box<InputRequiredResult>),
 }
 
 impl From<ToolResponse> for CallToolOutcome {
