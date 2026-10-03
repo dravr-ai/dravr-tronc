@@ -12,6 +12,7 @@
 //! free of any project-specific coupling so every `dravr-*` MCP server shares a
 //! single canonical wire vocabulary.
 
+use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
@@ -604,13 +605,55 @@ pub struct EmbeddedResource {
 /// The contents of a resource, as the spec's
 /// `TextResourceContents | BlobResourceContents` union: the two carry no
 /// tag, and are told apart by holding `text` or `blob`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Contents holding both are refused rather than read as one kind with the
+/// other field dropped, so a relayed block never loses its text or bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ResourceContents {
     /// Contents representable as text.
     Text(TextResourceContents),
     /// Binary contents, base64-encoded.
     Blob(BlobResourceContents),
+}
+
+/// Every field either kind of [`ResourceContents`] may carry, read before
+/// the kind is chosen by which of `text` and `blob` is present.
+#[derive(Deserialize)]
+struct ResourceContentsWire {
+    uri: String,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    text: Option<String>,
+    blob: Option<String>,
+    #[serde(rename = "_meta")]
+    meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'de> Deserialize<'de> for ResourceContents {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ResourceContentsWire::deserialize(deserializer)?;
+        match (wire.text, wire.blob) {
+            (Some(text), None) => Ok(Self::Text(TextResourceContents {
+                uri: wire.uri,
+                mime_type: wire.mime_type,
+                text,
+                meta: wire.meta,
+            })),
+            (None, Some(blob)) => Ok(Self::Blob(BlobResourceContents {
+                uri: wire.uri,
+                mime_type: wire.mime_type,
+                blob,
+                meta: wire.meta,
+            })),
+            (Some(_), Some(_)) => Err(DeError::custom(
+                "resource contents hold both `text` and `blob`",
+            )),
+            (None, None) => Err(DeError::custom(
+                "resource contents hold neither `text` nor `blob`",
+            )),
+        }
+    }
 }
 
 impl ResourceContents {
@@ -1871,6 +1914,32 @@ mod tests {
 
         let neither = json!({ "type": "resource", "resource": { "uri": "test://n" } });
         assert!(serde_json::from_value::<Content>(neither).is_err());
+    }
+
+    /// Contents holding both `text` and `blob` are refused: read as text,
+    /// they would come back out without their bytes.
+    #[test]
+    fn resource_contents_holding_text_and_blob_are_refused() {
+        let both = json!({ "uri": "x://a", "text": "t", "blob": "AA==" });
+        let refused =
+            serde_json::from_value::<ResourceContents>(both.clone()).expect_err("both fields"); // Safe: test assertion
+        assert!(refused.to_string().contains("both `text` and `blob`"));
+
+        let block = json!({ "type": "resource", "resource": both });
+        assert!(serde_json::from_value::<Content>(block).is_err());
+    }
+
+    /// Every field of either kind survives a read and a write back.
+    #[test]
+    fn resource_contents_round_trip_every_field() {
+        for wire in [
+            json!({ "uri": "x://t", "mimeType": "text/plain", "text": "t", "_meta": { "k": 1 } }),
+            json!({ "uri": "x://b", "mimeType": "image/png", "blob": "AA==", "_meta": { "k": 2 } }),
+        ] {
+            let contents: ResourceContents =
+                serde_json::from_value(wire.clone()).expect("contents"); // Safe: test assertion
+            assert_eq!(serde_json::to_value(&contents).expect("json"), wire); // Safe: test assertion
+        }
     }
 
     #[test]
