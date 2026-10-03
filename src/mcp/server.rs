@@ -55,6 +55,13 @@ fn default_supported_versions() -> Vec<String> {
     ]
 }
 
+/// Earlier `initialize`-era revisions the current one serves unchanged.
+///
+/// 2025-06-18 introduced the `MCP-Protocol-Version` header, and 2025-03-26 is
+/// the revision a server reads a request without one as. Accepted on that
+/// header, never negotiated: `initialize` still answers [`PROTOCOL_VERSION`].
+pub const EARLIER_LEGACY_REVISIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
+
 /// The largest request body the HTTP transport reads by default: 4 MiB.
 ///
 /// A JSON-RPC request is a method name and its arguments; this leaves room
@@ -850,9 +857,18 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// against. Refusing an unsupported one there is the only place it can be
     /// refused, which is why this is public while `Self::supports_version` is
     /// not.
+    ///
+    /// Besides every advertised revision, a server serving the current
+    /// `initialize` era ([`PROTOCOL_VERSION`]) accepts the earlier ones that
+    /// era serves unchanged on a request ([`EARLIER_LEGACY_REVISIONS`]):
+    /// Streamable HTTP tells a server to read a request carrying no header as
+    /// 2025-03-26, and this one serves such a request, so refusing the same
+    /// request when it names 2025-03-26 would contradict itself.
     #[must_use]
     pub fn accepts_protocol_version(&self, version: &str) -> bool {
         self.supports_version(version)
+            || (self.supports_version(PROTOCOL_VERSION)
+                && EARLIER_LEGACY_REVISIONS.contains(&version))
     }
 
     /// The revisions this server advertises, for a transport building an

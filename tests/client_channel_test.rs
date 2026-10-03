@@ -463,6 +463,19 @@ async fn a_response_post_carries_no_mirror_and_is_accepted() {
 }
 
 #[tokio::test]
+async fn an_earlier_legacy_revision_header_is_served() {
+    for version in ["2025-03-26", "2025-06-18"] {
+        let client = McpTestClient::in_process(Arc::new(sessionless()))
+            .with_header("mcp-protocol-version", version);
+        let answer = client
+            .raw(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .await
+            .unwrap();
+        assert_eq!(answer.status, 200, "{version}: {}", answer.body);
+    }
+}
+
+#[tokio::test]
 async fn a_tool_panicking_mid_stream_ends_with_an_internal_error() {
     let client = McpTestClient::in_process(Arc::new(sessionless()));
     let streamed = client
