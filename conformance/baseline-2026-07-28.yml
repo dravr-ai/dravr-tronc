@@ -1,0 +1,24 @@
+# ABOUTME: Expected conformance failures, @modelcontextprotocol/conformance 0.2.0-alpha.11 vs spec 2026-07-28
+# ABOUTME: The scenarios examples/conformance_server.rs fails today; a fix removes its line here
+#
+# Read by scripts/ci/conformance.sh. A scenario listed here that starts passing fails the run
+# as a stale entry, so this list only ever shrinks with the change that earns it.
+server:
+  # Completion: no completion/complete handler.
+  - completion-complete
+  # Content blocks the engine does not model (schema.rs Content: text and image only).
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+  # Notifications sent during a call: a tools/call answers with one response.
+  - tools-call-with-progress
+  # Resources and prompts: served by a host MethodHandler, none in the engine.
+  - resources-list
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+  - prompts-list
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image

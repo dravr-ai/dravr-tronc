@@ -340,6 +340,15 @@ struct Cli {
 }
 ```
 
+## Conformance
+
+CI runs the official [MCP conformance suite](https://github.com/modelcontextprotocol/conformance)
+against `examples/conformance_server.rs` — a plain `McpServer` with the suite's fixture tools —
+for both eras: suite `0.1.16` against spec `2025-11-25`, and `0.2.0-alpha.11` against
+`2026-07-28`. What the engine fails today is listed, per spec, in `conformance/baseline-<spec>.yml`;
+a new failure fails the job, and so does a listed scenario that starts passing, so a fix removes
+its line in the same change. Run it locally with `bash scripts/ci/conformance.sh` (needs `npx`).
+
 ## Recommended project layout
 
 ```

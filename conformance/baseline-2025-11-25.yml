@@ -1,0 +1,37 @@
+# ABOUTME: Expected conformance failures, @modelcontextprotocol/conformance 0.1.16 vs spec 2025-11-25
+# ABOUTME: The scenarios examples/conformance_server.rs fails today; a fix removes its line here
+#
+# Read by scripts/ci/conformance.sh. A scenario listed here that starts passing fails the run
+# as a stale entry, so this list only ever shrinks with the change that earns it.
+server:
+  # Logging: no logging/setLevel handler.
+  - logging-set-level
+  - tools-call-with-logging
+  # Completion: no completion/complete handler.
+  - completion-complete
+  # Content blocks the engine does not model (schema.rs Content: text and image only).
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+  # Notifications sent during a call: a tools/call answers with one response.
+  - tools-call-with-progress
+  # Server-to-client requests during a call.
+  - tools-call-sampling
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
+  # Sessions: the server assigns no Mcp-Session-Id, which this scenario reports as a
+  # warning, and 0.1.16 counts a warning as a failure against a baseline.
+  - server-sse-multiple-streams
+  # Resources and prompts: served by a host MethodHandler, none in the engine.
+  - resources-list
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+  - resources-subscribe
+  - resources-unsubscribe
+  - prompts-list
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image
