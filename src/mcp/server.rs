@@ -85,6 +85,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     supported_versions: Vec<String>,
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
+    allowed_hosts: Option<Vec<String>>,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
@@ -115,6 +116,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             supported_versions: default_supported_versions(),
             auth_hook: None,
             allowed_origins: Vec::new(),
+            allowed_hosts: None,
             tool_dispatcher: None,
             method_handler: None,
             task_manager: None,
@@ -202,6 +204,33 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// The `Origin` allowlist the HTTP transport enforces.
     pub fn allowed_origins(&self) -> &[String] {
         &self.allowed_origins
+    }
+
+    /// Set the `Host` authorities the HTTP transport accepts besides loopback.
+    ///
+    /// With a list, `POST /mcp` refuses with 403 a request whose `Host` (or
+    /// HTTP/2 `:authority`) is neither loopback nor listed, a repeated `Host`,
+    /// and one with none; an entry `host` admits that host on any port and
+    /// `host:port` only that pair (an IPv6 literal bracketed), matched
+    /// case-insensitively. This is the server-side half of DNS-rebinding
+    /// protection: a page that rebinds its own name to 127.0.0.1 reaches a
+    /// local server with that name in `Host`, and need not send `Origin`.
+    ///
+    /// With none (the default) [`mcp_router`](crate::mcp::transport::http::mcp_router)
+    /// checks no `Host` — a host serving a public name behind its own router
+    /// answers to whatever name its proxy forwards — while
+    /// [`serve`](crate::mcp::transport::http::serve) bound to loopback serves a
+    /// loopback `Host` only. An empty list is loopback-only everywhere.
+    #[must_use]
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = Some(hosts);
+        self
+    }
+
+    /// The `Host` allowlist the HTTP transport enforces, `None` when the host
+    /// named none.
+    pub fn allowed_hosts(&self) -> Option<&[String]> {
+        self.allowed_hosts.as_deref()
     }
 
     /// Install a host [`ToolDispatcher`] that owns `tools/list` and `tools/call`

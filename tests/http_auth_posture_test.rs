@@ -88,6 +88,12 @@ const WHOAMI: &str =
 /// POST `body` to `/mcp` on 127.0.0.1:`port` over a real socket, retrying the
 /// connect while the server comes up, and return the raw HTTP response.
 async fn post_mcp(port: u16, bearer: Option<&str>, body: &str) -> String {
+    post_mcp_to_host(port, &format!("127.0.0.1:{port}"), bearer, body).await
+}
+
+/// [`post_mcp`] naming `host` in the `Host` header, the way a page that rebound
+/// its own name to 127.0.0.1 would.
+async fn post_mcp_to_host(port: u16, host: &str, bearer: Option<&str>, body: &str) -> String {
     let mut stream = None;
     for _ in 0..100 {
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
@@ -99,7 +105,7 @@ async fn post_mcp(port: u16, bearer: Option<&str>, body: &str) -> String {
     let mut stream = stream.expect("the server never accepted a connection");
     let auth = bearer.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Accept: application/json, text/event-stream;q=0.5\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -152,6 +158,44 @@ async fn serve_serves_loopback_without_an_auth_hook() {
         response.contains("method=none admin=false user=none"),
         "an unauthenticated loopback call runs as the anonymous context; response was {response:?}"
     );
+}
+
+/// A loopback bind is the one DNS rebinding reaches: a page that rebinds its
+/// name to 127.0.0.1 arrives with that name in `Host`, and is refused.
+#[tokio::test]
+async fn serve_on_loopback_refuses_a_rebound_host() {
+    let port = free_port("127.0.0.1");
+    let task = tokio::spawn(serve(Arc::new(server()), "127.0.0.1", port));
+
+    let rebound = post_mcp_to_host(port, &format!("attacker.test:{port}"), None, PING).await;
+    let local = post_mcp_to_host(port, &format!("localhost:{port}"), None, PING).await;
+    let v6 = post_mcp_to_host(port, &format!("[::1]:{port}"), None, PING).await;
+    task.abort();
+
+    assert!(
+        rebound.starts_with("HTTP/1.1 403"),
+        "response was {rebound:?}"
+    );
+    assert!(local.starts_with("HTTP/1.1 200"), "response was {local:?}");
+    assert!(v6.starts_with("HTTP/1.1 200"), "response was {v6:?}");
+}
+
+/// A host that names its own list is held to it, on any bind.
+#[tokio::test]
+async fn serve_admits_the_hosts_a_server_names() {
+    let port = free_port("127.0.0.1");
+    let named = server().with_allowed_hosts(vec!["mcp.example.test".to_owned()]);
+    let task = tokio::spawn(serve(Arc::new(named), "127.0.0.1", port));
+
+    let listed = post_mcp_to_host(port, &format!("MCP.example.test:{port}"), None, PING).await;
+    let other = post_mcp_to_host(port, "attacker.test", None, PING).await;
+    task.abort();
+
+    assert!(
+        listed.starts_with("HTTP/1.1 200"),
+        "response was {listed:?}"
+    );
+    assert!(other.starts_with("HTTP/1.1 403"), "response was {other:?}");
 }
 
 #[tokio::test]

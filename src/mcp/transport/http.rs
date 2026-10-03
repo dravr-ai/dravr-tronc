@@ -10,9 +10,11 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::Request;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware::from_fn;
+use axum::http::uri::Authority;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::middleware::{from_fn, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -53,10 +55,11 @@ pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) 
         .with_state(server)
 }
 
-/// The router [`serve`] serves: [`mcp_router`] under [`guard_requests`].
+/// [`mcp_router`] under [`guard_requests`]: the router [`serve`] serves, less
+/// the loopback `Host` check it adds on a loopback bind.
 ///
 /// Public so a server bound some other way — the testkit's port-0 server, an
-/// in-process test client — answers exactly as the standalone one does.
+/// in-process test client — answers as the standalone one does.
 pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
     mcp_router(server).layer(from_fn(guard_requests))
 }
@@ -78,6 +81,11 @@ pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServ
 /// Attach a hook ([`ApiKeyAuthHook`](crate::mcp::auth::ApiKeyAuthHook) for a
 /// shared key) to serve a reachable interface.
 ///
+/// **A loopback bind serves a loopback `Host` only**, unless the server names
+/// its own list with [`McpServer::with_allowed_hosts`]. A page that rebinds
+/// its name to 127.0.0.1 reaches a loopback server with that name in `Host`,
+/// so this is what stops it where the `Origin` gate cannot.
+///
 /// # Errors
 ///
 /// An [`InsecureBindError`] for a reachable bind with no hook; otherwise a
@@ -97,7 +105,15 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
         return Err(Box::new(InsecureBindError::new(host)));
     }
 
-    let app = guarded_mcp_router(server);
+    // A loopback bind is the one DNS rebinding reaches, so unless the host
+    // named its own list, only a loopback `Host` is served there.
+    let loopback = resolved.iter().all(|a| a.ip().is_loopback());
+    let host_guarded = loopback && server.allowed_hosts().is_none();
+    let mut app = mcp_router(server);
+    if host_guarded {
+        app = app.layer(from_fn(require_loopback_host));
+    }
+    let app = app.layer(from_fn(guard_requests));
     let listener = TcpListener::bind(resolved.as_slice())
         .await
         .map_err(|e| format!("Failed to bind {addr}: {e}"))?;
@@ -118,7 +134,8 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 
 /// Handle an incoming MCP POST request
 ///
-/// Enforces the `Origin` allowlist (403), refuses a body not declared
+/// Enforces the `Origin` allowlist (403) and, when the server names one, the
+/// `Host` allowlist (403; see [`McpServer::with_allowed_hosts`]), refuses a body not declared
 /// `application/json` (415) and a client that does not accept both
 /// `application/json` and `text/event-stream` (406), refuses a body that is
 /// not a JSON-RPC Request (400), refuses an unsupported `MCP-Protocol-Version`
@@ -129,13 +146,20 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 /// SSE, whichever the client's `Accept` weighs higher; an accepted notification is answered 202 Accepted with no body.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
+    uri: Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // 1. Origin allowlist (DNS-rebinding protection).
+    // 1. Origin allowlist and, when the host names one, the Host allowlist
+    // (DNS-rebinding protection).
     if !origin_allowed(&headers, server.allowed_origins()) {
         debug!(origin = ?headers.get(header::ORIGIN), "Rejected MCP request: origin not allowed");
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
+    if let Some(allowed) = server.allowed_hosts() {
+        if let Err(refusal) = check_host(&headers, &uri, allowed) {
+            return refusal.into_response();
+        }
     }
 
     // 2. Media types. A body that is not `application/json` is refused before
@@ -519,30 +543,133 @@ fn is_loopback_origin(origin: &str) -> bool {
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
         return false;
     }
-    if authority.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#')) {
-        return false;
+    split_authority(authority).is_some_and(|(host, _)| is_loopback_host(host))
+}
+
+/// Split a bare authority (`host[:port]`, an IPv6 literal bracketed) into its
+/// host and optional port, or `None` when it is not exactly that shape: one
+/// carrying a path, userinfo, query, fragment or whitespace, a bracket left
+/// open, anything after `]` but `:port`, or a port that is not decimal.
+fn split_authority(authority: &str) -> Option<(&str, Option<&str>)> {
+    if authority.is_empty()
+        || authority.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#'))
+    {
+        return None;
     }
 
     // Split off an optional `:port`, minding the colons inside a bracketed
     // IPv6 literal, after whose `]` only nothing or `:port` may follow.
     let (host, port) = match authority.strip_prefix('[') {
         Some(bracketed) => {
-            let Some((literal, rest)) = bracketed.split_once(']') else {
-                return false;
-            };
+            let (literal, rest) = bracketed.split_once(']')?;
             if rest.is_empty() {
                 (literal, None)
-            } else if let Some(port) = rest.strip_prefix(':') {
-                (literal, Some(port))
             } else {
-                return false;
+                (literal, Some(rest.strip_prefix(':')?))
             }
         }
         None => authority
             .split_once(':')
             .map_or((authority, None), |(host, port)| (host, Some(port))),
     };
-    port.is_none_or(is_port) && is_loopback_host(host)
+    port.is_none_or(is_port).then_some((host, port))
+}
+
+/// Whether a request naming `authority` (its `Host`, or the `:authority` of an
+/// HTTP/2 request) passes the `allowed` host list — the server-side half of
+/// DNS-rebinding protection.
+///
+/// A page that rebinds its own name to 127.0.0.1 reaches a local server with
+/// that name in `Host`, and a browser need not send `Origin` on every
+/// request, so the `Origin` gate alone cannot stop it. A loopback authority
+/// (`localhost`, with or without its trailing dot, `127.0.0.0/8`, `[::1]`; any
+/// port) always passes. Otherwise an entry `host` admits that host on any
+/// port and `host:port` that pair only, compared case-insensitively. A
+/// missing or malformed authority passes nothing.
+#[must_use]
+pub fn is_host_allowed(authority: Option<&str>, allowed: &[String]) -> bool {
+    let Some(authority) = authority.map(str::trim) else {
+        return false;
+    };
+    let Some((host, port)) = split_authority(authority) else {
+        return false;
+    };
+    let bare = host.strip_suffix('.').unwrap_or(host);
+    if is_loopback_host(bare) {
+        return true;
+    }
+    allowed.iter().any(|entry| {
+        split_authority(entry.trim()).is_some_and(|(allowed_host, allowed_port)| {
+            allowed_host.eq_ignore_ascii_case(host)
+                && allowed_port.is_none_or(|allowed_port| Some(allowed_port) == port)
+        })
+    })
+}
+
+/// A refusal of the request's authority: its status and plain-text reason.
+type HostRefusal = (StatusCode, &'static str);
+
+/// The refusal of an authority no list admits.
+const HOST_NOT_ALLOWED: HostRefusal = (StatusCode::FORBIDDEN, "Host not allowed");
+
+/// The authority a request targets: its `Host` header, else the URI's
+/// authority (HTTP/2 carries `:authority` there, not in `Host`).
+///
+/// # Errors
+///
+/// A refusal for a request naming no single authority: `Host` repeated (403,
+/// a request-smuggling vector), or a `Host` disagreeing with an absolute-form
+/// target (400, RFC 9112 §3.2).
+fn request_authority<'r>(
+    headers: &'r HeaderMap,
+    uri: &'r Uri,
+) -> Result<Option<&'r str>, HostRefusal> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = hosts.next();
+    if hosts.next().is_some() {
+        return Err(HOST_NOT_ALLOWED);
+    }
+    let host = match host.map(HeaderValue::to_str) {
+        Some(Ok(host)) => Some(host),
+        Some(Err(_)) => return Err(HOST_NOT_ALLOWED),
+        None => None,
+    };
+    let target = uri.authority().map(Authority::as_str);
+    match (host, target) {
+        (Some(host), Some(target)) if !host.trim().eq_ignore_ascii_case(target) => Err((
+            StatusCode::BAD_REQUEST,
+            "Host does not match the request target",
+        )),
+        (Some(host), _) => Ok(Some(host)),
+        (None, target) => Ok(target),
+    }
+}
+
+/// Whether a request passes the `allowed` host list — [`is_host_allowed`]
+/// applied to the authority it targets.
+///
+/// # Errors
+///
+/// The refusal to answer with: 403 for an authority not allowed (or none),
+/// 400 for a `Host` that contradicts the request target.
+fn check_host(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -> Result<(), HostRefusal> {
+    let authority = request_authority(headers, uri)?;
+    if is_host_allowed(authority, allowed) {
+        Ok(())
+    } else {
+        debug!(host = ?authority, "Rejected MCP request: host not allowed");
+        Err(HOST_NOT_ALLOWED)
+    }
+}
+
+/// Middleware [`serve`] layers over a loopback bind whose server names no
+/// host list: only a loopback `Host` reaches it, so a page rebinding its own
+/// name to 127.0.0.1 cannot drive it.
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    match check_host(request.headers(), request.uri(), &[]) {
+        Ok(()) => next.run(request).await,
+        Err(refusal) => refusal.into_response(),
+    }
 }
 
 /// Whether `port` is a decimal TCP port.
@@ -959,6 +1086,99 @@ mod tests {
         assert!(!is_origin_allowed(Some("https://evil.test"), &allowed));
         assert!(is_origin_allowed(None, &allowed));
         assert!(is_origin_allowed(None, &[]));
+    }
+
+    /// Loopback authorities always pass; a listed `host` admits any port,
+    /// `host:port` only that pair; anything malformed or absent passes nothing.
+    #[test]
+    fn host_allowlist_rules() {
+        let none: Vec<String> = Vec::new();
+        for loopback in [
+            "localhost",
+            "LOCALHOST:8080",
+            "localhost.:3000",
+            "127.0.0.1",
+            "127.9.9.9:1",
+            "[::1]:5173",
+        ] {
+            assert!(is_host_allowed(Some(loopback), &none), "{loopback}");
+        }
+        for refused in [
+            "attacker.test",
+            "localhost.attacker.test",
+            "127.0.0.1.nip.io",
+            "localhost:abc",
+            "user@localhost",
+            "",
+        ] {
+            assert!(!is_host_allowed(Some(refused), &none), "{refused}");
+        }
+        assert!(!is_host_allowed(None, &none));
+
+        let allowed = vec![
+            "mcp.example.test".to_owned(),
+            "api.example.test:8443".to_owned(),
+        ];
+        assert!(is_host_allowed(Some("mcp.example.test"), &allowed));
+        assert!(is_host_allowed(Some("Mcp.Example.Test:9000"), &allowed));
+        assert!(is_host_allowed(Some("api.example.test:8443"), &allowed));
+        assert!(!is_host_allowed(Some("api.example.test"), &allowed));
+        assert!(!is_host_allowed(Some("api.example.test:443"), &allowed));
+        assert!(!is_host_allowed(Some("evil.test"), &allowed));
+    }
+
+    /// A router whose server names a host list refuses any other `Host`, a
+    /// repeated one, and one contradicting an absolute-form target.
+    #[tokio::test]
+    async fn a_named_host_list_is_enforced_by_the_router() {
+        let app = || {
+            mcp_router(Arc::new(
+                McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                    .with_allowed_hosts(vec!["mcp.example.test".to_owned()]),
+            ))
+        };
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let (status, _) = post(app(), ping, &[("host", "mcp.example.test")]).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post(app(), ping, &[("host", "evil.test")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = post(app(), ping, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "no Host names no allowed authority"
+        );
+        let (status, _) = post(
+            app(),
+            ping,
+            &[("host", "mcp.example.test"), ("host", "evil.test")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let absolute = Request::builder()
+            .method("POST")
+            .uri("http://evil.test/mcp")
+            .header("host", "mcp.example.test")
+            .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
+            .body(ping.to_owned())
+            .expect("request"); // Safe: test fixture
+        let response = app().oneshot(absolute).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// With no list, the router checks no `Host`: a host serving a public
+    /// name behind its own router answers to whatever its proxy forwards.
+    #[tokio::test]
+    async fn no_host_list_checks_no_host() {
+        let (status, _) = post(
+            make_app(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &[("host", "mcp.public.example")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// The token comes from the `Authorization` header only. A body field
