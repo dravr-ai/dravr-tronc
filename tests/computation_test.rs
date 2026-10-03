@@ -9,11 +9,12 @@
 
 use std::sync::Arc;
 
+use dravr_tronc::error::INVALID_PARAMS;
 use dravr_tronc::mcp::schema::{Listed, Tool, ToolResponse};
 use dravr_tronc::testkit::assert::{
     assert_structured_content, assert_tool_error, assert_tool_success, tool_text,
 };
-use dravr_tronc::testkit::McpTestClient;
+use dravr_tronc::testkit::{McpTestClient, TestClientError};
 use dravr_tronc::{Computation, McpServer, ToolRegistry};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -157,25 +158,27 @@ impl Computation for Celsius {
     }
 }
 
+/// Refused when it is registered, not on each call: its generated
+/// outputSchema is an array, which no client accepts.
 #[tokio::test]
-async fn an_output_that_is_not_an_object_is_a_tool_error_naming_the_tool() {
+async fn an_output_that_is_not_an_object_is_refused_at_registration() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(Celsius));
+    assert!(registry.is_empty());
     let client = McpTestClient::in_process(Arc::new(McpServer::new(
         "computation-test",
         "0",
         registry,
         Arc::new(()),
     )));
-    let result = client
+    assert!(client.list_tools().await.expect("tools/list").is_empty());
+    let unknown = client
         .call_tool("celsius", json!({ "celsius": [1.0] }))
         .await
-        .expect("a tool result");
-    assert!(result.is_error);
-    assert_eq!(
-        tool_text(&result),
-        "celsius: could not render the result: structured content must be a JSON object, \
-         but the result is an array"
+        .expect_err("no tool of that name");
+    assert!(
+        matches!(unknown, TestClientError::Rpc(ref error) if error.code == INVALID_PARAMS),
+        "{unknown}"
     );
 }
 

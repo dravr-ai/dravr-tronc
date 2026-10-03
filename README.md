@@ -180,7 +180,7 @@ once, last. See [Request guard](#request-guard).
 |--------|---------|
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
-| `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
+| `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools (one whose `outputSchema` root can never be an object is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision; a list result is a `schema::Listed<T>` (`{"items": [...]}`), since `structuredContent` is an object |
 | `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |

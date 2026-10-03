@@ -305,6 +305,30 @@ impl ToolContext {
     }
 }
 
+/// The JSON type an `outputSchema` confines its root to, when that type can
+/// never be an object: `"array"`, `"string"`, `["array", "null"]`.
+///
+/// `None` when the root may be an object — a `type` naming `"object"`, no
+/// `type` at all (a `$ref`, or an untyped schema) — or when every branch of
+/// a root `oneOf`/`anyOf` may be one. Only a root that is certainly not an
+/// object is refused at registration; a value that is not an object at run
+/// time is still refused by [`ToolResponse::structured`].
+fn non_object_root(schema: &Value) -> Option<String> {
+    match schema.get("type") {
+        Some(Value::String(kind)) => (kind != "object").then(|| kind.clone()),
+        Some(Value::Array(kinds)) => (!kinds.iter().any(|kind| kind == "object"))
+            .then(|| Value::Array(kinds.clone()).to_string()),
+        Some(_) => None,
+        None => ["oneOf", "anyOf"].into_iter().find_map(|union| {
+            let branches = schema.get(union)?.as_array()?;
+            let kinds: Option<Vec<String>> = branches.iter().map(non_object_root).collect();
+            kinds
+                .filter(|kinds| !kinds.is_empty())
+                .map(|kinds| kinds.join(" or "))
+        }),
+    }
+}
+
 /// Trait implemented by each MCP tool exposed by a server
 ///
 /// Generic over `S` — the project-specific server state type, shared as
@@ -363,24 +387,49 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
         }
     }
 
-    /// Register a tool handler, keyed by its definition name
+    /// Register a tool handler, keyed by its definition name.
+    ///
+    /// A tool whose `outputSchema` can never describe a JSON object — its
+    /// root `type` is `"array"`, `"string"` or another non-object type, as
+    /// schemars generates for a [`Computation`](crate::mcp::computation::Computation)
+    /// whose `Output` is a `Vec` or a scalar — is refused: it is not
+    /// registered, and the refusal is logged at ERROR naming the tool. The
+    /// specification makes both `outputSchema` and `structuredContent`
+    /// objects, so such a tool would advertise a schema no client accepts
+    /// and fail every call; refused here, the mistake surfaces when the
+    /// server starts instead. Wrap a list in
+    /// [`Listed`](crate::mcp::schema::Listed).
     pub fn register(&mut self, tool: Box<dyn McpTool<S>>) {
         self.insert(tool);
     }
 
-    /// Register a tool handler and record it under the given category
+    /// Register a tool handler and record it under the given category.
+    ///
+    /// Refuses the same tools [`Self::register`] does; a refused tool is
+    /// recorded under no category.
     pub fn register_with_category(&mut self, tool: Box<dyn McpTool<S>>, category: &str) {
-        let name = self.insert(tool);
-        self.categories
-            .entry(category.to_owned())
-            .or_default()
-            .push(name);
+        if let Some(name) = self.insert(tool) {
+            self.categories
+                .entry(category.to_owned())
+                .or_default()
+                .push(name);
+        }
     }
 
     /// Key `tool` by its definition name — compiling its schemas when
-    /// validation is on — and return the name.
-    fn insert(&mut self, tool: Box<dyn McpTool<S>>) -> String {
+    /// validation is on — and return the name, or refuse it (logged) when
+    /// its `outputSchema` can never be an object.
+    fn insert(&mut self, tool: Box<dyn McpTool<S>>) -> Option<String> {
         let definition = tool.definition();
+        if let Some(kind) = definition.output_schema.as_ref().and_then(non_object_root) {
+            tracing::error!(
+                tool = %definition.name,
+                output_type = %kind,
+                "Tool not registered: its outputSchema root type is {kind}, but \
+                 structuredContent must be a JSON object (wrap a list in schema::Listed)"
+            );
+            return None;
+        }
         #[cfg(feature = "schema-validation")]
         {
             let compiled = ToolSchemaValidator::compile(&definition);
@@ -391,7 +440,7 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
         }
         let name = definition.name;
         self.tools.insert(name.clone(), tool);
-        name
+        Some(name)
     }
 
     /// Return the number of registered tools
@@ -734,6 +783,62 @@ mod tests {
             .expect("registered tool"); // Safe: test assertion
         assert!(!allowed.is_error);
         assert_eq!(allowed.content[0].as_text(), Some("reset"));
+    }
+
+    /// A tool declaring `output_schema`, for the registration check.
+    struct Shaped(Value);
+
+    #[async_trait]
+    impl McpTool<DummyState> for Shaped {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "shaped".to_owned(),
+                description: "Declares the given outputSchema".to_owned(),
+                input_schema: json!({"type": "object"}),
+                output_schema: Some(self.0.clone()),
+                annotations: None,
+                execution: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<DummyState>,
+            _ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text("shaped".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_tool_whose_output_can_never_be_an_object_is_not_registered() {
+        for schema in [
+            json!({"type": "array", "items": {"type": "number"}}),
+            json!({"type": "string"}),
+            json!({"type": ["array", "null"]}),
+            json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+        ] {
+            let mut registry = ToolRegistry::<DummyState>::new();
+            registry.register_with_category(Box::new(Shaped(schema.clone())), "data");
+            assert!(registry.is_empty(), "{schema} is refused");
+            assert!(registry.tools_in_category("data").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_tool_whose_output_may_be_an_object_is_registered() {
+        for schema in [
+            json!({"type": "object"}),
+            json!({"type": ["object", "null"]}),
+            json!({"$ref": "#/$defs/Row"}),
+            json!({"oneOf": [{"type": "object"}, {"type": "string"}]}),
+            json!({"anyOf": [{"$ref": "#/$defs/Row"}, {"type": "null"}]}),
+        ] {
+            let mut registry = ToolRegistry::<DummyState>::new();
+            registry.register(Box::new(Shaped(schema.clone())));
+            assert_eq!(registry.len(), 1, "{schema} is registered");
+        }
     }
 
     #[test]
