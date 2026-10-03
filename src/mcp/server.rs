@@ -22,6 +22,7 @@ use crate::mcp::modern::{
     frame_cacheable_result, DiscoverResult, ModernMeta, ModernRequestMeta,
     PROTOCOL_VERSION_2026_07_28,
 };
+use crate::mcp::observe::{observe, Observer, PayloadCapturePolicy};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
@@ -87,6 +88,8 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
     in_flight: InFlightRequests,
+    observer: Option<Arc<dyn Observer>>,
+    payload_capture: PayloadCapturePolicy,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -115,6 +118,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             method_handler: None,
             task_manager: None,
             in_flight: InFlightRequests::default(),
+            observer: None,
+            payload_capture: PayloadCapturePolicy::disabled(),
         }
     }
 
@@ -228,6 +233,25 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     #[must_use]
     pub fn with_task_manager(mut self, manager: Arc<TaskManager>) -> Self {
         self.task_manager = Some(manager);
+        self
+    }
+
+    /// Install an [`Observer`] that sees every dispatched message start and
+    /// complete, with a typed outcome, inside the span it chose.
+    ///
+    /// Without one (the default), dispatch is not observed and costs nothing
+    /// extra. See [`crate::mcp::observe`].
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Set which tool payloads the observer may see, how they are redacted,
+    /// and how much of each. [`PayloadCapturePolicy::disabled`] by default.
+    #[must_use]
+    pub fn with_payload_capture(mut self, policy: PayloadCapturePolicy) -> Self {
+        self.payload_capture = policy;
         self
     }
 
@@ -384,6 +408,26 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         request: JsonRpcRequest,
         ctx: &ToolContext,
     ) -> Option<JsonRpcResponse> {
+        match &self.observer {
+            Some(observer) => {
+                observe(
+                    observer.as_ref(),
+                    &self.payload_capture,
+                    request,
+                    |request| self.dispatch(request, ctx),
+                )
+                .await
+            }
+            None => self.dispatch(request, ctx).await,
+        }
+    }
+
+    /// [`Self::handle_request_with_context`] without the observer.
+    async fn dispatch(
+        &self,
+        request: JsonRpcRequest,
+        ctx: &ToolContext,
+    ) -> Option<JsonRpcResponse> {
         // Validate JSON-RPC protocol version
         if request.jsonrpc != JSONRPC_VERSION {
             return Some(JsonRpcResponse::error(
@@ -402,7 +446,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         // `initialize` MUST NOT be cancelled; every other request is
         // registered so `notifications/cancelled` can reach it.
         if request.method == "initialize" {
-            return Some(self.dispatch(request, ctx).await);
+            return Some(self.route(request, ctx).await);
         }
         let in_flight = self.in_flight.register(ctx, &request_id);
         let ctx = ctx.clone().with_cancellation(in_flight.token().clone());
@@ -415,12 +459,12 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 debug!(%request_id, "Request cancelled by the client, no response");
                 None
             }
-            response = self.dispatch(request, &ctx) => Some(response),
+            response = self.route(request, &ctx) => Some(response),
         }
     }
 
     /// Era detection — see `mcp::modern` + the dual-era spec.
-    async fn dispatch(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
+    async fn route(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
         // Every handler reads this request's `_meta` off the context, typed,
         // rather than reaching back into the raw params.
         let ctx = ctx

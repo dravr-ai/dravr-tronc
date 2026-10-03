@@ -10,6 +10,7 @@ pub(crate) mod cancellation;
 pub mod computation;
 pub mod host;
 pub mod modern;
+pub mod observe;
 pub mod protocol;
 pub mod schema;
 pub mod server;
