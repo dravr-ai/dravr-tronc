@@ -26,6 +26,7 @@ use crate::mcp::modern::{
 use crate::mcp::observe::{observe, Observer, PayloadCapturePolicy};
 use crate::mcp::pagination::{cursor_param, paginate};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
+use crate::mcp::resource_metadata::ProtectedResourceMetadata;
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
 };
@@ -98,6 +99,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     allowed_hosts: Option<Vec<String>>,
     max_request_bytes: usize,
     list_page_size: Option<NonZeroUsize>,
+    resource_metadata: Option<Arc<ProtectedResourceMetadata>>,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
@@ -131,6 +133,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             allowed_hosts: None,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             list_page_size: None,
+            resource_metadata: None,
             tool_dispatcher: None,
             method_handler: None,
             task_manager: None,
@@ -260,6 +263,27 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     #[must_use]
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes
+    }
+
+    /// Publish the server's RFC 9728 protected-resource metadata.
+    ///
+    /// [`mcp_router`](crate::mcp::transport::http::mcp_router) then serves it
+    /// on `GET` at the well-known path its resource identifier derives
+    /// ([`ProtectedResourceMetadata::metadata_path`]) — and at the bare
+    /// `/.well-known/oauth-protected-resource` an MCP client falls back to —
+    /// so the host no longer mounts the route itself. The host's
+    /// [`AuthHook`] still writes the 401 challenge; it builds one pointing
+    /// here with [`ProtectedResourceMetadata::www_authenticate`].
+    #[must_use]
+    pub fn with_protected_resource_metadata(mut self, metadata: ProtectedResourceMetadata) -> Self {
+        self.resource_metadata = Some(Arc::new(metadata));
+        self
+    }
+
+    /// The protected-resource metadata the router publishes, if any.
+    #[must_use]
+    pub fn protected_resource_metadata(&self) -> Option<&Arc<ProtectedResourceMetadata>> {
+        self.resource_metadata.as_ref()
     }
 
     /// Page `tools/list` at most `size` tools long.

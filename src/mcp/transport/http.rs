@@ -19,7 +19,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream;
 use serde_json::Value;
@@ -37,6 +37,7 @@ use crate::mcp::modern::{
     is_modern_revision, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_HEADER,
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
+use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTECTED_RESOURCE};
 use crate::mcp::server::McpServer;
 use crate::mcp::transport::mirror::check_standard_headers;
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
@@ -57,11 +58,47 @@ use crate::server::request_guard::guard_requests;
 /// A body over [`McpServer::max_request_bytes`] is refused with 413 before it
 /// is buffered whole; the limit is set on the route itself, so it holds
 /// whatever the merging application layers on top.
+///
+/// When the server publishes [`ProtectedResourceMetadata`] (see
+/// [`McpServer::with_protected_resource_metadata`]), the router also answers
+/// `GET` with it at the document's well-known path, and at the bare
+/// `/.well-known/oauth-protected-resource` an MCP client falls back to.
 pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
     let body_limit = DefaultBodyLimit::max(server.max_request_bytes());
-    Router::new()
+    let metadata = server.protected_resource_metadata().cloned();
+    let router = Router::new()
         .route("/mcp", post(handle_mcp_post::<S>).layer(body_limit))
-        .with_state(server)
+        .with_state(server);
+    match metadata {
+        Some(metadata) => router.merge(resource_metadata_router(metadata)),
+        None => router,
+    }
+}
+
+/// The routes publishing `metadata`: its RFC 9728 well-known path and, when
+/// that carries the resource's path, the bare one too.
+fn resource_metadata_router(metadata: Arc<ProtectedResourceMetadata>) -> Router {
+    let path = metadata.metadata_path();
+    let serve_metadata = get(serve_resource_metadata).with_state(metadata);
+    let router = Router::new().route(&path, serve_metadata.clone());
+    if path == WELL_KNOWN_PROTECTED_RESOURCE {
+        router
+    } else {
+        router.route(WELL_KNOWN_PROTECTED_RESOURCE, serve_metadata)
+    }
+}
+
+/// Answer the metadata document. It is public by design — a client reads it
+/// before it holds any credential, often from a browser — so it carries
+/// `Access-Control-Allow-Origin: *` and passes no Origin or Host gate.
+async fn serve_resource_metadata(
+    State(metadata): State<Arc<ProtectedResourceMetadata>>,
+) -> Response {
+    (
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        Json(metadata.as_ref()),
+    )
+        .into_response()
 }
 
 /// [`mcp_router`] under [`guard_requests`]: the router [`serve`] serves, less
@@ -1230,6 +1267,70 @@ mod tests {
         let response = make_app().oneshot(request).await.expect("response"); // Safe: test assertion
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["error"]["code"], PARSE_ERROR);
+    }
+
+    /// GET `path` on `app`, returning the status, the CORS header and body.
+    async fn get_path(app: Router, path: &str) -> (StatusCode, Option<String>, String) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request"); // Safe: test fixture
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
+        let status = response.status();
+        let cors = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body") // Safe: test assertion
+            .to_bytes();
+        (status, cors, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A server that publishes its metadata gets it served at the RFC 9728
+    /// path its resource derives and at the bare fallback, readable from a
+    /// browser; one that does not publishes nothing.
+    #[tokio::test]
+    async fn published_resource_metadata_is_served_at_its_well_known_paths() {
+        let metadata = ProtectedResourceMetadata::new(
+            "https://mcp.example.test/mcp",
+            vec!["https://auth.example.test".to_owned()],
+        )
+        .expect("valid resource") // Safe: test fixture
+        .with_scopes(vec!["mcp:tools".to_owned()]);
+        let app = || {
+            mcp_router(Arc::new(
+                McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                    .with_protected_resource_metadata(metadata.clone()),
+            ))
+        };
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
+            let (status, cors, body) = get_path(app(), path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(cors.as_deref(), Some("*"), "{path}");
+            let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+            assert_eq!(json["resource"], "https://mcp.example.test/mcp");
+            assert_eq!(
+                json["authorization_servers"][0],
+                "https://auth.example.test"
+            );
+            assert_eq!(json["scopes_supported"][0], "mcp:tools");
+        }
+
+        let (status, _, _) = get_path(make_app(), "/.well-known/oauth-protected-resource").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "nothing is published unasked"
+        );
     }
 
     /// Loopback authorities always pass; a listed `host` admits any port,

@@ -13,6 +13,7 @@ pub mod modern;
 pub mod observe;
 pub mod pagination;
 pub mod protocol;
+pub mod resource_metadata;
 pub mod schema;
 pub mod server;
 pub mod tasks;
