@@ -8,11 +8,14 @@ pub mod auth;
 pub(crate) mod cancellation;
 #[cfg(feature = "computation")]
 pub mod computation;
+pub mod elicitation;
 pub mod host;
+pub mod logging;
 pub mod modern;
 pub mod observe;
 pub mod pagination;
 pub mod protocol;
+pub(crate) mod random_id;
 pub mod resource_metadata;
 pub mod schema;
 pub mod server;

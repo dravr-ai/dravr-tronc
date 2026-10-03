@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::INTERNAL_ERROR;
+use crate::mcp::random_id::random_hex_id;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::AbortHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -71,13 +72,6 @@ pub mod method_names {
     pub const TASKS_CANCEL: &str = "tasks/cancel";
 }
 
-/// Bytes of OS randomness behind a minted [`TaskId`]: 128 bits, the same
-/// strength as a random UUID, rendered as 32 lowercase hex characters.
-const TASK_ID_BYTES: usize = 16;
-
-/// Lowercase hexadecimal alphabet for rendering a minted [`TaskId`].
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
 /// Opaque, server-minted task identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -99,15 +93,9 @@ impl TaskId {
     /// one caller's task and another's `tasks/get` or `tasks/cancel`. That is
     /// why the engine mints it rather than taking one from the host.
     pub fn generate() -> Result<Self, TaskError> {
-        let mut bytes = [0_u8; TASK_ID_BYTES];
-        getrandom::fill(&mut bytes)
-            .map_err(|e| TaskError::Store(format!("no OS randomness for a task id: {e}")))?;
-        let mut id = String::with_capacity(TASK_ID_BYTES * 2);
-        for byte in bytes {
-            id.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-            id.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-        }
-        Ok(Self(id))
+        random_hex_id()
+            .map(Self)
+            .map_err(|e| TaskError::Store(format!("no OS randomness for a task id: {e}")))
     }
 
     /// Borrow the identifier as a string slice.

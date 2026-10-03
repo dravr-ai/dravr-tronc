@@ -138,28 +138,48 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
-impl JsonRpcRequest {
-    /// Read one JSON-RPC 2.0 request or notification from a message body.
+/// One JSON-RPC 2.0 message a peer sends: a request (or notification), or a
+/// response to a request this side sent it.
+///
+/// A server reads responses too once it sends its client requests of its own
+/// (`sampling/createMessage`, `elicitation/create`): the client answers each
+/// with a response carrying the id the server minted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum JsonRpcMessage {
+    /// A request, or a notification when it carries no id.
+    Request(JsonRpcRequest),
+    /// A response to a request this side sent.
+    Response(JsonRpcResponse),
+}
+
+impl JsonRpcMessage {
+    /// Read one JSON-RPC 2.0 message from a body.
     ///
     /// The body is parsed to a JSON value first, so the two failures JSON-RPC
     /// 2.0 §5.1 keeps apart stay apart: text that is not JSON is a Parse error
-    /// (-32700), and JSON that is not a Request object is an Invalid Request
+    /// (-32700), and JSON that is not a message object is an Invalid Request
     /// (-32600). The second covers an array (a batch, which MCP does not carry
-    /// since 2025-06-18), a scalar, a client's response (no `method`), and an
-    /// object missing or mistyping a member.
+    /// since 2025-06-18), a scalar, and an object missing or mistyping a
+    /// member.
     ///
-    /// A present `id` must be a string or an integer: MCP basic §Requests says
-    /// it "MUST be a string or integer" and "MUST NOT be null". Any other `id`
-    /// is refused before the object is read, because serde reads `"id": null`
-    /// as an absent id and would turn a malformed request into a notification
-    /// that is never answered. Only an absent `id` makes a notification.
+    /// An object with a `method` is a request. A present `id` must be a
+    /// string or an integer: MCP basic §Requests says it "MUST be a string or
+    /// integer" and "MUST NOT be null". Any other `id` is refused before the
+    /// object is read, because serde reads `"id": null` as an absent id and
+    /// would turn a malformed request into a notification that is never
+    /// answered. Only an absent `id` makes a notification.
+    ///
+    /// An object without a `method` is a response: it must carry an `id` and
+    /// exactly one of `result` and `error`. Its `id` may be null — JSON-RPC
+    /// answers a request it could not read that way — and is otherwise a
+    /// string or an integer.
     ///
     /// # Errors
     ///
     /// Returns the error response to send back, with a null `id`: when the
-    /// message is not a well-formed Request its `id` cannot be trusted to
-    /// correlate with anything the client is waiting on (a client's response
-    /// carries an id from the server's own id space).
+    /// message is not well-formed its `id` cannot be trusted to correlate with
+    /// anything the peer is waiting on.
     pub fn parse(raw: &str) -> Result<Self, Box<JsonRpcResponse>> {
         let value: Value = serde_json::from_str(raw).map_err(|e| {
             Box::new(JsonRpcResponse::error(
@@ -175,28 +195,65 @@ impl JsonRpcRequest {
             } else {
                 "Invalid Request: a request must be a JSON object"
             };
-            return Err(Box::new(JsonRpcResponse::error(
-                None,
-                INVALID_REQUEST,
-                reason,
-            )));
+            return Err(invalid_request(reason));
         };
 
-        if fields.get("id").is_some_and(|id| !is_request_id(id)) {
-            return Err(Box::new(JsonRpcResponse::error(
-                None,
-                INVALID_REQUEST,
-                "Invalid Request: id must be a string or an integer",
-            )));
+        if !fields.contains_key("method") {
+            return Self::parse_response(value);
         }
 
-        serde_json::from_value(value).map_err(|e| {
-            Box::new(JsonRpcResponse::error(
-                None,
-                INVALID_REQUEST,
-                format!("Invalid Request: {e}"),
-            ))
-        })
+        if fields.get("id").is_some_and(|id| !is_request_id(id)) {
+            return Err(invalid_request(
+                "Invalid Request: id must be a string or an integer",
+            ));
+        }
+
+        serde_json::from_value(value)
+            .map(Self::Request)
+            .map_err(|e| invalid_request(&format!("Invalid Request: {e}")))
+    }
+
+    /// Read an object without a `method` as a response.
+    fn parse_response(value: Value) -> Result<Self, Box<JsonRpcResponse>> {
+        let has = |member: &str| value.get(member).is_some();
+        let id_ok = value
+            .get("id")
+            .is_some_and(|id| id.is_null() || is_request_id(id));
+        if !id_ok || has("result") == has("error") || value.get("jsonrpc").is_none() {
+            return Err(invalid_request(
+                "Invalid Request: a message without a method must be a response, with an id \
+                 and exactly one of result and error",
+            ));
+        }
+        serde_json::from_value(value)
+            .map(Self::Response)
+            .map_err(|e| invalid_request(&format!("Invalid Request: {e}")))
+    }
+}
+
+/// An Invalid Request (-32600) refusal carrying no id.
+fn invalid_request(reason: &str) -> Box<JsonRpcResponse> {
+    Box::new(JsonRpcResponse::error(None, INVALID_REQUEST, reason))
+}
+
+impl JsonRpcRequest {
+    /// Read one JSON-RPC 2.0 request or notification from a message body.
+    ///
+    /// [`JsonRpcMessage::parse`], refusing a response with an Invalid Request
+    /// (-32600): for a reader with no request of its own outstanding, a
+    /// response answers nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error response to send back, with a null `id` (see
+    /// [`JsonRpcMessage::parse`]).
+    pub fn parse(raw: &str) -> Result<Self, Box<JsonRpcResponse>> {
+        match JsonRpcMessage::parse(raw)? {
+            JsonRpcMessage::Request(request) => Ok(request),
+            JsonRpcMessage::Response(_) => Err(invalid_request(
+                "Invalid Request: a response answers no request this reader sent",
+            )),
+        }
     }
 
     /// Create a new request with a default id of `1`.
@@ -501,6 +558,44 @@ mod tests {
             assert_eq!(req.headers, None);
             assert!(req.metadata.is_empty(), "metadata was {:?}", req.metadata);
             assert_eq!(req.method, "tools/list");
+        }
+    }
+
+    #[test]
+    fn a_message_without_a_method_reads_as_a_response() {
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":"srv-1","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-1,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#,
+        ] {
+            let message = JsonRpcMessage::parse(raw).expect("a response parses"); // Safe: test assertion
+            assert!(matches!(message, JsonRpcMessage::Response(_)), "{raw}");
+        }
+        let message = JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .expect("a request parses"); // Safe: test assertion
+        assert!(matches!(message, JsonRpcMessage::Request(_)));
+    }
+
+    #[test]
+    fn a_malformed_response_is_an_invalid_request() {
+        for raw in [
+            // Neither result nor error, or both.
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":1,"message":"x"}}"#,
+            // No id, or one that is neither null, a string nor an integer.
+            r#"{"jsonrpc":"2.0","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1.5,"result":{}}"#,
+            // No version.
+            r#"{"id":1,"result":{}}"#,
+            // An error that is not an error object.
+            r#"{"jsonrpc":"2.0","id":1,"error":"boom"}"#,
+        ] {
+            let refused = JsonRpcMessage::parse(raw).expect_err("must be refused"); // Safe: test assertion
+            assert_eq!(
+                refused.error.as_ref().map(|e| e.code),
+                Some(INVALID_REQUEST),
+                "{raw}"
+            );
         }
     }
 
