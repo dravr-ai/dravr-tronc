@@ -151,8 +151,13 @@ pub struct Tool {
 }
 
 /// Parameters for a `tools/call` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Built with [`Self::new`] and the `with_` methods, never as a literal: it
+/// is `#[non_exhaustive]`, so a parameter a later revision adds to
+/// `tools/call` is not a breaking change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ToolCall {
     /// Name of the tool to invoke.
     pub name: String,
@@ -168,6 +173,37 @@ pub struct ToolCall {
     /// echoed back by the client on retry (SEP-2322).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_state: Option<String>,
+}
+
+impl ToolCall {
+    /// A call of the tool `name` with `arguments`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, arguments: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            arguments: Some(arguments),
+            input_responses: None,
+            request_state: None,
+        }
+    }
+
+    /// This call retrying an [`InputRequiredResult`], carrying the client's
+    /// answers to its `inputRequests`.
+    #[must_use]
+    pub fn with_input_responses(
+        mut self,
+        input_responses: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.input_responses = Some(input_responses);
+        self
+    }
+
+    /// This call echoing the `requestState` of an [`InputRequiredResult`].
+    #[must_use]
+    pub fn with_request_state(mut self, request_state: impl Into<String>) -> Self {
+        self.request_state = Some(request_state.into());
+        self
+    }
 }
 
 /// SEP-2322 `InputRequiredResult`: the server needs more from the client
@@ -2019,6 +2055,27 @@ mod tests {
         )
         .expect("deserialize"); // Safe: test assertion
         assert_eq!(assistant.role, Role::Assistant);
+    }
+
+    #[test]
+    fn a_tool_call_is_built_without_a_literal_and_writes_the_wire_names() {
+        let first =
+            serde_json::to_value(ToolCall::new("confirm", json!({ "x": 1 }))).expect("serialize"); // Safe: test assertion
+        assert_eq!(first, json!({ "name": "confirm", "arguments": { "x": 1 } }));
+
+        let mut answers = serde_json::Map::new();
+        answers.insert("ok".to_owned(), json!({ "action": "accept" }));
+        let retry = ToolCall::new("confirm", json!({}))
+            .with_input_responses(answers)
+            .with_request_state("s1");
+        let wire = serde_json::to_value(&retry).expect("serialize"); // Safe: test assertion
+        assert_eq!(wire["inputResponses"]["ok"]["action"], "accept");
+        assert_eq!(wire["requestState"], "s1");
+        let read: ToolCall = serde_json::from_value(wire).expect("deserialize"); // Safe: test assertion
+        assert_eq!(read.request_state.as_deref(), Some("s1"));
+
+        let empty = ToolCall::default();
+        assert!(empty.name.is_empty() && empty.arguments.is_none());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use crate::error::METHOD_NOT_FOUND;
 use crate::mcp::modern::{meta_keys, PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER};
 use crate::mcp::protocol::{JsonRpcError, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
-use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::schema::{Tool, ToolCall, ToolResponse};
 use crate::mcp::server::McpServer;
 use crate::mcp::transport::http::{guarded_mcp_router, MCP_SESSION_ID_HEADER};
 use crate::mcp::transport::mirror::{
@@ -277,7 +277,8 @@ impl McpTestClient {
         name: &str,
         arguments: Value,
     ) -> Result<ToolResponse, TestClientError> {
-        let params = json!({ "name": name, "arguments": arguments });
+        let params = serde_json::to_value(ToolCall::new(name, arguments))
+            .map_err(|e| TestClientError::InvalidRequest(e.to_string()))?;
         let result = self.result("tools/call", Some(params)).await?;
         serde_json::from_value(result).map_err(TestClientError::Decode)
     }
@@ -784,7 +785,8 @@ impl RawResponse {
 /// Why a test client call did not produce what it asked for.
 #[derive(Debug)]
 pub enum TestClientError {
-    /// The request could not be built (a header that is not valid HTTP).
+    /// The request could not be built (a header that is not valid HTTP,
+    /// params that do not serialise).
     InvalidRequest(String),
     /// The request could not be sent or its answer read.
     Transport(String),
