@@ -63,7 +63,7 @@ otel = [
 async-trait = "0.1"
 axum = "0.8"
 # Decodes the `=?base64?…?=` sentinel a mirrored MCP request header may
-# carry (SEP-2243).
+# carry (SEP-2243), and encodes the opaque cursor of a paginated list.
 base64 = "0.22"
 bitflags = "2"
 # 10.3 is the first release past the claim type-confusion advisory, and the

@@ -5,6 +5,7 @@
 // Copyright (c) 2026 dravr.ai
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -23,6 +24,7 @@ use crate::mcp::modern::{
     PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER, REMOVED_METHODS,
 };
 use crate::mcp::observe::{observe, Observer, PayloadCapturePolicy};
+use crate::mcp::pagination::{cursor_param, paginate};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
@@ -95,6 +97,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     allowed_origins: Vec<String>,
     allowed_hosts: Option<Vec<String>>,
     max_request_bytes: usize,
+    list_page_size: Option<NonZeroUsize>,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
@@ -127,6 +130,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             allowed_origins: Vec::new(),
             allowed_hosts: None,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            list_page_size: None,
             tool_dispatcher: None,
             method_handler: None,
             task_manager: None,
@@ -256,6 +260,20 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     #[must_use]
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes
+    }
+
+    /// Page `tools/list` at most `size` tools long.
+    ///
+    /// A page that stops short of the end carries a `nextCursor` the client
+    /// echoes back as `params.cursor` (see [`crate::mcp::pagination`]). Without
+    /// a page size (the default) every tool after the cursor is one page, and
+    /// none carries a `nextCursor`. Every conforming client follows the cursor,
+    /// but one that does not would silently see only the first page, so a host
+    /// opts in once it knows its clients.
+    #[must_use]
+    pub fn with_list_page_size(mut self, size: NonZeroUsize) -> Self {
+        self.list_page_size = Some(size);
+        self
     }
 
     /// Install a host [`ToolDispatcher`] that owns `tools/list` and `tools/call`
@@ -563,7 +581,10 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     async fn process_legacy(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request.id, request.params.as_ref()),
-            "tools/list" => self.handle_tools_list(request.id, ctx).await,
+            "tools/list" => {
+                self.handle_tools_list(request.id, request.params.as_ref(), ctx)
+                    .await
+            }
             // `allow_tasks: false` — the extension exists only in the modern
             // era, so a legacy client can never be handed a task handle it has
             // no contract for (and whose response would skip `resultType`).
@@ -619,7 +640,10 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
         let response = match request.method.as_str() {
             "server/discover" => self.handle_server_discover(request.id),
-            "tools/list" => self.handle_tools_list(request.id, &ctx).await,
+            "tools/list" => {
+                self.handle_tools_list(request.id, request.params.as_ref(), &ctx)
+                    .await
+            }
             "tools/call" => {
                 let headers = request.headers.as_ref();
                 self.handle_tools_call(
@@ -822,15 +846,35 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// the fleet was exposed, because the one host that declares `ADMIN_ONLY`
     /// tools installs a dispatcher; the trap was that any host adding its first
     /// admin-only tool without one would leak it silently.
-    async fn handle_tools_list(&self, id: Option<Value>, ctx: &ToolContext) -> JsonRpcResponse {
+    ///
+    /// The tools are listed in name order and paged per
+    /// [`Self::with_list_page_size`], resuming after `params.cursor`; a cursor
+    /// this server never issued is `-32602`.
+    async fn handle_tools_list(
+        &self,
+        id: Option<Value>,
+        params: Option<&Value>,
+        ctx: &ToolContext,
+    ) -> JsonRpcResponse {
         let definitions = match &self.tool_dispatcher {
             Some(dispatcher) => dispatcher.list_tools(&self.state, ctx).await,
             None => self.tools.list_definitions_for(ctx.is_admin),
         };
-        match serde_json::to_value(definitions) {
+        let page = match cursor_param(params).and_then(|cursor| {
+            paginate(definitions, cursor, self.list_page_size, |tool| {
+                tool.name.as_str()
+            })
+        }) {
+            Ok(page) => page,
+            Err(invalid) => return JsonRpcResponse::error(id, INVALID_PARAMS, invalid.to_string()),
+        };
+        match serde_json::to_value(page.items) {
             Ok(tools) => {
                 let mut result = serde_json::Map::new();
                 result.insert("tools".to_owned(), tools);
+                if let Some(next_cursor) = page.next_cursor {
+                    result.insert("nextCursor".to_owned(), Value::String(next_cursor));
+                }
                 JsonRpcResponse::success(id, Value::Object(result))
             }
             Err(e) => {
@@ -1773,6 +1817,61 @@ mod tests {
             .await
             .expect("response"); // Safe: test assertion
         assert!(resp.result.is_some(), "an agreeing header is served");
+    }
+
+    /// `tools/list` pages in name order and follows its own cursor to the end.
+    #[tokio::test]
+    async fn tools_list_pages_follow_next_cursor() {
+        let server = make_server_with_admin_tool().with_list_page_size(
+            NonZeroUsize::new(1).expect("one is non-zero"), // Safe: test fixture
+        );
+        let admin = ToolContext::new().as_admin(true);
+        let list = |cursor: Option<&str>| {
+            let params = cursor.map(|c| json!({ "cursor": c }));
+            JsonRpcRequest::with_id("tools/list", params, json!(70))
+        };
+
+        let first = server
+            .handle_request_with_context(list(None), &admin)
+            .await
+            .expect("response"); // Safe: test assertion
+        let first = first.result.expect("result"); // Safe: test assertion
+        assert_eq!(first["tools"][0]["name"], "admin_tool");
+        let cursor = first["nextCursor"].as_str().expect("a next cursor"); // Safe: test assertion
+
+        let second = server
+            .handle_request_with_context(list(Some(cursor)), &admin)
+            .await
+            .expect("response"); // Safe: test assertion
+        let second = second.result.expect("result"); // Safe: test assertion
+        assert_eq!(second["tools"][0]["name"], "ping_tool");
+        assert!(second.get("nextCursor").is_none(), "the last page has none");
+
+        let invalid = server
+            .handle_request_with_context(list(Some("***")), &admin)
+            .await
+            .expect("response"); // Safe: test assertion
+        assert_eq!(invalid.error.expect("error").code, INVALID_PARAMS); // Safe: test assertion
+    }
+
+    /// Without a page size every tool is one page, in name order.
+    #[tokio::test]
+    async fn unpaged_tools_list_carries_no_cursor() {
+        let server = make_server_with_admin_tool();
+        let admin = ToolContext::new().as_admin(true);
+        let resp = server
+            .handle_request_with_context(
+                JsonRpcRequest::with_id("tools/list", None, json!(71)),
+                &admin,
+            )
+            .await
+            .expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(
+            listed_names(&JsonRpcResponse::success(None, result.clone())),
+            ["admin_tool", "ping_tool"]
+        );
+        assert!(result.get("nextCursor").is_none());
     }
 
     #[tokio::test]
