@@ -13,8 +13,10 @@
 //! answer (`sampling/createMessage`, `elicitation/create`). A tool does all of
 //! that through [`ToolContext::client`](crate::mcp::tool::ToolContext::client).
 //!
-//! The transport carries what the channel sends: over stdio it is a line on
-//! stdout like any other. The client answers a server request with a JSON-RPC
+//! The transport carries what the channel sends. Over stdio it is a line on
+//! stdout like any other; over Streamable HTTP the call's `POST` is answered
+//! with an event stream that carries each message as an event and the
+//! response last. The client answers a server request with a JSON-RPC
 //! response — a line on stdin — and the transport routes it back here by the
 //! id the server minted, which is unguessable and keyed by the caller
 //! identity the request was sent to, so no other caller can answer it.

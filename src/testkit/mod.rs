@@ -12,7 +12,8 @@
 //!   `tower::ServiceExt::oneshot`, with no socket — or over HTTP to a URL. It
 //!   carries a bearer token, extra headers and `_meta` keys on every request,
 //!   speaks either protocol era, and offers `initialize`, `list_tools`,
-//!   `call_tool`, a JSON-RPC `request`, and `raw` for a body the typed calls
+//!   `call_tool`, a JSON-RPC `request`, `exchange` for the notifications a
+//!   call streams before its response, and `raw` for a body the typed calls
 //!   would never send.
 //! - [`McpTestServer`] binds a server to `127.0.0.1:0` and hands out clients
 //!   for whichever port the system chose, for a test that needs a real socket.
@@ -32,5 +33,5 @@ pub mod assert;
 mod client;
 mod server;
 
-pub use client::{McpTestClient, RawResponse, TestClientError, TESTKIT_CLIENT_NAME};
+pub use client::{Exchange, McpTestClient, RawResponse, TestClientError, TESTKIT_CLIENT_NAME};
 pub use server::McpTestServer;

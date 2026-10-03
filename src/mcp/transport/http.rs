@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::{pending, Future};
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::rejection::StringRejection;
@@ -17,14 +19,15 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::uri::Authority;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::stream;
+use futures::{stream, FutureExt, Stream};
 use serde_json::Value;
 use tokio::net::{lookup_host, TcpListener};
 use tokio::signal;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::error::{
@@ -33,12 +36,14 @@ use crate::error::{
     UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::AuthError;
+use crate::mcp::client_channel::ClientChannel;
 use crate::mcp::modern::{
     is_modern_revision, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_HEADER,
 };
-use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
+use crate::mcp::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
 use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTECTED_RESOURCE};
 use crate::mcp::server::McpServer;
+use crate::mcp::tool::ToolContext;
 use crate::mcp::transport::mirror::check_standard_headers;
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
@@ -254,8 +259,15 @@ pub async fn shutdown_signal() {
 /// (400, -32022) and a modern body sent without one (400, -32020), authenticates via the server's hook (401 +
 /// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
 /// spent budget; 500 when the host failed to decide), then dispatches under
-/// the resolved per-call context. A request's response is rendered as JSON or
-/// SSE, whichever the client's `Accept` weighs higher; an accepted notification is answered 202 Accepted with no body.
+/// the resolved per-call context.
+///
+/// A request's response is rendered as JSON or a single SSE event, whichever
+/// the client's `Accept` weighs higher — unless the call talks to its client
+/// before it answers (progress, log messages, a request of its own; see
+/// [`ClientChannel`]): then the
+/// answer is an event stream carrying each of those as an event, and the
+/// response last. An accepted notification is answered 202 Accepted with no
+/// body.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     uri: Uri,
@@ -264,14 +276,8 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
 ) -> Response {
     // 1. Origin allowlist and, when the host names one, the Host allowlist
     // (DNS-rebinding protection).
-    if !origin_allowed(&headers, server.allowed_origins()) {
-        debug!(origin = ?headers.get(header::ORIGIN), "Rejected MCP request: origin not allowed");
-        return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
-    }
-    if let Some(allowed) = server.allowed_hosts() {
-        if let Err(refusal) = check_host(&headers, &uri, allowed) {
-            return refusal.into_response();
-        }
+    if let Err(refusal) = check_origin_and_host(&server, &headers, &uri) {
+        return *refusal;
     }
 
     // 2. Media types. A body that is not `application/json` is refused before
@@ -314,37 +320,53 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     // a batch, a client's response, an id that is neither a string nor an
     // integer — is one this server cannot accept, which Streamable HTTP
     // answers with an HTTP error status, never a 2xx.
-    let mut request = match JsonRpcRequest::parse(&body) {
+    let request = match JsonRpcRequest::parse(&body) {
         Ok(request) => request,
         Err(refusal) => return (StatusCode::BAD_REQUEST, Json(*refusal)).into_response(),
     };
+    serve_request(server, &headers, request).await
+}
 
-    // 4. Populate transport-derived fields for the auth hook. The credential
-    // comes from the `Authorization` header only; `parse` never reads one out
-    // of the body.
-    request.auth_token = bearer_token(&headers);
-    // Every other header reaches the hook too, so a host can tell which of its
-    // public origins the client dialed — an RFC 9728 challenge must name that
-    // one — without the transport knowing what a host reads.
-    request.headers = forwarded_headers(&headers);
-    // `MCP-Protocol-Version` names the revision the request speaks. On a
-    // stateless server there is no session to check it against, so this is
-    // the only place an unsupported one can be refused (-32022) rather than
-    // served as if we spoke it. A request with no header is an
-    // `initialize`-era one (a pre-2025-06-18 client sends none); a body
-    // carrying modern `_meta` without it is refused, since every modern POST
-    // must carry the header. Era detection reads the header back from the
-    // metadata and holds it to the body's `_meta` (-32020 on disagreement).
-    let version = match protocol_version_header(&headers) {
-        Ok(version) => version,
-        Err(reason) => return header_mismatch(request.id, &reason),
-    };
-    if let Some(version) = version {
-        if !server.accepts_protocol_version(version) {
-            return (
+/// The `Origin` gate and, when the server names a host list, the `Host` gate:
+/// `Err` carries the 403 (or 400) to answer.
+fn check_origin_and_host<S: Send + Sync + ?Sized + 'static>(
+    server: &McpServer<S>,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), Refusal> {
+    if !origin_allowed(headers, server.allowed_origins()) {
+        debug!(origin = ?headers.get(header::ORIGIN), "Rejected MCP request: origin not allowed");
+        return Err(Box::new(
+            (StatusCode::FORBIDDEN, "Origin not allowed").into_response(),
+        ));
+    }
+    if let Some(allowed) = server.allowed_hosts() {
+        check_host(headers, uri, allowed).map_err(|refusal| Box::new(refusal.into_response()))?;
+    }
+    Ok(())
+}
+
+/// A request refused before dispatch: the answer to send, boxed so the
+/// `Result` carrying it stays small.
+type Refusal = Box<Response>;
+
+/// The request's `MCP-Protocol-Version`, judged: `Ok(None)` when it carries
+/// none, the version when this server accepts it, and the 400 to answer
+/// otherwise (-32020 for a repeated or unreadable header, -32022 for a
+/// revision the server does not speak), echoing `id`.
+fn accepted_protocol_version<'h, S: Send + Sync + ?Sized + 'static>(
+    server: &McpServer<S>,
+    headers: &'h HeaderMap,
+    id: Option<&Value>,
+) -> Result<Option<&'h str>, Refusal> {
+    let version = protocol_version_header(headers)
+        .map_err(|reason| Box::new(header_mismatch(id.cloned(), &reason)))?;
+    match version {
+        Some(version) if !server.accepts_protocol_version(version) => Err(Box::new(
+            (
                 StatusCode::BAD_REQUEST,
                 Json(JsonRpcResponse::error_with_data(
-                    request.id,
+                    id.cloned(),
                     UNSUPPORTED_PROTOCOL_VERSION,
                     "Unsupported protocol version".to_owned(),
                     serde_json::json!({
@@ -353,8 +375,39 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
                     }),
                 )),
             )
-                .into_response();
-        }
+                .into_response(),
+        )),
+        version => Ok(version),
+    }
+}
+
+/// Serve one JSON-RPC request (or notification) sent to `/mcp`.
+async fn serve_request<S: Send + Sync + ?Sized + 'static>(
+    server: Arc<McpServer<S>>,
+    headers: &HeaderMap,
+    mut request: JsonRpcRequest,
+) -> Response {
+    // 4. Populate transport-derived fields for the auth hook. The credential
+    // comes from the `Authorization` header only; `parse` never reads one out
+    // of the body.
+    request.auth_token = bearer_token(headers);
+    // Every other header reaches the hook too, so a host can tell which of its
+    // public origins the client dialed — an RFC 9728 challenge must name that
+    // one — without the transport knowing what a host reads.
+    request.headers = forwarded_headers(headers);
+    // `MCP-Protocol-Version` names the revision the request speaks. On a
+    // stateless server there is no session to check it against, so this is
+    // the only place an unsupported one can be refused (-32022) rather than
+    // served as if we spoke it. A request with no header is an
+    // `initialize`-era one (a pre-2025-06-18 client sends none); a body
+    // carrying modern `_meta` without it is refused, since every modern POST
+    // must carry the header. Era detection reads the header back from the
+    // metadata and holds it to the body's `_meta` (-32020 on disagreement).
+    let version = match accepted_protocol_version(&server, headers, request.id.as_ref()) {
+        Ok(version) => version,
+        Err(refusal) => return *refusal,
+    };
+    if let Some(version) = version {
         request = request.with_metadata(PROTOCOL_VERSION_HEADER, version);
     } else if request.id.is_some()
         && !matches!(
@@ -369,7 +422,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     }
     let modern = version.is_some_and(is_modern_revision);
     // SEP-2243: the mirrors a gateway routes on must say what the body says.
-    if let Err(reason) = check_standard_headers(&headers, &request, modern) {
+    if let Err(reason) = check_standard_headers(headers, &request, modern) {
         return header_mismatch(request.id, &reason);
     }
 
@@ -379,8 +432,23 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         Err(refusal) => return auth_refusal_response(refusal),
     };
 
-    // 6. Dispatch under the resolved context.
-    let Some(response) = server.handle_request_with_context(request, &ctx).await else {
+    // 6. Dispatch under the resolved context, connected to the client through
+    // the call's own answer.
+    let (outbound, outbox) = mpsc::unbounded_channel();
+    let connection = server.http_client_connection(outbound, &ctx);
+    let ctx = ToolContext {
+        client: ClientChannel::connected(connection),
+        ..ctx
+    };
+    let prefers_sse = prefers_event_stream(headers);
+    answer_call(server, request, ctx, outbox, modern, prefers_sse).await
+}
+
+/// A dispatched request's single answer: 202 with no body when there is none
+/// (a notification, or a request the client cancelled), else the response
+/// under its status, as JSON or one SSE event, whichever the client prefers.
+fn render_response(response: Option<JsonRpcResponse>, modern: bool, prefers_sse: bool) -> Response {
+    let Some(response) = response else {
         // An accepted notification: Streamable HTTP requires 202 Accepted with
         // no body (basic/transports §Sending Messages to the Server).
         return StatusCode::ACCEPTED.into_response();
@@ -388,17 +456,148 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
 
     debug!(method = "mcp", "Handled HTTP MCP request");
 
-    // 7. A modern refusal carries its HTTP status; anything else is a 200
+    // A modern refusal carries its HTTP status; anything else is a 200
     // rendered as JSON or a single SSE event, whichever the client weighs
     // higher (a tie is answered as an event stream).
     let status = response_status(&response, modern);
     if status != StatusCode::OK {
         return (status, Json(response)).into_response();
     }
-    if prefers_event_stream(&headers) {
+    if prefers_sse {
         respond_sse(&response)
     } else {
         Json(response).into_response()
+    }
+}
+
+/// A dispatch in flight: the call's eventual response.
+type Dispatch = Pin<Box<dyn Future<Output = Option<JsonRpcResponse>> + Send>>;
+
+/// Dispatch `request` and answer it: as [`render_response`] when the call
+/// sent its client nothing first, else as an event stream of what it sent,
+/// the response last.
+///
+/// The choice is made by whichever comes first, the response or a message.
+/// Once streaming, the call is polled by the stream itself, so a client that
+/// goes away drops the call with it, exactly as hyper drops a handler whose
+/// connection closed.
+async fn answer_call<S: Send + Sync + ?Sized + 'static>(
+    server: Arc<McpServer<S>>,
+    request: JsonRpcRequest,
+    ctx: ToolContext,
+    mut outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
+    modern: bool,
+    prefers_sse: bool,
+) -> Response {
+    let id = request.id.clone();
+    let mut call: Dispatch =
+        Box::pin(async move { server.handle_request_with_context(request, &ctx).await });
+
+    let first = tokio::select! {
+        biased;
+        response = &mut call => {
+            let sent = drain(&mut outbox);
+            if sent.is_empty() {
+                return render_response(response, modern, prefers_sse);
+            }
+            let stream = CallStream {
+                phase: Phase::Draining(response),
+                sent: sent.into(),
+                outbox,
+            };
+            return Sse::new(stream.into_events()).into_response();
+        }
+        Some(message) = outbox.recv() => message,
+    };
+
+    // The call is now polled by the response body, outside the request
+    // guard's panic containment, so a panic is caught here and answered as
+    // the JSON-RPC internal error it is.
+    let call: Dispatch = Box::pin(AssertUnwindSafe(call).catch_unwind().map(move |outcome| {
+        outcome.unwrap_or_else(|_| {
+            error!("A call panicked while streaming its answer");
+            Some(JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                "The call failed while answering".to_owned(),
+            ))
+        })
+    }));
+    let stream = CallStream {
+        phase: Phase::Running(call),
+        sent: VecDeque::from([first]),
+        outbox,
+    };
+    Sse::new(stream.into_events())
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Every message already queued on `outbox`.
+fn drain(outbox: &mut mpsc::UnboundedReceiver<JsonRpcMessage>) -> Vec<JsonRpcMessage> {
+    let mut sent = Vec::new();
+    while let Ok(message) = outbox.try_recv() {
+        sent.push(message);
+    }
+    sent
+}
+
+/// Where a streamed call is.
+enum Phase {
+    /// Still running.
+    Running(Dispatch),
+    /// Answered: what is still queued goes out, then this response.
+    Draining(Option<JsonRpcResponse>),
+    /// The response is out.
+    Done,
+}
+
+/// The event stream of a call that talked to its client before answering.
+struct CallStream {
+    phase: Phase,
+    /// Messages taken off the outbox, not yet sent.
+    sent: VecDeque<JsonRpcMessage>,
+    outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
+}
+
+impl CallStream {
+    /// The stream's next message: queued ones first, then whatever the call
+    /// sends or answers.
+    async fn next(&mut self) -> Option<JsonRpcMessage> {
+        if let Some(message) = self.sent.pop_front() {
+            return Some(message);
+        }
+        loop {
+            match &mut self.phase {
+                Phase::Running(call) => {
+                    let sent_or_answered = tokio::select! {
+                        biased;
+                        Some(message) = self.outbox.recv() => Ok(message),
+                        response = call => Err(response),
+                    };
+                    match sent_or_answered {
+                        Ok(message) => return Some(message),
+                        Err(response) => self.phase = Phase::Draining(response),
+                    }
+                }
+                Phase::Draining(response) => {
+                    if let Ok(message) = self.outbox.try_recv() {
+                        return Some(message);
+                    }
+                    let response = response.take();
+                    self.phase = Phase::Done;
+                    return response.map(JsonRpcMessage::Response);
+                }
+                Phase::Done => return None,
+            }
+        }
+    }
+
+    fn into_events(self) -> impl Stream<Item = Result<Event, Infallible>> + Send {
+        stream::unfold(self, |mut call| async move {
+            let message = call.next().await?;
+            Some((Ok(sse_event(&message)), call))
+        })
     }
 }
 
@@ -853,18 +1052,21 @@ pub fn forwarded_headers(headers: &HeaderMap) -> Option<HashMap<String, Value>> 
     (!forwarded.is_empty()).then_some(forwarded)
 }
 
-/// Wrap a JSON-RPC response in a single SSE event
-fn respond_sse(response: &JsonRpcResponse) -> Response {
-    let data = serde_json::to_string(&response).unwrap_or_else(|e| {
+/// One message as an SSE event.
+fn sse_event<T: serde::Serialize>(message: &T) -> Event {
+    let data = serde_json::to_string(message).unwrap_or_else(|e| {
         error!(error = %e, "SSE serialization failed");
         format!(
             r#"{{"jsonrpc":"2.0","error":{{"code":-32603,"message":"Serialization failed: {e}"}}}}"#
         )
     });
+    Event::default().data(data)
+}
 
-    let event = Event::default().data(data);
+/// Wrap a JSON-RPC response in a single SSE event
+fn respond_sse(response: &JsonRpcResponse) -> Response {
+    let event = sse_event(response);
     let event_stream = stream::once(async { Ok::<_, Infallible>(event) });
-
     Sse::new(event_stream).into_response()
 }
 

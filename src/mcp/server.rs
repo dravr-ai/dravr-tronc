@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::error::{
@@ -19,7 +20,9 @@ use crate::error::{
 };
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICATIONS_CANCELLED};
-use crate::mcp::client_channel::DEFAULT_CLIENT_REQUEST_TIMEOUT;
+use crate::mcp::client_channel::{
+    ClientConnection, PendingRequests, DEFAULT_CLIENT_REQUEST_TIMEOUT,
+};
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::logging::{LogLevel, LOGGING_SET_LEVEL};
 use crate::mcp::modern::{
@@ -28,7 +31,9 @@ use crate::mcp::modern::{
 };
 use crate::mcp::observe::{observe, Observer, PayloadCapturePolicy};
 use crate::mcp::pagination::{cursor_param, paginate};
-use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
+use crate::mcp::protocol::{
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION,
+};
 use crate::mcp::resource_metadata::ProtectedResourceMetadata;
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
@@ -109,6 +114,8 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     in_flight: InFlightRequests,
     observer: Option<Arc<dyn Observer>>,
     payload_capture: PayloadCapturePolicy,
+    /// Server requests sent over HTTP awaiting the client's answer.
+    pending: Arc<PendingRequests>,
     client_request_timeout: Duration,
 }
 
@@ -144,6 +151,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             in_flight: InFlightRequests::default(),
             observer: None,
             payload_capture: PayloadCapturePolicy::disabled(),
+            pending: Arc::new(PendingRequests::new()),
             client_request_timeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
         }
     }
@@ -365,6 +373,22 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     pub fn with_client_request_timeout(mut self, timeout: Duration) -> Self {
         self.client_request_timeout = timeout;
         self
+    }
+
+    /// The connection a call over HTTP reaches its client through: messages
+    /// go out on `outbound`, the call's event stream.
+    pub(crate) fn http_client_connection(
+        &self,
+        outbound: mpsc::UnboundedSender<JsonRpcMessage>,
+        ctx: &ToolContext,
+    ) -> ClientConnection {
+        ClientConnection::new(
+            outbound,
+            Arc::clone(&self.pending),
+            None,
+            ctx,
+            self.client_request_timeout,
+        )
     }
 
     /// How long a call waits for its client's answer.

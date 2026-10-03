@@ -1,5 +1,5 @@
 // ABOUTME: McpTestClient — MCP over the in-process router or HTTP, with bearer, headers and _meta
-// ABOUTME: Typed initialize/list_tools/call_tool, a JSON-RPC request, and raw bodies with their status
+// ABOUTME: Reads a streamed answer event by event; typed calls, a JSON-RPC request, and raw bodies
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -49,6 +49,10 @@ enum Transport {
 /// [`McpTestServer::client`](crate::testkit::McpTestServer::client)), then
 /// set what every request should carry with the `with_*` builders. A client
 /// is cheap to clone into a second one with different credentials.
+///
+/// A call the server answers with an event stream is read event by event,
+/// and the notifications it sends before its response are collected (see
+/// [`Self::exchange`]).
 #[derive(Clone)]
 pub struct McpTestClient {
     transport: Transport,
@@ -217,6 +221,22 @@ impl McpTestClient {
         method: &str,
         params: Option<Value>,
     ) -> Result<JsonRpcResponse, TestClientError> {
+        Ok(self.exchange(method, params).await?.response)
+    }
+
+    /// Send a JSON-RPC request for `method` and return everything the server
+    /// sent back: the messages that came before the response, and the
+    /// response itself.
+    ///
+    /// # Errors
+    ///
+    /// A transport failure, an answer that is not JSON-RPC, or a stream that
+    /// ended before the response.
+    pub async fn exchange(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Exchange, TestClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "method": method });
         let params = self.with_client_meta(params);
@@ -224,7 +244,56 @@ impl McpTestClient {
         if let Some(params) = params {
             request["params"] = params;
         }
-        self.send(request.to_string(), mirrors).await?.rpc()
+        let mut headers = self.request_headers();
+        headers.extend(mirrors);
+        let reply = self
+            .send_with(Method::POST, request.to_string(), headers)
+            .await?;
+        if !is_event_stream(&reply.headers) {
+            let answer = reply.collect().await?;
+            return Ok(Exchange {
+                messages: Vec::new(),
+                response: answer.rpc()?,
+            });
+        }
+        self.read_stream(reply).await
+    }
+
+    /// Read an event stream to its response.
+    async fn read_stream(&self, mut reply: Reply) -> Result<Exchange, TestClientError> {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut messages = Vec::new();
+        loop {
+            while let Some(event) = take_event(&mut buffer) {
+                let Some(data) = event_data(&event) else {
+                    continue;
+                };
+                let message: Value =
+                    serde_json::from_str(&data).map_err(|_| TestClientError::NotJsonRpc {
+                        status: reply.status,
+                        body: data.clone(),
+                    })?;
+                if message.get("method").is_none() {
+                    let response = serde_json::from_value(message).map_err(|_| {
+                        TestClientError::NotJsonRpc {
+                            status: reply.status,
+                            body: data,
+                        }
+                    })?;
+                    return Ok(Exchange { messages, response });
+                }
+                messages.push(message);
+            }
+            match reply.body.chunk().await? {
+                Some(chunk) => buffer.extend_from_slice(&chunk),
+                None => {
+                    return Err(TestClientError::NotJsonRpc {
+                        status: reply.status,
+                        body: String::from_utf8_lossy(&buffer).into_owned(),
+                    });
+                }
+            }
+        }
     }
 
     /// Send a JSON-RPC notification: no id, so no JSON-RPC answer, only the
@@ -257,7 +326,8 @@ impl McpTestClient {
         self.send(body.into(), Vec::new()).await
     }
 
-    /// POST `body` with this client's headers plus `mirrors`.
+    /// POST `body` with this client's headers plus `mirrors`, and read the
+    /// whole answer.
     async fn send(
         &self,
         body: String,
@@ -265,11 +335,27 @@ impl McpTestClient {
     ) -> Result<RawResponse, TestClientError> {
         let mut headers = self.request_headers();
         headers.extend(mirrors);
+        self.send_with(Method::POST, body, headers)
+            .await?
+            .collect()
+            .await
+    }
+
+    /// Send `body` as `method` with exactly `headers`, and return the answer
+    /// as it starts to arrive.
+    async fn send_with(
+        &self,
+        method: Method,
+        body: String,
+        headers: Vec<(String, String)>,
+    ) -> Result<Reply, TestClientError> {
         match &self.transport {
             Transport::InProcess(router) => {
-                Self::raw_in_process(router.clone(), body, headers).await
+                Self::in_process_reply(router.clone(), method, body, headers).await
             }
-            Transport::Http { url, http } => Self::raw_http(http, url, body, headers).await,
+            Transport::Http { url, http } => {
+                Self::http_reply(http, url, method, body, headers).await
+            }
         }
     }
 
@@ -315,12 +401,13 @@ impl McpTestClient {
         headers
     }
 
-    async fn raw_in_process(
+    async fn in_process_reply(
         router: Router,
+        method: Method,
         body: String,
         headers: Vec<(String, String)>,
-    ) -> Result<RawResponse, TestClientError> {
-        let mut builder = Request::builder().method(Method::POST).uri("/mcp");
+    ) -> Result<Reply, TestClientError> {
+        let mut builder = Request::builder().method(method).uri("/mcp");
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
@@ -331,28 +418,21 @@ impl McpTestClient {
             Ok(response) => response,
             Err(never) => match never {},
         };
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| TestClientError::Transport(e.to_string()))?
-            .to_bytes();
-        Ok(RawResponse {
-            status,
-            headers,
-            body: String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(Reply {
+            status: response.status(),
+            headers: response.headers().clone(),
+            body: ReplyBody::InProcess(response.into_body()),
         })
     }
 
-    async fn raw_http(
+    async fn http_reply(
         http: &reqwest::Client,
         url: &str,
+        method: Method,
         body: String,
         headers: Vec<(String, String)>,
-    ) -> Result<RawResponse, TestClientError> {
-        let mut request = http.post(url).body(body);
+    ) -> Result<Reply, TestClientError> {
+        let mut request = http.request(method, url).body(body);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -360,16 +440,10 @@ impl McpTestClient {
             .send()
             .await
             .map_err(|e| TestClientError::Transport(e.without_url().to_string()))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| TestClientError::Transport(e.without_url().to_string()))?;
-        Ok(RawResponse {
-            status,
-            headers,
-            body,
+        Ok(Reply {
+            status: response.status(),
+            headers: response.headers().clone(),
+            body: ReplyBody::Http(response),
         })
     }
 
@@ -396,6 +470,116 @@ impl McpTestClient {
     }
 }
 
+/// What a JSON-RPC request got back.
+#[derive(Debug, Clone)]
+pub struct Exchange {
+    /// Every message the server sent before the response, in order. Empty
+    /// when the answer was not an event stream.
+    pub messages: Vec<Value>,
+    /// The response.
+    pub response: JsonRpcResponse,
+}
+
+impl Exchange {
+    /// The notifications named `method` among [`Self::messages`].
+    #[must_use]
+    pub fn notifications(&self, method: &str) -> Vec<&Value> {
+        self.messages
+            .iter()
+            .filter(|m| m.get("id").is_none() && m["method"] == method)
+            .collect()
+    }
+
+    /// The requests the server sent among [`Self::messages`].
+    #[must_use]
+    pub fn server_requests(&self) -> Vec<&Value> {
+        self.messages
+            .iter()
+            .filter(|m| m.get("id").is_some())
+            .collect()
+    }
+}
+
+/// An answer whose body has not been read yet.
+struct Reply {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: ReplyBody,
+}
+
+/// The body of a [`Reply`], read chunk by chunk.
+enum ReplyBody {
+    InProcess(Body),
+    Http(reqwest::Response),
+}
+
+impl ReplyBody {
+    /// The next chunk of the body, `None` at its end.
+    async fn chunk(&mut self) -> Result<Option<Vec<u8>>, TestClientError> {
+        match self {
+            Self::InProcess(body) => loop {
+                match body.frame().await {
+                    None => return Ok(None),
+                    Some(Err(e)) => return Err(TestClientError::Transport(e.to_string())),
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            return Ok(Some(data.to_vec()));
+                        }
+                    }
+                }
+            },
+            Self::Http(response) => response
+                .chunk()
+                .await
+                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                .map_err(|e| TestClientError::Transport(e.without_url().to_string())),
+        }
+    }
+}
+
+impl Reply {
+    /// Read the whole body.
+    async fn collect(mut self) -> Result<RawResponse, TestClientError> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = self.body.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(RawResponse {
+            status: self.status,
+            headers: self.headers,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+    }
+}
+
+/// Whether `headers` declare a `text/event-stream` body.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+}
+
+/// Take the first complete event — the text up to a blank line — off the
+/// front of `buffer`.
+fn take_event(buffer: &mut Vec<u8>) -> Option<String> {
+    let end = buffer.windows(2).position(|pair| pair == b"\n\n")?;
+    let event: Vec<u8> = buffer.drain(..end + 2).collect();
+    Some(String::from_utf8_lossy(&event).into_owned())
+}
+
+/// The `data` of one event, its lines joined as the event-stream format
+/// joins them; `None` for an event with none (a keep-alive comment).
+fn event_data(event: &str) -> Option<String> {
+    let lines: Vec<&str> = event
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// An HTTP answer as it arrived.
 #[derive(Debug, Clone)]
 pub struct RawResponse {
@@ -408,24 +592,30 @@ pub struct RawResponse {
 }
 
 impl RawResponse {
-    /// The JSON the body carries — the body itself, or the data of its first
-    /// event when the server answered with an event stream.
+    /// The JSON the body carries — the body itself, or, when the server
+    /// answered with an event stream, the data of its JSON-RPC response: the
+    /// event without a `method`, which a stream carries last.
     ///
     /// # Errors
     ///
     /// [`TestClientError::NotJsonRpc`] when there is no JSON to read.
     pub fn json(&self) -> Result<Value, TestClientError> {
-        let is_sse = self
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
-        let payload = if is_sse {
-            first_event_data(&self.body)
-        } else {
-            self.body.clone()
-        };
-        serde_json::from_str(&payload).map_err(|_| self.not_json_rpc())
+        if !is_event_stream(&self.headers) {
+            return serde_json::from_str(&self.body).map_err(|_| self.not_json_rpc());
+        }
+        let mut buffer = self.body.clone().into_bytes();
+        if !buffer.ends_with(b"\n\n") {
+            buffer.extend_from_slice(b"\n\n");
+        }
+        let mut response = None;
+        while let Some(event) = take_event(&mut buffer) {
+            let parsed =
+                event_data(&event).and_then(|data| serde_json::from_str::<Value>(&data).ok());
+            if let Some(message) = parsed.filter(|m| m.get("method").is_none()) {
+                response = Some(message);
+            }
+        }
+        response.ok_or_else(|| self.not_json_rpc())
     }
 
     /// The body as a JSON-RPC response.
@@ -443,17 +633,6 @@ impl RawResponse {
             body: self.body.clone(),
         }
     }
-}
-
-/// The `data` of the first event of a `text/event-stream` body, its lines
-/// joined as the event-stream format joins them.
-fn first_event_data(body: &str) -> String {
-    body.lines()
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(|data| data.strip_prefix(' ').unwrap_or(data))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Why a test client call did not produce what it asked for.
