@@ -1,5 +1,5 @@
 // ABOUTME: Computation — a tool that parses typed arguments, computes, and renders the result
-// ABOUTME: Blanket McpTool impl; the input schema is generated from the type the tool parses
+// ABOUTME: Blanket McpTool impl; input and output schemas are generated from the types it maps between
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -15,11 +15,13 @@
 //!
 //! A [`Computation`] states the operation once — input type, output type, the
 //! function — and the blanket [`McpTool`] impl does the rest the same way for
-//! every server: the input schema is generated from [`Computation::Input`] by
-//! schemars, so it cannot disagree with what is parsed; malformed arguments are
-//! a tool error naming the tool; the output is rendered with
-//! `serde_json::to_string` of the value itself, so every number is written at
-//! its own precision.
+//! every server: the input schema is generated from [`Computation::Input`] and
+//! the output schema from [`Computation::Output`] by schemars, so neither can
+//! disagree with what is parsed or returned; malformed arguments are a tool
+//! error naming the tool; the output is the result's `structuredContent`,
+//! rendered through [`ToolResponse::structured`], so every number is written at
+//! its own precision and the text block carries the same JSON for a client
+//! that reads only `content`.
 //!
 //! ```rust,ignore
 //! struct RankSources;
@@ -61,8 +63,13 @@ pub trait Computation: Send + Sync {
     /// What the arguments parse into. Its derived schema is the tool's input
     /// schema, so a field's doc comment is what the client reads about it.
     type Input: DeserializeOwned + JsonSchema;
-    /// What the computation returns, rendered as the tool's text result.
-    type Output: Serialize;
+    /// What the computation returns. Its derived schema is the tool's output
+    /// schema, and the value is the result's `structuredContent`.
+    ///
+    /// It must serialise to a JSON object — a struct or a map — because both
+    /// `outputSchema` and `structuredContent` are objects in the
+    /// specification. A list or a scalar is wrapped in a struct that names it.
+    type Output: Serialize + JsonSchema;
 
     /// Tool name, as `tools/call` addresses it.
     const NAME: &'static str;
@@ -95,7 +102,7 @@ impl<S: Send + Sync + ?Sized, T: Computation> McpTool<S> for T {
                 idempotent_hint: Some(true),
                 open_world_hint: Some(false),
             }),
-            output_schema: None,
+            output_schema: Some(schema_for!(T::Output).to_value()),
             execution: None,
         }
     }
@@ -115,8 +122,7 @@ fn run<T: Computation + ?Sized>(tool: &T, arguments: Value) -> ToolResponse {
         Ok(output) => output,
         Err(message) => return ToolResponse::error(format!("{}: {message}", T::NAME)),
     };
-    match serde_json::to_string(&output) {
-        Ok(text) => ToolResponse::text(text),
-        Err(e) => ToolResponse::error(format!("{}: could not render the result: {e}", T::NAME)),
-    }
+    ToolResponse::structured(&output).unwrap_or_else(|e| {
+        ToolResponse::error(format!("{}: could not render the result: {e}", T::NAME))
+    })
 }

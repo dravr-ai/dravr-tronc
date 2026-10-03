@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
+use std::fmt;
 
 use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION};
 
@@ -265,6 +267,83 @@ impl ToolResponse {
             is_error: true,
             structured_content: None,
         }
+    }
+
+    /// Build a successful result whose `structuredContent` is `value`, for a
+    /// tool that declares an `outputSchema`.
+    ///
+    /// The same JSON is also the result's text block: the specification asks a
+    /// tool returning structured content to serialise it into a text block as
+    /// well, for a client that reads only `content`.
+    ///
+    /// The value is written once with `serde_json::to_string` and the
+    /// structured form is read back from that text, never built with
+    /// `serde_json::to_value`. `to_value` widens every `f32` to its nearest
+    /// `f64`, so 12.8 would reach the structured reader as
+    /// 12.800000190734863 while the text said 12.8; read back from the text,
+    /// both forms carry the number at its own precision.
+    ///
+    /// # Errors
+    ///
+    /// [`StructuredContentError::Render`] when `value` cannot be serialised,
+    /// and [`StructuredContentError::NotAnObject`] when it serialises to
+    /// anything but a JSON object — `structuredContent` is an object in every
+    /// revision of the specification, and so is the root of an
+    /// `outputSchema`.
+    pub fn structured<T: Serialize + ?Sized>(value: &T) -> Result<Self, StructuredContentError> {
+        let text = serde_json::to_string(value).map_err(StructuredContentError::Render)?;
+        let structured: serde_json::Value =
+            serde_json::from_str(&text).map_err(StructuredContentError::Render)?;
+        if !structured.is_object() {
+            return Err(StructuredContentError::NotAnObject(json_kind(&structured)));
+        }
+        Ok(Self {
+            content: vec![Content::Text { text }],
+            is_error: false,
+            structured_content: Some(structured),
+        })
+    }
+}
+
+/// Why a value could not become a result's `structuredContent`.
+#[derive(Debug)]
+pub enum StructuredContentError {
+    /// The value's `Serialize` implementation failed.
+    Render(serde_json::Error),
+    /// The value serialised to this kind of JSON value, not an object.
+    NotAnObject(&'static str),
+}
+
+impl fmt::Display for StructuredContentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Render(e) => write!(f, "could not serialise the result: {e}"),
+            Self::NotAnObject(kind) => write!(
+                f,
+                "structured content must be a JSON object, but the result is {kind}"
+            ),
+        }
+    }
+}
+
+impl StdError for StructuredContentError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Render(e) => Some(e),
+            Self::NotAnObject(_) => None,
+        }
+    }
+}
+
+/// The JSON kind of `value`, with its article, for an error message.
+const fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
