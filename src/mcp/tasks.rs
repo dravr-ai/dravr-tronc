@@ -575,8 +575,20 @@ impl TaskStore for InMemoryTaskStore {
     }
 }
 
-/// Retention and pacing applied to newly created tasks.
+/// Retention and pacing applied to newly created tasks, and who sweeps the
+/// expired ones.
+///
+/// [`Self::default`] has the manager sweep on its own, every
+/// [`DEFAULT_SWEEP_INTERVAL`]. A host that already runs a sweeper of its own
+/// — a scheduled job calling [`TaskManager::sweep_expired`], a database
+/// sweep over its [`TaskStore`] — starts from [`Self::host_swept`] instead,
+/// or every instance runs two sweeps over the same store.
+///
+/// Built with [`Self::default`] or [`Self::host_swept`] and the `with_`
+/// methods: it is `#[non_exhaustive]`, so a setting added later is not a
+/// breaking change. The fields stay public to read.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct TaskOptions {
     /// Lifetime in milliseconds; `None` means unlimited retention.
     pub ttl_ms: Option<u64>,
@@ -595,6 +607,44 @@ impl Default for TaskOptions {
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             sweep_interval: Some(DEFAULT_SWEEP_INTERVAL),
         }
+    }
+}
+
+impl TaskOptions {
+    /// The default retention and pacing, with the manager's own sweep off:
+    /// for a host that sweeps expired tasks itself, by calling
+    /// [`TaskManager::sweep_expired`] or through its store, on its own
+    /// schedule.
+    #[must_use]
+    pub fn host_swept() -> Self {
+        Self {
+            sweep_interval: None,
+            ..Self::default()
+        }
+    }
+
+    /// These options with a task lifetime of `ttl_ms` milliseconds, or
+    /// unlimited retention for `None`.
+    #[must_use]
+    pub const fn with_ttl_ms(mut self, ttl_ms: Option<u64>) -> Self {
+        self.ttl_ms = ttl_ms;
+        self
+    }
+
+    /// These options advertising a polling interval of `poll_interval_ms`
+    /// milliseconds.
+    #[must_use]
+    pub const fn with_poll_interval_ms(mut self, poll_interval_ms: u64) -> Self {
+        self.poll_interval_ms = poll_interval_ms;
+        self
+    }
+
+    /// These options with the manager sweeping every `sweep_interval`, or
+    /// not at all for `None` (see [`Self::host_swept`]).
+    #[must_use]
+    pub const fn with_sweep_interval(mut self, sweep_interval: Option<Duration>) -> Self {
+        self.sweep_interval = sweep_interval;
+        self
     }
 }
 
@@ -644,6 +694,11 @@ fn validate_input_keys(
 /// what lets a host use its own runtime and database; the run is how the
 /// engine still reaches that operation — `tasks/cancel` fires its
 /// [`TaskRun::cancellation`] token.
+///
+/// The manager also drops expired tasks on its own, every
+/// [`TaskOptions::sweep_interval`], from the first [`Self::create`]. A host
+/// that runs its own sweeper over the same store builds the manager with
+/// [`TaskOptions::host_swept`], so each instance runs one sweep, not two.
 pub struct TaskManager {
     store: Arc<dyn TaskStore>,
     options: TaskOptions,
@@ -905,8 +960,9 @@ impl TaskManager {
     /// Drop tasks whose TTL elapsed, returning how many were removed.
     ///
     /// The manager runs this every [`TaskOptions::sweep_interval`]; a host
-    /// calls it directly only when it turned that off. An expired task's result can no longer be retrieved, so the operation
-    /// still running it is cancelled too.
+    /// calls it directly only when it turned that off, with
+    /// [`TaskOptions::host_swept`]. An expired task's result can no longer
+    /// be retrieved, so the operation still running it is cancelled too.
     pub async fn sweep_expired(&self) -> Result<usize, TaskError> {
         let removed = self.store.sweep_expired().await?;
         let runs = self.runs();

@@ -882,12 +882,22 @@ impl TaskStore for CountingStore {
     }
 }
 
+/// A host running its own sweeper keeps every default but the manager's
+/// sweep.
+#[test]
+fn host_swept_options_turn_off_only_the_managers_own_sweep() {
+    let defaults = TaskOptions::default();
+    assert!(defaults.sweep_interval.is_some());
+    let host_swept = TaskOptions::host_swept();
+    assert_eq!(host_swept.sweep_interval, None);
+    assert_eq!(host_swept.ttl_ms, defaults.ttl_ms);
+    assert_eq!(host_swept.poll_interval_ms, defaults.poll_interval_ms);
+}
+
 fn fast_expiry() -> TaskOptions {
-    TaskOptions {
-        ttl_ms: Some(1),
-        sweep_interval: Some(Duration::from_millis(10)),
-        ..TaskOptions::default()
-    }
+    TaskOptions::default()
+        .with_ttl_ms(Some(1))
+        .with_sweep_interval(Some(Duration::from_millis(10)))
 }
 
 /// Expired tasks leave memory without the host scheduling anything, and the
@@ -939,10 +949,7 @@ async fn the_sweeper_ends_with_its_manager_and_can_be_turned_off() {
     let store = Arc::new(CountingStore::default());
     let manager = Arc::new(TaskManager::with_options(
         Arc::clone(&store) as Arc<dyn TaskStore>,
-        TaskOptions {
-            sweep_interval: None,
-            ..fast_expiry()
-        },
+        TaskOptions::host_swept().with_ttl_ms(Some(1)),
     ));
     drop(
         manager
