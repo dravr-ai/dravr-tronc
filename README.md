@@ -92,6 +92,28 @@ with an `InsecureBindError`, before any socket opens — unless every address th
 is loopback. To serve a reachable interface, attach a hook; for a shared key that is
 `mcp::auth::ApiKeyAuthHook` (see [Startup posture](#startup-posture-refuse-a-reachable-bind-nothing-gates)).
 
+A loopback bind also serves a loopback `Host` only (DNS-rebinding protection the `Origin` gate
+cannot give alone); name other authorities with `McpServer::with_allowed_hosts`. `serve` shuts down
+gracefully on SIGINT or SIGTERM, answering every request in flight first;
+`serve_with_shutdown` takes the trigger from the caller.
+
+What `POST /mcp` requires of a client (Streamable HTTP, revision 2026-07-28):
+
+- `Content-Type: application/json` (else 415) and an `Accept` listing both `application/json` and
+  `text/event-stream` (else 406); a body over `McpServer::max_request_bytes` (4 MiB by default) is
+  a 413.
+- `MCP-Protocol-Version` on every modern request, naming the revision its `_meta` names; a request
+  with neither is an `initialize`-era one.
+- The SEP-2243 mirrors: `Mcp-Method` on every modern request, `Mcp-Name` on `tools/call`,
+  `resources/read` and `prompts/get`, and an `Mcp-Param-{Name}` for each argument a tool's input
+  schema annotates with `x-mcp-header`. A mirror that disagrees with the body is a 400
+  `HeaderMismatch` (`-32020`) in any era.
+
+`tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
+serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same
+cursors. A server given `with_protected_resource_metadata` has its RFC 9728 document served at
+`/.well-known/oauth-protected-resource[/<resource path>]`.
+
 ### 4. Merge into an existing Axum app
 
 ```rust
@@ -124,6 +146,9 @@ once, last. See [Request guard](#request-guard).
 | `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket) or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `raw`; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
+| `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
+| `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
+| `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve, and its 401 challenge |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
