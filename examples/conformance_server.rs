@@ -24,7 +24,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dravr_tronc::mcp::schema::{Content, Tool, ToolResponse};
+use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::transport::http::serve;
 use dravr_tronc::{McpServer, McpTool, ToolContext, ToolRegistry};
 use serde_json::{json, Value};
@@ -73,14 +73,7 @@ impl McpTool<()> for Fixture {
         match &self.answer {
             Answer::Text(text) => ToolResponse::text((*text).to_owned()),
             Answer::Error(message) => ToolResponse::error((*message).to_owned()),
-            Answer::Image => ToolResponse {
-                content: vec![Content::Image {
-                    data: MINI_PNG_BASE64.to_owned(),
-                    mime_type: "image/png".to_owned(),
-                }],
-                is_error: false,
-                structured_content: None,
-            },
+            Answer::Image => ToolResponse::image(MINI_PNG_BASE64, "image/png"),
         }
     }
 }

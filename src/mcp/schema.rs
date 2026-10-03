@@ -249,21 +249,53 @@ pub struct ToolResponse {
 }
 
 impl ToolResponse {
-    /// Build a successful text result.
+    /// Build a successful result of the given content blocks, in order.
     #[must_use]
-    pub fn text(content: String) -> Self {
+    pub fn blocks(content: Vec<Content>) -> Self {
         Self {
-            content: vec![Content::Text { text: content }],
+            content,
             is_error: false,
             structured_content: None,
         }
+    }
+
+    /// Build a successful text result.
+    #[must_use]
+    pub fn text(content: String) -> Self {
+        Self::blocks(vec![Content::text(content)])
+    }
+
+    /// Build a successful result of one image, from base64-encoded `data` of
+    /// type `mime_type`.
+    #[must_use]
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::blocks(vec![Content::image(data, mime_type)])
+    }
+
+    /// Build a successful result of one audio clip, from base64-encoded
+    /// `data` of type `mime_type`.
+    #[must_use]
+    pub fn audio(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::blocks(vec![Content::audio(data, mime_type)])
+    }
+
+    /// Build a successful result of one embedded resource.
+    #[must_use]
+    pub fn resource(contents: ResourceContents) -> Self {
+        Self::blocks(vec![Content::resource(contents)])
+    }
+
+    /// Build a successful result of one resource link.
+    #[must_use]
+    pub fn resource_link(link: ResourceLink) -> Self {
+        Self::blocks(vec![Content::resource_link(link)])
     }
 
     /// Build an error result carrying the given message.
     #[must_use]
     pub fn error(message: String) -> Self {
         Self {
-            content: vec![Content::Text { text: message }],
+            content: vec![Content::text(message)],
             is_error: true,
             structured_content: None,
         }
@@ -298,7 +330,7 @@ impl ToolResponse {
             return Err(StructuredContentError::NotAnObject(json_kind(&structured)));
         }
         Ok(Self {
-            content: vec![Content::Text { text }],
+            content: vec![Content::text(text)],
             is_error: false,
             structured_content: Some(structured),
         })
@@ -347,41 +379,374 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// A content block within a tool result or prompt message, in its spec shape.
+/// A content block within a tool result or prompt message, in its spec shape:
+/// the `ContentBlock` union of revisions 2025-11-25 and 2026-07-28, which
+/// share it.
 ///
-/// The specification's `ContentBlock` also admits `audio`, `resource_link` and
-/// embedded `resource` blocks. No server on this engine produces any of them,
-/// so none is modelled: a variant nothing constructs is a wire shape nothing
-/// checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every block carries optional [`Annotations`] and an optional `_meta`
+/// object, written only when set. The constructors build a bare block;
+/// [`Self::with_annotations`] adds the hints to any of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Content {
-    /// Plain text content.
+    /// Plain text (`"type": "text"`).
     #[serde(rename = "text")]
-    Text {
-        /// Text content string.
-        text: String,
-    },
-    /// Image content with base64 data.
+    Text(TextContent),
+    /// A base64-encoded image (`"type": "image"`).
     #[serde(rename = "image")]
-    Image {
-        /// Base64-encoded image data.
-        data: String,
-        /// MIME type of the image (e.g. `"image/png"`).
-        #[serde(rename = "mimeType")]
-        mime_type: String,
-    },
+    Image(ImageContent),
+    /// Base64-encoded audio (`"type": "audio"`).
+    #[serde(rename = "audio")]
+    Audio(AudioContent),
+    /// A link to a resource the client may read (`"type": "resource_link"`).
+    #[serde(rename = "resource_link")]
+    ResourceLink(ResourceLink),
+    /// A resource's contents carried in the block (`"type": "resource"`).
+    #[serde(rename = "resource")]
+    Resource(EmbeddedResource),
 }
 
 impl Content {
+    /// A text block.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(TextContent {
+            text: text.into(),
+            annotations: None,
+            meta: None,
+        })
+    }
+
+    /// An image block from base64-encoded `data` of type `mime_type`.
+    #[must_use]
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::Image(ImageContent {
+            data: data.into(),
+            mime_type: mime_type.into(),
+            annotations: None,
+            meta: None,
+        })
+    }
+
+    /// An audio block from base64-encoded `data` of type `mime_type`.
+    #[must_use]
+    pub fn audio(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::Audio(AudioContent {
+            data: data.into(),
+            mime_type: mime_type.into(),
+            annotations: None,
+            meta: None,
+        })
+    }
+
+    /// An embedded-resource block carrying `contents`.
+    #[must_use]
+    pub fn resource(contents: ResourceContents) -> Self {
+        Self::Resource(EmbeddedResource {
+            resource: contents,
+            annotations: None,
+            meta: None,
+        })
+    }
+
+    /// A resource-link block pointing at `link`.
+    #[must_use]
+    pub fn resource_link(link: ResourceLink) -> Self {
+        Self::ResourceLink(link)
+    }
+
+    /// This block with its annotations set to `annotations`.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        let slot = match &mut self {
+            Self::Text(block) => &mut block.annotations,
+            Self::Image(block) => &mut block.annotations,
+            Self::Audio(block) => &mut block.annotations,
+            Self::ResourceLink(block) => &mut block.annotations,
+            Self::Resource(block) => &mut block.annotations,
+        };
+        *slot = Some(annotations);
+        self
+    }
+
+    /// The block's annotations, if it carries any.
+    #[must_use]
+    pub const fn annotations(&self) -> Option<&Annotations> {
+        match self {
+            Self::Text(block) => block.annotations.as_ref(),
+            Self::Image(block) => block.annotations.as_ref(),
+            Self::Audio(block) => block.annotations.as_ref(),
+            Self::ResourceLink(block) => block.annotations.as_ref(),
+            Self::Resource(block) => block.annotations.as_ref(),
+        }
+    }
+
     /// Borrow the inner string when this is a [`Content::Text`].
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Text { text } => Some(text),
-            Self::Image { .. } => None,
+            Self::Text(block) => Some(&block.text),
+            Self::Image(_) | Self::Audio(_) | Self::ResourceLink(_) | Self::Resource(_) => None,
         }
     }
+}
+
+/// The spec's `TextContent`: a text block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextContent {
+    /// The text.
+    pub text: String,
+    /// Hints on how the client should use the block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// The block's `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The spec's `ImageContent`: a base64-encoded image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageContent {
+    /// The base64-encoded image data.
+    pub data: String,
+    /// The image's MIME type (e.g. `"image/png"`).
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    /// Hints on how the client should use the block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// The block's `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The spec's `AudioContent`: base64-encoded audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioContent {
+    /// The base64-encoded audio data.
+    pub data: String,
+    /// The audio's MIME type (e.g. `"audio/wav"`).
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    /// Hints on how the client should use the block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// The block's `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The spec's `ResourceLink`: a resource the server can read, named by its
+/// URI, which the client fetches with `resources/read` if it wants it.
+///
+/// It carries every field of the spec's `Resource`; a link need not appear
+/// in `resources/list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLink {
+    /// The resource's URI.
+    pub uri: String,
+    /// The resource's programmatic name.
+    pub name: String,
+    /// A human-readable display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What the resource is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The resource's MIME type, if known.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The resource's raw size in bytes, before any base64 encoding, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Icons a client may show for the resource.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<Icon>>,
+    /// Hints on how the client should use the block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// The block's `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ResourceLink {
+    /// A link to `uri` named `name`, with no optional field set.
+    #[must_use]
+    pub fn new(uri: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: name.into(),
+            title: None,
+            description: None,
+            mime_type: None,
+            size: None,
+            icons: None,
+            annotations: None,
+            meta: None,
+        }
+    }
+}
+
+/// The spec's `EmbeddedResource`: a resource's contents carried in the block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddedResource {
+    /// The resource's contents, text or binary.
+    pub resource: ResourceContents,
+    /// Hints on how the client should use the block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// The block's `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The contents of a resource, as the spec's
+/// `TextResourceContents | BlobResourceContents` union: the two carry no
+/// tag, and are told apart by holding `text` or `blob`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResourceContents {
+    /// Contents representable as text.
+    Text(TextResourceContents),
+    /// Binary contents, base64-encoded.
+    Blob(BlobResourceContents),
+}
+
+impl ResourceContents {
+    /// The text contents of the resource at `uri`.
+    #[must_use]
+    pub fn text(uri: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Text(TextResourceContents {
+            uri: uri.into(),
+            mime_type: None,
+            text: text.into(),
+            meta: None,
+        })
+    }
+
+    /// The binary contents of the resource at `uri`, from base64-encoded
+    /// `blob`.
+    #[must_use]
+    pub fn blob(uri: impl Into<String>, blob: impl Into<String>) -> Self {
+        Self::Blob(BlobResourceContents {
+            uri: uri.into(),
+            mime_type: None,
+            blob: blob.into(),
+            meta: None,
+        })
+    }
+
+    /// These contents with their MIME type set to `mime_type`.
+    #[must_use]
+    pub fn with_mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        let slot = match &mut self {
+            Self::Text(contents) => &mut contents.mime_type,
+            Self::Blob(contents) => &mut contents.mime_type,
+        };
+        *slot = Some(mime_type.into());
+        self
+    }
+
+    /// The URI of the resource these contents are from.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Text(contents) => &contents.uri,
+            Self::Blob(contents) => &contents.uri,
+        }
+    }
+
+    /// The contents' MIME type, if set.
+    #[must_use]
+    pub fn mime_type(&self) -> Option<&str> {
+        match self {
+            Self::Text(contents) => contents.mime_type.as_deref(),
+            Self::Blob(contents) => contents.mime_type.as_deref(),
+        }
+    }
+}
+
+/// The spec's `TextResourceContents`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextResourceContents {
+    /// The URI of the resource.
+    pub uri: String,
+    /// The MIME type of the resource, if known.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The resource's text.
+    pub text: String,
+    /// The contents' `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The spec's `BlobResourceContents`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobResourceContents {
+    /// The URI of the resource.
+    pub uri: String,
+    /// The MIME type of the resource, if known.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The resource's bytes, base64-encoded.
+    pub blob: String,
+    /// The contents' `_meta` object.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The spec's `Annotations`: hints a client reads to decide how to use or
+/// show a block. Every field is optional and written only when set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Annotations {
+    /// Who the block is meant for; both roles when it is for both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<Role>>,
+    /// How important the block is, from 0 (optional) to 1 (required).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f64>,
+    /// When the underlying data last changed, as an ISO 8601 timestamp
+    /// (e.g. `"2025-01-12T15:00:58Z"`), kept as written.
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+/// The spec's `Role`: the sender or recipient of a message or block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// The user.
+    User,
+    /// The assistant.
+    Assistant,
+}
+
+/// The spec's `Icon`: an image a client may show for an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Icon {
+    /// The icon's URI: an `https:` URL or a `data:` URI.
+    pub src: String,
+    /// The icon's MIME type, when `src` does not say.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// The sizes the icon is available at (e.g. `["48x48"]`, `["any"]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<String>>,
+    /// The UI theme the icon is drawn for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<IconTheme>,
+}
+
+/// The UI theme an [`Icon`] is drawn for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconTheme {
+    /// A light background.
+    Light,
+    /// A dark background.
+    Dark,
 }
 
 /// MCP server capability declarations.
@@ -1041,7 +1406,7 @@ pub struct ModelHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptMessage {
     /// Role of the sender.
-    pub role: String,
+    pub role: Role,
     /// Message content.
     pub content: Content,
 }
@@ -1051,7 +1416,7 @@ impl PromptMessage {
     #[must_use]
     pub fn user(content: Content) -> Self {
         Self {
-            role: "user".to_owned(),
+            role: Role::User,
             content,
         }
     }
@@ -1060,7 +1425,7 @@ impl PromptMessage {
     #[must_use]
     pub fn assistant(content: Content) -> Self {
         Self {
-            role: "assistant".to_owned(),
+            role: Role::Assistant,
             content,
         }
     }
@@ -1343,10 +1708,246 @@ mod tests {
 
     #[test]
     fn content_as_text_only_matches_text_variant() {
-        let img = Content::Image {
-            data: "AAAA".to_owned(),
-            mime_type: "image/png".to_owned(),
-        };
+        let img = Content::image("AAAA", "image/png");
         assert!(img.as_text().is_none());
+    }
+
+    /// `wire` read as a [`Content`] and written back is `wire`, unchanged.
+    fn assert_round_trip(wire: &serde_json::Value) -> Content {
+        let block: Content = serde_json::from_value(wire.clone()).expect("deserialize"); // Safe: test assertion
+        assert_eq!(&serde_json::to_value(&block).expect("serialize"), wire); // Safe: test assertion
+        block
+    }
+
+    fn every_annotation() -> serde_json::Value {
+        json!({
+            "audience": ["user", "assistant"],
+            "priority": 0.8,
+            "lastModified": "2025-01-12T15:00:58Z"
+        })
+    }
+
+    #[test]
+    fn every_content_block_round_trips_in_its_spec_shape() {
+        let blocks = [
+            json!({ "type": "text", "text": "hi" }),
+            json!({
+                "type": "image", "data": "iVBORw0K", "mimeType": "image/png",
+                "annotations": every_annotation(), "_meta": { "example.com/k": 1 }
+            }),
+            json!({ "type": "audio", "data": "UklGRg==", "mimeType": "audio/wav" }),
+            json!({
+                "type": "audio", "data": "UklGRg==", "mimeType": "audio/wav",
+                "annotations": { "priority": 0.0 }
+            }),
+            json!({
+                "type": "resource",
+                "resource": { "uri": "file:///notes.txt", "mimeType": "text/plain", "text": "a" },
+                "annotations": { "audience": ["user"] }
+            }),
+            json!({
+                "type": "resource",
+                "resource": { "uri": "file:///a.bin", "blob": "AAEC", "_meta": { "k": "v" } },
+                "_meta": { "k": true }
+            }),
+            json!({ "type": "resource_link", "uri": "file:///a.rs", "name": "a.rs" }),
+            json!({
+                "type": "resource_link",
+                "uri": "file:///project/src/main.rs",
+                "name": "main.rs",
+                "title": "Main entry point",
+                "description": "Primary application entry point",
+                "mimeType": "text/x-rust",
+                "size": 2048,
+                "icons": [
+                    { "src": "https://example.com/rust.png", "mimeType": "image/png",
+                      "sizes": ["48x48", "any"], "theme": "dark" },
+                    { "src": "data:image/svg+xml;base64,PHN2Zz4=" }
+                ],
+                "annotations": every_annotation(),
+                "_meta": { "example.com/k": [1, 2] }
+            }),
+        ];
+        for wire in &blocks {
+            assert_round_trip(wire);
+        }
+    }
+
+    #[test]
+    fn a_text_block_with_every_annotation_reads_into_typed_fields() {
+        let wire = json!({ "type": "text", "text": "hi", "annotations": every_annotation() });
+        let block = assert_round_trip(&wire);
+        let annotations = block.annotations().expect("annotated"); // Safe: test assertion
+        assert_eq!(
+            annotations.audience.as_deref(),
+            Some(&[Role::User, Role::Assistant][..])
+        );
+        assert_eq!(annotations.priority, Some(0.8));
+        assert_eq!(
+            annotations.last_modified.as_deref(),
+            Some("2025-01-12T15:00:58Z")
+        );
+        assert_eq!(block.as_text(), Some("hi"));
+    }
+
+    #[test]
+    fn constructors_write_the_spec_shape_and_nothing_unset() {
+        let cases = [
+            (Content::text("hi"), json!({ "type": "text", "text": "hi" })),
+            (
+                Content::image("iVBORw0K", "image/png"),
+                json!({ "type": "image", "data": "iVBORw0K", "mimeType": "image/png" }),
+            ),
+            (
+                Content::audio("UklGRg==", "audio/wav"),
+                json!({ "type": "audio", "data": "UklGRg==", "mimeType": "audio/wav" }),
+            ),
+            (
+                Content::resource(
+                    ResourceContents::text("test://embedded", "body").with_mime_type("text/plain"),
+                ),
+                json!({
+                    "type": "resource",
+                    "resource": { "uri": "test://embedded", "mimeType": "text/plain", "text": "body" }
+                }),
+            ),
+            (
+                Content::resource(ResourceContents::blob("test://bin", "AAEC")),
+                json!({ "type": "resource", "resource": { "uri": "test://bin", "blob": "AAEC" } }),
+            ),
+            (
+                Content::resource_link(ResourceLink::new("file:///a.rs", "a.rs")),
+                json!({ "type": "resource_link", "uri": "file:///a.rs", "name": "a.rs" }),
+            ),
+        ];
+        for (block, wire) in cases {
+            assert_eq!(serde_json::to_value(&block).expect("serialize"), wire); // Safe: test assertion
+            assert_eq!(assert_round_trip(&wire), block);
+        }
+    }
+
+    #[test]
+    fn with_annotations_sets_the_hints_on_every_kind_of_block() {
+        let hints = Annotations {
+            audience: Some(vec![Role::Assistant]),
+            priority: Some(1.0),
+            last_modified: None,
+        };
+        let blocks = [
+            Content::text("t"),
+            Content::image("AA==", "image/png"),
+            Content::audio("AA==", "audio/wav"),
+            Content::resource(ResourceContents::blob("test://b", "AA==")),
+            Content::resource_link(ResourceLink::new("test://l", "l")),
+        ];
+        for block in blocks {
+            assert!(block.annotations().is_none());
+            let annotated = block.with_annotations(hints.clone());
+            assert_eq!(annotated.annotations(), Some(&hints));
+            let wire = serde_json::to_value(&annotated).expect("serialize"); // Safe: test assertion
+            assert_eq!(
+                wire["annotations"],
+                json!({ "audience": ["assistant"], "priority": 1.0 })
+            );
+        }
+    }
+
+    /// The two kinds of resource contents carry no tag: `text` makes one a
+    /// text resource, `blob` a binary one, and neither is no resource.
+    #[test]
+    fn resource_contents_are_told_apart_by_text_or_blob() {
+        let text: ResourceContents =
+            serde_json::from_value(json!({ "uri": "test://t", "text": "a" })).expect("text"); // Safe: test assertion
+        assert!(matches!(text, ResourceContents::Text(_)));
+        assert_eq!(text.uri(), "test://t");
+        assert_eq!(text.mime_type(), None);
+
+        let blob: ResourceContents = serde_json::from_value(
+            json!({ "uri": "test://b", "mimeType": "image/png", "blob": "AA==" }),
+        )
+        .expect("blob"); // Safe: test assertion
+        assert!(matches!(blob, ResourceContents::Blob(_)));
+        assert_eq!(blob.mime_type(), Some("image/png"));
+
+        let neither = json!({ "type": "resource", "resource": { "uri": "test://n" } });
+        assert!(serde_json::from_value::<Content>(neither).is_err());
+    }
+
+    #[test]
+    fn blocks_outside_the_spec_shape_are_refused() {
+        let refused = [
+            json!({ "type": "audio", "data": "AA==" }),
+            json!({ "type": "image", "mimeType": "image/png" }),
+            json!({ "type": "resource_link", "uri": "file:///a" }),
+            json!({ "type": "resource_link", "name": "a" }),
+            json!({ "type": "resource", "resource": { "text": "no uri" } }),
+            json!({ "type": "text", "text": "a", "annotations": { "audience": ["system"] } }),
+            json!({ "type": "video", "data": "AA==", "mimeType": "video/mp4" }),
+        ];
+        for wire in refused {
+            assert!(
+                serde_json::from_value::<Content>(wire.clone()).is_err(),
+                "{wire} was read"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_response_constructors_hold_one_block_each() {
+        let link = ResourceLink {
+            mime_type: Some("text/x-rust".to_owned()),
+            ..ResourceLink::new("file:///a.rs", "a.rs")
+        };
+        let cases = [
+            (ToolResponse::image("AA==", "image/png"), "image"),
+            (ToolResponse::audio("AA==", "audio/wav"), "audio"),
+            (
+                ToolResponse::resource(ResourceContents::text("test://r", "r")),
+                "resource",
+            ),
+            (ToolResponse::resource_link(link), "resource_link"),
+        ];
+        for (response, kind) in cases {
+            assert!(!response.is_error);
+            let wire = serde_json::to_value(&response).expect("serialize"); // Safe: test assertion
+            assert_eq!(wire["content"].as_array().map(Vec::len), Some(1));
+            assert_eq!(wire["content"][0]["type"], kind);
+            assert!(wire.get("structuredContent").is_none());
+        }
+    }
+
+    #[test]
+    fn tool_response_blocks_keeps_their_order() {
+        let response = ToolResponse::blocks(vec![
+            Content::text("first"),
+            Content::image("AA==", "image/png"),
+            Content::resource(
+                ResourceContents::text("test://r", "{}").with_mime_type("application/json"),
+            ),
+        ]);
+        let wire = serde_json::to_value(&response).expect("serialize"); // Safe: test assertion
+        let kinds: Vec<&str> = wire["content"]
+            .as_array()
+            .expect("content array") // Safe: test assertion
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect();
+        assert_eq!(kinds, ["text", "image", "resource"]);
+        assert_eq!(wire["isError"], false);
+    }
+
+    #[test]
+    fn prompt_message_roles_are_the_spec_role_strings() {
+        let user =
+            serde_json::to_value(PromptMessage::user(Content::text("q"))).expect("serialize"); // Safe: test assertion
+        assert_eq!(
+            user,
+            json!({ "role": "user", "content": { "type": "text", "text": "q" } })
+        );
+        let assistant: PromptMessage = serde_json::from_value(
+            json!({ "role": "assistant", "content": { "type": "audio", "data": "AA==", "mimeType": "audio/wav" } }),
+        )
+        .expect("deserialize"); // Safe: test assertion
+        assert_eq!(assistant.role, Role::Assistant);
     }
 }
