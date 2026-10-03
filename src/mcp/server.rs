@@ -43,6 +43,14 @@ fn default_supported_versions() -> Vec<String> {
     ]
 }
 
+/// The largest request body the HTTP transport reads by default: 4 MiB.
+///
+/// A JSON-RPC request is a method name and its arguments; this leaves room
+/// for a tool taking a sizeable document inline while refusing a body sent to
+/// exhaust memory. It used to be axum's implicit 2 MB, which nothing in the
+/// crate stated, so a host could neither see nor change it.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
 /// Source of the natural-language instructions a server advertises in
 /// `initialize` and `server/discover`.
 ///
@@ -86,6 +94,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
     allowed_hosts: Option<Vec<String>>,
+    max_request_bytes: usize,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
@@ -117,6 +126,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             auth_hook: None,
             allowed_origins: Vec::new(),
             allowed_hosts: None,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             tool_dispatcher: None,
             method_handler: None,
             task_manager: None,
@@ -231,6 +241,21 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// named none.
     pub fn allowed_hosts(&self) -> Option<&[String]> {
         self.allowed_hosts.as_deref()
+    }
+
+    /// Set the largest request body, in bytes, the HTTP transport reads
+    /// ([`DEFAULT_MAX_REQUEST_BYTES`] unless set). A larger one is refused
+    /// with 413 before it is buffered whole.
+    #[must_use]
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
+        self
+    }
+
+    /// The largest request body the HTTP transport reads.
+    #[must_use]
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
     }
 
     /// Install a host [`ToolDispatcher`] that owns `tools/list` and `tools/call`

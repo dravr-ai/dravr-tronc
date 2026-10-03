@@ -10,8 +10,9 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::rejection::StringRejection;
 use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::uri::Authority;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
@@ -26,7 +27,8 @@ use tracing::{debug, error, info};
 
 use crate::error::{
     HEADER_MISMATCH, INTERNAL_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND,
-    MISSING_REQUIRED_CLIENT_CAPABILITY, RATE_LIMITED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, PARSE_ERROR, RATE_LIMITED, UNAUTHORIZED,
+    UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::AuthError;
 use crate::mcp::modern::{
@@ -49,9 +51,14 @@ use crate::server::request_guard::guard_requests;
 /// for the standalone case. Two guards on one route would log it twice. Never
 /// layer a request deadline over it — a tool call is dispatched whole before
 /// the response is written.
+///
+/// A body over [`McpServer::max_request_bytes`] is refused with 413 before it
+/// is buffered whole; the limit is set on the route itself, so it holds
+/// whatever the merging application layers on top.
 pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
+    let body_limit = DefaultBodyLimit::max(server.max_request_bytes());
     Router::new()
-        .route("/mcp", post(handle_mcp_post::<S>))
+        .route("/mcp", post(handle_mcp_post::<S>).layer(body_limit))
         .with_state(server)
 }
 
@@ -136,7 +143,7 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
 ///
 /// Enforces the `Origin` allowlist (403) and, when the server names one, the
 /// `Host` allowlist (403; see [`McpServer::with_allowed_hosts`]), refuses a body not declared
-/// `application/json` (415) and a client that does not accept both
+/// `application/json` (415), a body over the size limit (413), and a client that does not accept both
 /// `application/json` and `text/event-stream` (406), refuses a body that is
 /// not a JSON-RPC Request (400), refuses an unsupported `MCP-Protocol-Version`
 /// (400, -32022) and a modern body sent without one (400, -32020), authenticates via the server's hook (401 +
@@ -148,7 +155,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     uri: Uri,
     headers: HeaderMap,
-    body: String,
+    body: Result<String, StringRejection>,
 ) -> Response {
     // 1. Origin allowlist and, when the host names one, the Host allowlist
     // (DNS-rebinding protection).
@@ -182,7 +189,23 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         );
     }
 
-    // 3. Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
+    // 3. Read the body. One over the limit is a 413, one that is not UTF-8
+    // cannot be JSON; neither reached the parser, so neither has an id.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return transport_refusal(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                INVALID_REQUEST,
+                &format!("Request body exceeds {} bytes", server.max_request_bytes()),
+            );
+        }
+        Err(rejection) => {
+            return transport_refusal(rejection.status(), PARSE_ERROR, &rejection.body_text());
+        }
+    };
+
+    // Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
     // a batch, a client's response, an id that is neither a string nor an
     // integer — is one this server cannot accept, which Streamable HTTP
     // answers with an HTTP error status, never a 2xx.
@@ -746,8 +769,10 @@ mod tests {
     use crate::error::{INVALID_PARAMS, PARSE_ERROR};
     use crate::mcp::auth::AuthHook;
     use crate::mcp::schema::{Tool, ToolResponse};
+    use crate::mcp::server::DEFAULT_MAX_REQUEST_BYTES;
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
     use crate::mcp::transport::mirror::{MCP_METHOD_HEADER, MCP_NAME_HEADER};
+    use axum::body::Body;
     use http::Request;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -1086,6 +1111,57 @@ mod tests {
         assert!(!is_origin_allowed(Some("https://evil.test"), &allowed));
         assert!(is_origin_allowed(None, &allowed));
         assert!(is_origin_allowed(None, &[]));
+    }
+
+    /// A body over the server's limit is refused with 413 and a JSON-RPC
+    /// error, and one within it is served.
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused_with_413() {
+        let app = || {
+            mcp_router(Arc::new(
+                McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                    .with_max_request_bytes(64),
+            ))
+        };
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let (status, _) = post(app(), ping, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let padded = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{"pad":"{}"}}}}"#,
+            "x".repeat(128)
+        );
+        let (status, body) = post(app(), &padded, &[]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+        assert_eq!(json["error"]["code"], INVALID_REQUEST);
+    }
+
+    /// The default limit is stated, not axum's implicit one.
+    #[test]
+    fn the_default_body_limit_is_the_stated_one() {
+        let server = McpServer::new(
+            "test",
+            "0.1.0",
+            ToolRegistry::<TestState>::new(),
+            Arc::new(TestState),
+        );
+        assert_eq!(server.max_request_bytes(), DEFAULT_MAX_REQUEST_BYTES);
+    }
+
+    /// A body that is not UTF-8 cannot be JSON: a 400 parse error.
+    #[tokio::test]
+    async fn a_body_that_is_not_utf8_is_a_parse_error() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", TEST_ACCEPT)
+            .body(Body::from(vec![0x7B, 0xFF, 0x7D]))
+            .expect("request"); // Safe: test fixture
+        let response = make_app().oneshot(request).await.expect("response"); // Safe: test assertion
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"]["code"], PARSE_ERROR);
     }
 
     /// Loopback authorities always pass; a listed `host` admits any port,
