@@ -12,7 +12,7 @@ use bitflags::bitflags;
 use serde_json::Value;
 
 use crate::mcp::schema::{Tool, ToolResponse};
-use crate::mcp::tasks::TASKS_EXTENSION_ID;
+use crate::mcp::tasks::{CancellationToken, TASKS_EXTENSION_ID};
 
 bitflags! {
     /// Host-agnostic classification flags a tool declares for discovery + gating.
@@ -87,6 +87,15 @@ pub struct ToolContext {
     /// Deliberately `Vec<String>` and not a typed set: the vocabulary is the
     /// host's, and tronc has no business naming an athlete's scopes.
     pub scopes: Vec<String>,
+    /// Fired when the client cancels this request with
+    /// `notifications/cancelled`.
+    ///
+    /// The engine stops waiting on a cancelled request and drops its future,
+    /// which ends a tool at its next `.await`; a tool doing work that outlives
+    /// that future — a spawned job, a blocking section — watches this token to
+    /// stop it. A transport may install its own token here (one tied to the
+    /// connection, say); the engine derives each request's token from it.
+    pub cancellation: CancellationToken,
 }
 
 impl ToolContext {
@@ -128,6 +137,13 @@ impl ToolContext {
     #[must_use]
     pub const fn as_admin(mut self, is_admin: bool) -> Self {
         self.is_admin = is_admin;
+        self
+    }
+
+    /// Install the token this request's cancellation derives from.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
         self
     }
 

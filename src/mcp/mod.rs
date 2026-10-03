@@ -5,6 +5,7 @@
 // Copyright (c) 2026 dravr.ai
 
 pub mod auth;
+pub(crate) mod cancellation;
 #[cfg(feature = "computation")]
 pub mod computation;
 pub mod host;

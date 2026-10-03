@@ -16,6 +16,7 @@ use crate::error::{
     MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
+use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICATIONS_CANCELLED};
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::modern::{
     frame_cacheable_result, DiscoverResult, ModernMeta, ModernRequestMeta,
@@ -85,6 +86,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
+    in_flight: InFlightRequests,
 }
 
 impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
@@ -112,6 +114,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             tool_dispatcher: None,
             method_handler: None,
             task_manager: None,
+            in_flight: InFlightRequests::default(),
         }
     }
 
@@ -391,21 +394,56 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
 
         // Notifications have no id and expect no response
-        if request.id.is_none() {
-            debug!(method = %request.method, "Received notification, no response");
+        let Some(request_id) = request.id.clone() else {
+            self.handle_notification(&request, ctx);
             return None;
-        }
+        };
 
-        // Era detection — see `mcp::modern` + the dual-era spec.
-        let response = match ModernRequestMeta::from_params(request.params.as_ref()) {
+        // `initialize` MUST NOT be cancelled; every other request is
+        // registered so `notifications/cancelled` can reach it.
+        if request.method == "initialize" {
+            return Some(self.dispatch(request, ctx).await);
+        }
+        let in_flight = self.in_flight.register(ctx, &request_id);
+        let ctx = ctx.clone().with_cancellation(in_flight.token().clone());
+        tokio::select! {
+            biased;
+            // The client will not read a cancelled request's response, so the
+            // server sends none, and dropping the dispatch future ends the
+            // work at its next await.
+            () = in_flight.token().cancelled() => {
+                debug!(%request_id, "Request cancelled by the client, no response");
+                None
+            }
+            response = self.dispatch(request, &ctx) => Some(response),
+        }
+    }
+
+    /// Era detection — see `mcp::modern` + the dual-era spec.
+    async fn dispatch(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
+        match ModernRequestMeta::from_params(request.params.as_ref()) {
             ModernMeta::Malformed(reason) => {
                 JsonRpcResponse::error(request.id, INVALID_PARAMS, reason)
             }
             ModernMeta::Modern(meta) => self.process_modern(request, *meta, ctx).await,
             ModernMeta::Legacy => self.process_legacy(request, ctx).await,
-        };
+        }
+    }
 
-        Some(response)
+    /// Act on a notification. `notifications/cancelled` fires the named
+    /// request's token when that request is still being served for the same
+    /// caller; every other notification needs nothing from a stateless server.
+    fn handle_notification(&self, request: &JsonRpcRequest, ctx: &ToolContext) {
+        if request.method != NOTIFICATIONS_CANCELLED {
+            debug!(method = %request.method, "Received notification, no response");
+            return;
+        }
+        if let Some(request_id) = cancelled_request_id(request.params.as_ref()) {
+            let found = self.in_flight.cancel(ctx, request_id);
+            debug!(%request_id, found, "Cancellation received");
+        } else {
+            debug!("Cancellation notification names no requestId");
+        }
     }
 
     /// Dispatch a legacy (`initialize`/session) request.
