@@ -12,6 +12,7 @@
 )]
 
 use dravr_tronc::mcp::tasks::CreateTaskResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,14 +22,14 @@ use dravr_tronc::mcp::protocol::JsonRpcResponse;
 use dravr_tronc::mcp::schema::{TaskSupport, Tool, ToolExecution, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tasks::{
-    DetailedTask, InMemoryTaskStore, Task, TaskError, TaskId, TaskManager, TaskOwner, TaskPayload,
-    TaskRun, TaskStatus,
+    DetailedTask, InMemoryTaskStore, Task, TaskError, TaskId, TaskManager, TaskOptions, TaskOwner,
+    TaskPayload, TaskRun, TaskStatus, TaskStore, TaskUpdate,
 };
 use dravr_tronc::mcp::tool::{ToolContext, ToolRegistry};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use tokio::task::yield_now;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 /// State for the test server.
 struct TestState;
@@ -843,4 +844,113 @@ async fn listen_is_not_served_by_a_poll_only_engine() {
     let error = response.error.expect("error");
     assert_eq!(error.code, -32601);
     assert_eq!(error.message, "Method not found: subscriptions/listen");
+}
+
+// ---------------------------------------------------------------------------
+// Expiry
+// ---------------------------------------------------------------------------
+
+/// An in-memory store that counts sweeps, to watch the manager's own sweeper.
+#[derive(Default)]
+struct CountingStore {
+    inner: InMemoryTaskStore,
+    sweeps: AtomicUsize,
+}
+
+#[async_trait]
+impl TaskStore for CountingStore {
+    async fn create(&self, owner: &TaskOwner, task: DetailedTask) -> Result<(), TaskError> {
+        self.inner.create(owner, task).await
+    }
+
+    async fn get(&self, owner: &TaskOwner, id: &TaskId) -> Result<Option<DetailedTask>, TaskError> {
+        self.inner.get(owner, id).await
+    }
+
+    async fn update(
+        &self,
+        owner: &TaskOwner,
+        id: &TaskId,
+        apply: TaskUpdate<'_>,
+    ) -> Result<DetailedTask, TaskError> {
+        self.inner.update(owner, id, apply).await
+    }
+
+    async fn sweep_expired(&self) -> Result<Vec<TaskId>, TaskError> {
+        self.sweeps.fetch_add(1, Ordering::SeqCst);
+        self.inner.sweep_expired().await
+    }
+}
+
+fn fast_expiry() -> TaskOptions {
+    TaskOptions {
+        ttl_ms: Some(1),
+        sweep_interval: Some(Duration::from_millis(10)),
+        ..TaskOptions::default()
+    }
+}
+
+/// Expired tasks leave memory without the host scheduling anything, and the
+/// operation still running one is told its result is no longer wanted.
+#[tokio::test]
+async fn the_manager_sweeps_expired_tasks_on_its_own() {
+    let store = Arc::new(CountingStore::default());
+    let manager = Arc::new(TaskManager::with_options(
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+        fast_expiry(),
+    ));
+    let run = manager
+        .create(&TaskOwner::default())
+        .await
+        .expect("created");
+
+    timeout(Duration::from_secs(2), run.cancellation().cancelled())
+        .await
+        .expect("the expiry sweep cancels the running operation");
+    assert!(store.sweeps.load(Ordering::SeqCst) >= 1);
+    assert!(
+        store.inner.sweep_expired().await.expect("swept").is_empty(),
+        "the manager already removed the expired task"
+    );
+}
+
+/// The sweep belongs to the manager: it stops when the manager is dropped, and
+/// a host that turns it off is never swept behind its back.
+#[tokio::test]
+async fn the_sweeper_ends_with_its_manager_and_can_be_turned_off() {
+    let store = Arc::new(CountingStore::default());
+    let manager = Arc::new(TaskManager::with_options(
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+        fast_expiry(),
+    ));
+    drop(
+        manager
+            .create(&TaskOwner::default())
+            .await
+            .expect("created"),
+    );
+    sleep(Duration::from_millis(50)).await;
+    drop(manager);
+    let after_drop = store.sweeps.load(Ordering::SeqCst);
+    assert!(after_drop >= 1, "the sweeper ran while the manager lived");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.sweeps.load(Ordering::SeqCst), after_drop);
+
+    let store = Arc::new(CountingStore::default());
+    let manager = Arc::new(TaskManager::with_options(
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+        TaskOptions {
+            sweep_interval: None,
+            ..fast_expiry()
+        },
+    ));
+    drop(
+        manager
+            .create(&TaskOwner::default())
+            .await
+            .expect("created"),
+    );
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.sweeps.load(Ordering::SeqCst), 0);
+    assert_eq!(manager.sweep_expired().await.expect("swept"), 1);
 }

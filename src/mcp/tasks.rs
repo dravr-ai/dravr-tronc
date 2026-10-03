@@ -26,7 +26,8 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
@@ -36,6 +37,9 @@ use serde_json::{Map, Value};
 
 use crate::error::INTERNAL_ERROR;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::AbortHandle;
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::warn;
 
 /// The token a [`TaskRun`] carries, re-exported so a host names it without a
 /// direct `tokio-util` dependency.
@@ -50,6 +54,9 @@ pub const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 
 /// Default polling interval advertised to clients, in milliseconds.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+
+/// Default period of a manager's expired-task sweep.
+pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// JSON-RPC method names the extension defines.
 ///
@@ -586,6 +593,10 @@ pub struct TaskOptions {
     pub ttl_ms: Option<u64>,
     /// Polling interval advertised to the client, in milliseconds.
     pub poll_interval_ms: u64,
+    /// How often the manager drops expired tasks on its own. `None`, or a
+    /// zero duration, leaves sweeping to a host that calls
+    /// [`TaskManager::sweep_expired`] on its own schedule.
+    pub sweep_interval: Option<Duration>,
 }
 
 impl Default for TaskOptions {
@@ -593,6 +604,7 @@ impl Default for TaskOptions {
         Self {
             ttl_ms: Some(DEFAULT_TASK_TTL_MS),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            sweep_interval: Some(DEFAULT_SWEEP_INTERVAL),
         }
     }
 }
@@ -647,6 +659,7 @@ pub struct TaskManager {
     store: Arc<dyn TaskStore>,
     options: TaskOptions,
     runs: Mutex<HashMap<TaskId, LiveRun>>,
+    sweeper: OnceLock<AbortHandle>,
 }
 
 impl Debug for TaskManager {
@@ -671,6 +684,7 @@ impl TaskManager {
             store,
             options,
             runs: Mutex::new(HashMap::new()),
+            sweeper: OnceLock::new(),
         }
     }
 
@@ -684,6 +698,38 @@ impl TaskManager {
     #[must_use]
     pub fn store(&self) -> &Arc<dyn TaskStore> {
         &self.store
+    }
+
+    /// Start the periodic expired-task sweep, once per manager.
+    ///
+    /// Started from [`Self::create`] rather than the constructor because a
+    /// spawn needs a runtime and `create` is the first call guaranteed to run
+    /// on one; nothing expires before a task exists. The loop holds the
+    /// manager weakly, so it ends with the manager, and the manager's drop
+    /// aborts it without waiting for the next tick.
+    fn ensure_sweeper(self: &Arc<Self>) {
+        let Some(every) = self.options.sweep_interval.filter(|d| !d.is_zero()) else {
+            return;
+        };
+        self.sweeper.get_or_init(|| {
+            let manager = Arc::downgrade(self);
+            tokio::spawn(async move {
+                let mut ticks = interval(every);
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // The first tick completes immediately; sweep a period later.
+                ticks.tick().await;
+                loop {
+                    ticks.tick().await;
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = manager.sweep_expired().await {
+                        warn!(error = %e, "Expired-task sweep failed");
+                    }
+                }
+            })
+            .abort_handle()
+        });
     }
 
     /// The live-run table, recovered from a poisoned lock: every critical
@@ -701,6 +747,7 @@ impl TaskManager {
     /// with that seed task, then move the run into the operation that does the
     /// work: it carries the cancellation token and settles the task.
     pub async fn create(self: &Arc<Self>, owner: &TaskOwner) -> Result<TaskRun, TaskError> {
+        self.ensure_sweeper();
         let task = Task::new(
             TaskId::generate()?,
             self.options.ttl_ms,
@@ -868,7 +915,8 @@ impl TaskManager {
 
     /// Drop tasks whose TTL elapsed, returning how many were removed.
     ///
-    /// An expired task's result can no longer be retrieved, so the operation
+    /// The manager runs this every [`TaskOptions::sweep_interval`]; a host
+    /// calls it directly only when it turned that off. An expired task's result can no longer be retrieved, so the operation
     /// still running it is cancelled too.
     pub async fn sweep_expired(&self) -> Result<usize, TaskError> {
         let removed = self.store.sweep_expired().await?;
@@ -884,6 +932,14 @@ impl TaskManager {
     /// Forget a run whose [`TaskRun`] was dropped.
     fn release(&self, id: &TaskId) {
         self.runs().remove(id);
+    }
+}
+
+impl Drop for TaskManager {
+    fn drop(&mut self) {
+        if let Some(sweeper) = self.sweeper.get() {
+            sweeper.abort();
+        }
     }
 }
 
