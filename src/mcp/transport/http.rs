@@ -500,7 +500,12 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
     };
     let (outbound, outbox) = mpsc::unbounded_channel();
     let outbound = rendering.may_stream.then_some(outbound);
-    let connection = server.http_client_connection(outbound, session.clone(), &ctx);
+    let connection = server.http_client_connection(
+        outbound,
+        session.clone(),
+        &ctx,
+        request.auth_token.as_deref(),
+    );
     let ctx = ToolContext {
         client: ClientChannel::connected(connection),
         ..ctx
@@ -808,8 +813,12 @@ async fn accept_client_response<S: Send + Sync + ?Sized + 'static>(
             return session_not_found(None);
         }
     }
-    let delivered =
-        server.deliver_client_response(&ctx, session.as_ref().and_then(|s| s.id()), response);
+    let delivered = server.deliver_client_response(
+        &ctx,
+        session.as_ref().and_then(|s| s.id()),
+        message.auth_token.as_deref(),
+        response,
+    );
     debug!(delivered, "Client answered a server request");
     StatusCode::ACCEPTED.into_response()
 }

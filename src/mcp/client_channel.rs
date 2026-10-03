@@ -49,7 +49,9 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -164,24 +166,86 @@ impl StdError for ClientRequestError {
     }
 }
 
-/// Who a server request went to: the caller identity the auth hook resolved
-/// and, over HTTP, the session. An answer counts only from the same caller.
+/// Who a message came from or went to: the caller identity the auth hook
+/// resolved, and the channel it travels. A server request's answer, and a
+/// cancellation of a request in flight, count only from the same caller.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallerKey {
     user: Option<String>,
     tenant: Option<String>,
-    session: Option<String>,
+    channel: Channel,
+}
+
+/// What tells apart two callers the auth hook resolved to the same identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Channel {
+    /// Dispatched in-process, not through a transport: the identity alone.
+    Unconnected,
+    /// One connection of a connection-scoped transport (stdio), by a serial
+    /// no other connection of the process shares.
+    Connection(u64),
+    /// An HTTP session, by its `Mcp-Session-Id`.
+    Session(String),
+    /// HTTP without a session: a fingerprint of the bearer credential the
+    /// request presented, when it presented one.
+    Sessionless(Option<u64>),
 }
 
 impl CallerKey {
-    /// The key of the caller `ctx` names, in the session `session` names.
-    pub(crate) fn new(ctx: &ToolContext, session: Option<&str>) -> Self {
+    /// The caller `ctx` names, dispatched in-process.
+    pub(crate) fn unconnected(ctx: &ToolContext) -> Self {
+        Self::with_channel(ctx, Channel::Unconnected)
+    }
+
+    /// The caller `ctx` names on a connection of its own: a key no other
+    /// connection's caller ever equals.
+    pub(crate) fn connection(ctx: &ToolContext) -> Self {
+        static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(0);
+        let serial = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+        Self::with_channel(ctx, Channel::Connection(serial))
+    }
+
+    /// The caller `ctx` names over HTTP: in the session `session` names, or
+    /// sessionless, presenting the bearer `credential`.
+    ///
+    /// A session alone tells its requests apart, and keeps doing so when the
+    /// client renews its credential in it; only a sessionless request is
+    /// keyed by the credential.
+    pub(crate) fn http(ctx: &ToolContext, session: Option<&str>, credential: Option<&str>) -> Self {
+        let channel = session.map_or_else(
+            || Channel::Sessionless(credential.map(fingerprint)),
+            |session| Channel::Session(session.to_owned()),
+        );
+        Self::with_channel(ctx, channel)
+    }
+
+    fn with_channel(ctx: &ToolContext, channel: Channel) -> Self {
         Self {
             user: ctx.user_id.clone(),
             tenant: ctx.tenant_id.clone(),
-            session: session.map(str::to_owned),
+            channel,
         }
     }
+
+    /// Whether a message under this key comes from one caller only.
+    ///
+    /// Not so for a sessionless HTTP request whose auth hook resolved no
+    /// principal: anonymous clients, and clients sharing one API key, all
+    /// present the same identity and, at most, the same credential, so
+    /// nothing the server holds tells one from another.
+    pub(crate) fn tells_callers_apart(&self) -> bool {
+        !matches!(self.channel, Channel::Sessionless(_))
+            || self.user.is_some()
+            || self.tenant.is_some()
+    }
+}
+
+/// A fingerprint of a bearer credential: a keyed hash, its key drawn at
+/// random once per process, so the credential is never held in a key, and
+/// two credentials collide only by chance.
+fn fingerprint(credential: &str) -> u64 {
+    static KEY: OnceLock<RandomState> = OnceLock::new();
+    KEY.get_or_init(RandomState::new).hash_one(credential)
 }
 
 /// One server request awaiting its answer.
@@ -267,16 +331,15 @@ pub(crate) struct ClientConnection {
 
 impl ClientConnection {
     /// A connection sending on `outbound` (none: nothing reaches the client
-    /// before the response), awaiting answers in `pending`, for the caller
-    /// `ctx` in `session`.
+    /// before the response), awaiting answers in `pending`, for `caller` in
+    /// `session`.
     pub(crate) fn new(
         outbound: Option<mpsc::UnboundedSender<JsonRpcMessage>>,
         pending: Arc<PendingRequests>,
         session: Option<Arc<Session>>,
-        ctx: &ToolContext,
+        caller: CallerKey,
         request_timeout: Duration,
     ) -> Self {
-        let caller = CallerKey::new(ctx, session.as_ref().and_then(|s| s.id()));
         Self {
             outbound,
             pending,
@@ -417,6 +480,11 @@ impl ClientChannel {
                 cancellation,
             },
         }
+    }
+
+    /// Who the call's transport says sent it, if it came through one.
+    pub(crate) fn caller(&self) -> Option<&CallerKey> {
+        Some(&self.connection.as_ref()?.caller)
     }
 
     /// The session the call runs in, if its transport keeps one.
@@ -687,7 +755,7 @@ mod tests {
             Some(outbound),
             Arc::clone(&pending),
             Some(session),
-            &ctx,
+            CallerKey::http(&ctx, None, None),
             Duration::from_secs(5),
         );
         let channel = ClientChannel::connected(connection).for_legacy_call(
@@ -764,7 +832,7 @@ mod tests {
             Some(outbound),
             Arc::new(PendingRequests::new()),
             None,
-            &ctx,
+            CallerKey::http(&ctx, None, None),
             Duration::from_secs(5),
         );
         let channel = ClientChannel::connected(connection).for_modern_call(
@@ -793,7 +861,7 @@ mod tests {
             Some(outbound),
             Arc::new(PendingRequests::new()),
             None,
-            &ctx,
+            CallerKey::http(&ctx, None, None),
             Duration::from_secs(5),
         );
         let channel = ClientChannel::connected(connection).for_modern_call(
@@ -854,8 +922,8 @@ mod tests {
         );
         let id = request.id.expect("a request has an id"); // Safe: test assertion
 
-        let caller = CallerKey::new(&ToolContext::default(), None);
-        let stranger = CallerKey::new(&ToolContext::new().with_user("mallory"), None);
+        let caller = CallerKey::http(&ToolContext::default(), None, None);
+        let stranger = CallerKey::http(&ToolContext::new().with_user("mallory"), None, None);
         let answer = JsonRpcResponse::success(
             Some(id),
             json!({ "role": "assistant", "content": { "type": "text", "text": "hi" },
@@ -885,7 +953,7 @@ mod tests {
             Some(outbound),
             Arc::clone(&pending),
             Some(session),
-            &ctx,
+            CallerKey::http(&ctx, None, None),
             Duration::from_secs(5),
         );
         let cancel = CancellationToken::new();
@@ -910,7 +978,7 @@ mod tests {
 
         // The late answer finds nothing waiting.
         let late = JsonRpcResponse::success(Some(id), json!({}));
-        assert!(!pending.deliver(&CallerKey::new(&ctx, None), late));
+        assert!(!pending.deliver(&CallerKey::http(&ctx, None, None), late));
     }
 
     #[tokio::test]
@@ -937,7 +1005,7 @@ mod tests {
             Some(outbound),
             Arc::new(PendingRequests::new()),
             Some(session),
-            &ctx,
+            CallerKey::http(&ctx, None, None),
             Duration::from_millis(20),
         );
         let channel = ClientChannel::connected(connection).for_legacy_call(

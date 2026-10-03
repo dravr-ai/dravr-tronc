@@ -139,6 +139,13 @@ capabilities as flags, not the object it sent, and `with_http_session_limits(tot
 caps how many are held (10 000, and 1 000 per caller identity, by default). A caller at its limit
 gives up its least recently used idle session; a full server answers `initialize` with 503.
 
+`notifications/cancelled` reaches only the sender's own call: over stdio, the connection's; in a
+session, that session's; sessionless, the call of the same principal presenting the same bearer
+credential, so two clients of one user holding their own tokens are told apart. A sessionless
+caller the auth hook resolved no principal for — anonymous, or a shared API key — cannot be told
+from another, so its cancellation is ignored rather than allowed to reach a stranger's call; such
+a client cancels by holding a session.
+
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same
 cursors. A server given `with_protected_resource_metadata` has its RFC 9728 document served at

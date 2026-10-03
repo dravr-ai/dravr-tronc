@@ -75,14 +75,14 @@ where
     let caller = ToolContext::default();
     let session = Session::connection();
     let pending = Arc::new(PendingRequests::new());
+    let answers_from = CallerKey::connection(&caller);
     let connection = ClientConnection::new(
         Some(outbound.clone()),
         Arc::clone(&pending),
         Some(Arc::clone(&session)),
-        &caller,
+        answers_from.clone(),
         server.client_request_timeout(),
     );
-    let answers_from = CallerKey::new(&caller, None);
     let ctx = ToolContext {
         client: ClientChannel::connected(connection),
         ..caller
@@ -342,6 +342,43 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(text.contains("elicitation"), "{answer}");
+    }
+
+    /// The connection is one client: its own cancellation reaches its call,
+    /// which withdraws the request it was waiting on and is never answered.
+    #[tokio::test]
+    async fn a_cancellation_on_the_connection_reaches_its_call() {
+        let mut client = Client::connect();
+        client
+            .send(
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "elicitation": {} },
+                    "clientInfo": { "name": "t", "version": "1" }
+                }}),
+            )
+            .await;
+        client.next().await;
+        client
+            .send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": { "name": "chatty", "arguments": {} } }))
+            .await;
+        let ask = client.next().await;
+        assert_eq!(ask["method"], "elicitation/create");
+        client
+            .send(
+                json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                          "params": { "requestId": 2 } }),
+            )
+            .await;
+        let withdrawn = client.next().await;
+        assert_eq!(withdrawn["method"], "notifications/cancelled");
+        assert_eq!(withdrawn["params"]["requestId"], ask["id"]);
+
+        client
+            .send(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }))
+            .await;
+        assert_eq!(client.next().await["id"], 3, "nothing answers the call");
     }
 
     #[tokio::test]

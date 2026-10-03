@@ -483,18 +483,21 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// The connection a call over HTTP reaches its client through: messages
     /// go out on `outbound` (the call's event stream; none when the client
     /// accepts no event stream), answers come back through this server's
-    /// pending table, and `session` is the one the request runs in.
+    /// pending table, and `session` is the one the request runs in. The
+    /// caller is `ctx` presenting the bearer `credential`.
     pub(crate) fn http_client_connection(
         &self,
         outbound: Option<mpsc::UnboundedSender<JsonRpcMessage>>,
         session: Option<Arc<Session>>,
         ctx: &ToolContext,
+        credential: Option<&str>,
     ) -> ClientConnection {
+        let caller = CallerKey::http(ctx, session.as_ref().and_then(|s| s.id()), credential);
         ClientConnection::new(
             outbound,
             Arc::clone(&self.pending),
             session,
-            ctx,
+            caller,
             self.client_request_timeout,
         )
     }
@@ -504,18 +507,20 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self.client_request_timeout
     }
 
-    /// Hand a client's `response`, sent by the caller `ctx` in the session
-    /// `session_id` names, to the server request it answers. Returns whether
-    /// a call was waiting for it; an answer from any other caller, or to a
-    /// request no longer waiting, reaches nothing.
+    /// Hand a client's `response`, sent over HTTP by the caller `ctx`
+    /// presenting the bearer `credential` in the session `session_id` names,
+    /// to the server request it answers. Returns whether a call was waiting
+    /// for it; an answer from any other caller, or to a request no longer
+    /// waiting, reaches nothing.
     pub(crate) fn deliver_client_response(
         &self,
         ctx: &ToolContext,
         session_id: Option<&str>,
+        credential: Option<&str>,
         response: JsonRpcResponse,
     ) -> bool {
         self.pending
-            .deliver(&CallerKey::new(ctx, session_id), response)
+            .deliver(&CallerKey::http(ctx, session_id, credential), response)
     }
 
     /// The capabilities to advertise, with the tasks extension merged in when a

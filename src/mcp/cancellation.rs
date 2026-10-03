@@ -16,16 +16,22 @@
 //! token itself.
 //!
 //! JSON-RPC ids are chosen by the client and are unique only per client, so
-//! the key carries the caller identity the auth hook resolved and, over HTTP,
-//! the session the request was sent in: the same [`CallerKey`] a server
-//! request's answer is matched on. A notification reaches only the requests
-//! of its own session, so two clients counting their ids from 0 under one
-//! identity — two anonymous ones, or two sharing an API key — cannot cancel
-//! each other's calls once each holds a session. Sessionless callers the auth
-//! hook cannot tell apart share a key space, the same boundary [`TaskOwner`]
-//! draws for tasks.
+//! the key is the request id under the same [`CallerKey`] a server request's
+//! answer is matched on: the caller identity the auth hook resolved, and the
+//! channel the request came over.
 //!
-//! [`TaskOwner`]: crate::mcp::tasks::TaskOwner
+//! - Over stdio, the connection: every request on it is its one client's.
+//! - Over HTTP in a session, the session: a notification reaches only the
+//!   requests of its own session, so two clients counting their ids from 0
+//!   under one identity cannot cancel each other's calls.
+//! - Over HTTP without a session, the principal the hook resolved and a
+//!   fingerprint of the bearer credential presented, so two clients of one
+//!   user, each holding its own token, are told apart. When the hook
+//!   resolved no principal — anonymous clients, clients sharing one API
+//!   key — nothing the server holds tells one client from another, and the
+//!   notification is ignored rather than allowed to cancel a stranger's
+//!   call: such a client gets cancellation by holding a session.
+//! - Dispatched in-process, not through a transport: the identity alone.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,12 +55,18 @@ struct RequestKey {
 }
 
 impl RequestKey {
-    fn new(ctx: &ToolContext, request_id: &Value) -> Self {
-        let session = ctx.client.session().and_then(|session| session.id());
-        Self {
-            caller: CallerKey::new(ctx, session),
+    /// The key of `request_id` from the caller `ctx` names, or `None` when
+    /// that caller cannot be told from another (see the [module docs](self)).
+    fn new(ctx: &ToolContext, request_id: &Value) -> Option<Self> {
+        let caller = ctx
+            .client
+            .caller()
+            .cloned()
+            .unwrap_or_else(|| CallerKey::unconnected(ctx));
+        caller.tells_callers_apart().then(|| Self {
+            caller,
             request: request_id.to_string(),
-        }
+        })
     }
 }
 
@@ -77,7 +89,9 @@ impl InFlightRequests {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Register a request for the duration of the returned guard.
+    /// Register a request for the duration of the returned guard; one from a
+    /// caller that cannot be told apart is not registered, so no
+    /// notification reaches it.
     ///
     /// The request's token is a child of `ctx.cancellation`, so a transport
     /// that already cancels on its own signal (a dropped connection) still
@@ -86,10 +100,12 @@ impl InFlightRequests {
         let key = RequestKey::new(ctx, request_id);
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let token = ctx.cancellation.child_token();
-        self.entries()
-            .entry(key.clone())
-            .or_default()
-            .push((serial, token.clone()));
+        if let Some(key) = &key {
+            self.entries()
+                .entry(key.clone())
+                .or_default()
+                .push((serial, token.clone()));
+        }
         InFlightGuard {
             registry: self,
             key,
@@ -100,9 +116,12 @@ impl InFlightRequests {
 
     /// Cancel the caller's in-flight request with this id. Returns whether one
     /// was found; a request that already finished is not an error, since the
-    /// notification can always cross the response in flight.
+    /// notification can always cross the response in flight. A caller that
+    /// cannot be told apart finds none.
     pub(crate) fn cancel(&self, ctx: &ToolContext, request_id: &Value) -> bool {
-        let key = RequestKey::new(ctx, request_id);
+        let Some(key) = RequestKey::new(ctx, request_id) else {
+            return false;
+        };
         self.entries().get(&key).is_some_and(|entries| {
             for (_, token) in entries {
                 token.cancel();
@@ -128,7 +147,8 @@ impl InFlightRequests {
 #[derive(Debug)]
 pub(crate) struct InFlightGuard<'a> {
     registry: &'a InFlightRequests,
-    key: RequestKey,
+    /// `None` for a request that was not registered.
+    key: Option<RequestKey>,
     serial: u64,
     token: CancellationToken,
 }
@@ -142,7 +162,9 @@ impl InFlightGuard<'_> {
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.registry.release(&self.key, self.serial);
+        if let Some(key) = &self.key {
+            self.registry.release(key, self.serial);
+        }
     }
 }
 
