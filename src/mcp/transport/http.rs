@@ -1070,6 +1070,16 @@ impl MediaRange<'_> {
             _ => false,
         }
     }
+
+    /// How narrowly this range names a type: `*/*` is 0, `type/*` is 1 and
+    /// an exact `type/subtype` is 2.
+    fn specificity(&self) -> u8 {
+        match self.media.split_once('/') {
+            Some(("*", "*")) => 0,
+            Some((_, "*")) => 1,
+            _ => 2,
+        }
+    }
 }
 
 /// The media ranges of the request's `Accept` header (RFC 9110 §12.5.1). A
@@ -1103,14 +1113,24 @@ fn accept_ranges(headers: &HeaderMap) -> Vec<MediaRange<'_>> {
         .collect()
 }
 
-/// The weight the client gives `media`: the highest `q` among the ranges
-/// covering it, or 0 when none does.
+/// The weight the client gives `media`, or 0 when no range covers it. The
+/// most specific covering range sets it (RFC 9110 §12.5.1): an exact
+/// `type/subtype` overrides `type/*`, which overrides `*/*`, so
+/// `*/*, text/event-stream;q=0` refuses the event stream. Equally specific
+/// ranges naming it twice give it the higher of their weights.
 fn accept_weight(ranges: &[MediaRange<'_>], media: &str) -> f32 {
     ranges
         .iter()
         .filter(|range| range.covers(media))
-        .map(|range| range.quality)
-        .fold(0.0, f32::max)
+        .fold(None, |best: Option<(u8, f32)>, range| {
+            let candidate = (range.specificity(), range.quality);
+            Some(match best {
+                Some(held) if held.0 > candidate.0 => held,
+                Some(held) if held.0 == candidate.0 => (held.0, held.1.max(candidate.1)),
+                _ => candidate,
+            })
+        })
+        .map_or(0.0, |(_, quality)| quality)
 }
 
 /// How a `POST /mcp` may be answered, as the client's `Accept` weighs the
@@ -1127,7 +1147,8 @@ struct Rendering {
 
 impl Rendering {
     /// Read the request's `Accept`; `None` when it admits neither rendering —
-    /// every range covering one weighted `q=0`, or none covering either.
+    /// each weighted `q=0` by the most specific range covering it, or not
+    /// covered at all.
     ///
     /// JSON wins a tie, so a client sending `*/*`, both types unweighted, or
     /// no `Accept` at all gets a single response as JSON, and still gets an
@@ -2153,6 +2174,78 @@ mod tests {
             })
         );
         assert_eq!(negotiate(Some("text/plain")), None);
+    }
+
+    /// The most specific range covering a type sets its weight (RFC 9110
+    /// §12.5.1), so a `q=0` on a type holds against a wildcard admitting it.
+    #[test]
+    fn the_most_specific_accept_range_weighs_a_type() {
+        let weights = |accept: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_str(accept).expect("a header value"), // Safe: test fixture
+            );
+            let ranges = accept_ranges(&headers);
+            (
+                accept_weight(&ranges, APPLICATION_JSON),
+                accept_weight(&ranges, TEXT_EVENT_STREAM),
+            )
+        };
+        for (accept, json, event_stream) in [
+            ("*/*;q=0.5, text/event-stream;q=0", 0.5, 0.0),
+            (
+                "text/event-stream, */*;q=0.1, application/json;q=0",
+                0.0,
+                1.0,
+            ),
+            ("application/json;q=0, */*", 0.0, 1.0),
+            ("text/*;q=0, */*", 1.0, 0.0),
+            ("text/*;q=0.2, */*;q=0.9", 0.9, 0.2),
+            ("text/event-stream;q=0.3, text/*, */*;q=0.1", 0.1, 0.3),
+            ("application/json;q=0.2, Application/JSON;q=0.7", 0.7, 0.0),
+        ] {
+            assert_eq!(weights(accept), (json, event_stream), "{accept:?}");
+        }
+    }
+
+    /// A client refusing the event stream behind a wildcard is answered as
+    /// JSON only, and one refusing JSON that way gets the event stream.
+    #[test]
+    fn a_refusal_behind_a_wildcard_holds_in_negotiation() {
+        let negotiate = |accept: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_str(accept).expect("a header value"), // Safe: test fixture
+            );
+            Rendering::negotiate(&headers)
+        };
+        assert_eq!(
+            negotiate("*/*;q=0.5, text/event-stream;q=0"),
+            Some(Rendering {
+                single_as_event: false,
+                may_stream: false,
+            })
+        );
+        assert_eq!(
+            negotiate("*/*, text/event-stream;q=0"),
+            Some(Rendering {
+                single_as_event: false,
+                may_stream: false,
+            })
+        );
+        assert_eq!(
+            negotiate("text/event-stream, */*;q=0.1, application/json;q=0"),
+            Some(Rendering {
+                single_as_event: true,
+                may_stream: true,
+            })
+        );
+        assert_eq!(
+            negotiate("*/*, text/event-stream;q=0, application/json;q=0"),
+            None
+        );
     }
 
     #[tokio::test]
