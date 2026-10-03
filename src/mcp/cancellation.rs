@@ -13,7 +13,9 @@
 //! [`ToolContext::cancellation`]. The notification fires that token: the
 //! engine stops waiting on the request and drops its future, and a tool doing
 //! work outside that future (a spawned job, a blocking section) watches the
-//! token itself.
+//! token itself. A request dropped before it is answered — its HTTP
+//! connection closed, its stdio input ended past the drain — fires the same
+//! token, so closing the connection cancels a call whatever its caller.
 //!
 //! JSON-RPC ids are chosen by the client and are unique only per client, so
 //! the key is the request id under the same [`CallerKey`] a server request's
@@ -30,7 +32,12 @@
 //!   resolved no principal — anonymous clients, clients sharing one API
 //!   key — nothing the server holds tells one client from another, and the
 //!   notification is ignored rather than allowed to cancel a stranger's
-//!   call: such a client gets cancellation by holding a session.
+//!   call. Such a client cancels by closing the call's connection. An
+//!   `initialize`-era client can instead hold a session, on a server with
+//!   [`McpServer::with_http_sessions`](crate::mcp::server::McpServer::with_http_sessions);
+//!   the 2026-07-28 revision has no sessions, so for it only an auth hook
+//!   resolving a principal per client (each with its own credential) makes
+//!   the notification reach its call.
 //! - Dispatched in-process, not through a transport: the identity alone.
 
 use std::collections::HashMap;

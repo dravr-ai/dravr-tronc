@@ -143,8 +143,12 @@ gives up its least recently used idle session; a full server answers `initialize
 session, that session's; sessionless, the call of the same principal presenting the same bearer
 credential, so two clients of one user holding their own tokens are told apart. A sessionless
 caller the auth hook resolved no principal for — anonymous, or a shared API key — cannot be told
-from another, so its cancellation is ignored rather than allowed to reach a stranger's call; such
-a client cancels by holding a session.
+from another, so its cancellation is ignored rather than allowed to reach a stranger's call. Any
+client cancels a call by closing its connection: a request dropped unanswered fires the token in
+`ToolContext::cancellation`, so work a tool runs outside the call stops too. For the notification
+itself, an `initialize`-era client can hold a session (`with_http_sessions`); a 2026-07-28 client,
+which never has one, needs an auth hook resolving a principal per client, each with its own
+credential.
 
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same

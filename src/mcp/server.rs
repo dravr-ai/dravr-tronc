@@ -721,7 +721,14 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         }
         let in_flight = self.in_flight.register(ctx, &request_id);
         let ctx = ctx.clone().with_cancellation(in_flight.token().clone());
-        tokio::select! {
+        // A dispatch dropped before it answers — its HTTP connection closed,
+        // the host gave up on it — fires the request's token, so work the
+        // tool runs outside this future stops as the future does. Closing
+        // the connection is how a caller no notification can reach (see
+        // `mcp::cancellation`) cancels; an answered request leaves its token
+        // alone for whatever the tool handed it to.
+        let unanswered = in_flight.token().clone().drop_guard();
+        let response = tokio::select! {
             biased;
             // The client will not read a cancelled request's response, so the
             // server sends none, and dropping the dispatch future ends the
@@ -731,7 +738,9 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
                 None
             }
             response = self.route(request, &ctx) => Some(response),
-        }
+        };
+        unanswered.disarm();
+        response
     }
 
     /// Era detection — see `mcp::modern` + the dual-era spec.

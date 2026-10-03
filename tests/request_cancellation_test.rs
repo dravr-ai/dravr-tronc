@@ -315,3 +315,54 @@ async fn one_user_s_two_clients_cancel_only_their_own_calls() {
     assert!(clients.cancel_from(&clients.first).await);
     clients.finish().await;
 }
+
+/// The cancellation a client the server cannot tell apart still has: closing
+/// its connection. Dropping the HTTP exchange drops the call and fires its
+/// token, so work the tool runs outside the call's future stops too — for an
+/// anonymous client of either era, which no notification can reach.
+#[tokio::test]
+async fn closing_the_connection_cancels_an_anonymous_call() {
+    for modern in [false, true] {
+        let (server, mut tokens, _release) = server();
+        let client = McpTestClient::in_process(server);
+        let client = if modern { client.modern() } else { client };
+        let call = tokio::spawn(async move { client.call_tool("wait", json!({})).await });
+        let token = timeout(Duration::from_secs(1), tokens.recv())
+            .await
+            .expect("the tool starts")
+            .expect("a token");
+        assert!(!token.is_cancelled(), "modern: {modern}");
+
+        call.abort();
+        timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .unwrap_or_else(|_| panic!("the dropped call's token fires (modern: {modern})"));
+    }
+}
+
+/// A call answered normally leaves its token alone, so a job the tool
+/// handed it to is not stopped by the answer going out.
+#[tokio::test]
+async fn an_answered_call_does_not_fire_its_token() {
+    let (server, mut tokens, release) = server();
+    let ctx = ToolContext::new();
+    let call = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            server
+                .handle_request_with_context(call(&json!(1)), &ctx)
+                .await
+        })
+    };
+    let token = timeout(Duration::from_secs(1), tokens.recv())
+        .await
+        .expect("the tool starts")
+        .expect("a token");
+    release.notify_one();
+    let response = timeout(Duration::from_secs(1), call)
+        .await
+        .expect("the call ends")
+        .expect("joined");
+    assert!(response.is_some());
+    assert!(!token.is_cancelled());
+}

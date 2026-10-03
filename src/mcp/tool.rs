@@ -187,7 +187,8 @@ pub struct ToolContext {
     /// host's, and tronc has no business naming an athlete's scopes.
     pub scopes: Vec<String>,
     /// Fired when the client cancels this request with
-    /// `notifications/cancelled`.
+    /// `notifications/cancelled`, or when the request is dropped before it is
+    /// answered (its connection closed).
     ///
     /// The engine stops waiting on a cancelled request and drops its future,
     /// which ends a tool at its next `.await`; a tool doing work that outlives
