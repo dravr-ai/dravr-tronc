@@ -12,10 +12,18 @@ use std::process;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::middleware::{from_fn, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
 use dravr_tronc::error::{INVALID_PARAMS, UNAUTHORIZED};
 use dravr_tronc::mcp::auth::{AuthError, AuthHook};
 use dravr_tronc::mcp::protocol::JsonRpcRequest;
 use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::mcp::transport::http::mcp_router;
+use dravr_tronc::server::request_guard::guard_requests;
 use dravr_tronc::testkit::assert::{
     assert_rpc_error, assert_rpc_success, assert_structured_content, assert_tool_error,
     assert_tool_success, assert_tools_snapshot,
@@ -305,4 +313,42 @@ async fn a_missing_snapshot_fails_rather_than_passing() {
         &tools,
         env::temp_dir().join("tronc-snapshot-never-written.json"),
     );
+}
+
+/// A host's own gate over its whole application: no `x-host-key`, no entry.
+async fn require_host_key(request: Request, next: Next) -> Response {
+    if request
+        .headers()
+        .get("x-host-key")
+        .is_some_and(|key| key == "k")
+    {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+/// A client over the host's own router passes through its layers, as a
+/// client of the deployed service does, and speaks MCP through them.
+#[tokio::test]
+async fn a_client_over_the_host_router_passes_its_layers() {
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(mcp_router(server()))
+        .layer(from_fn(require_host_key))
+        .layer(from_fn(guard_requests));
+
+    let refused = McpTestClient::over_router(app.clone())
+        .with_bearer(KEY)
+        .raw(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .expect("an answer");
+    assert_eq!(refused.status, 401, "the host's gate runs first");
+
+    let client = McpTestClient::over_router(app)
+        .with_bearer(KEY)
+        .with_header("x-host-key", "k");
+    client.initialize().await.expect("initialize");
+    let tools = client.list_tools().await.expect("tools/list");
+    assert!(tools.iter().any(|tool| tool.name == "whoami"));
 }

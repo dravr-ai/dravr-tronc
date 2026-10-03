@@ -44,7 +44,7 @@ pub type ServerRequestHandler =
 /// Where a request goes.
 #[derive(Clone)]
 enum Transport {
-    /// Through the router `serve` binds, without a socket.
+    /// Through a router, by `oneshot`, without a socket.
     InProcess(Router),
     /// Over HTTP to an `/mcp` URL.
     Http { url: String, http: reqwest::Client },
@@ -53,7 +53,8 @@ enum Transport {
 /// An MCP client for tests.
 ///
 /// Every request it sends carries the bearer token, extra headers and `_meta`
-/// keys set on it. Build it with [`Self::in_process`] or [`Self::http`] (or
+/// keys set on it. Build it with [`Self::in_process`], [`Self::over_router`]
+/// or [`Self::http`] (or
 /// [`McpTestServer::client`](crate::testkit::McpTestServer::client)), then
 /// set what every request should carry with the `with_*` builders. A client
 /// is cheap to clone into a second one with different credentials.
@@ -99,7 +100,29 @@ impl McpTestClient {
     /// router [`serve`](crate::mcp::transport::http::serve) binds — origin
     /// check, auth hook, request guard and all — by `oneshot`, with no socket.
     pub fn in_process<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Self {
-        Self::over(Transport::InProcess(guarded_mcp_router(server)))
+        Self::over_router(guarded_mcp_router(server))
+    }
+
+    /// A client for the host's own `router`, in-process: each request is a
+    /// `POST /mcp` (or, for [`Self::end_session`], a `DELETE /mcp`) sent
+    /// through it by `oneshot`, with no socket.
+    ///
+    /// For a host that merges [`mcp_router`](crate::mcp::transport::http::mcp_router)
+    /// into an application of its own: the test then passes through whatever
+    /// that application layers over `/mcp` — its auth middleware, CORS, the
+    /// request guard — exactly as a client of the deployed service would.
+    /// [`Self::in_process`] is this over the router
+    /// [`serve`](crate::mcp::transport::http::serve) binds.
+    ///
+    /// ```rust,ignore
+    /// let app = Router::new()
+    ///     .merge(mcp_router(Arc::clone(&server)))
+    ///     .layer(from_fn(require_host_key))
+    ///     .layer(from_fn(guard_requests));
+    /// let client = McpTestClient::over_router(app).with_header("x-host-key", "k");
+    /// ```
+    pub fn over_router(router: Router) -> Self {
+        Self::over(Transport::InProcess(router))
     }
 
     /// A client for the `/mcp` endpoint at `url`.

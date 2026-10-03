@@ -8,7 +8,8 @@
 //! transport instead of a hand-rolled JSON-RPC helper.
 //!
 //! - [`McpTestClient`] speaks MCP to a server either in-process — each
-//!   request goes through the same axum router `serve` binds, by
+//!   request goes through the same axum router `serve` binds, or through the
+//!   host's own router with its layers ([`McpTestClient::over_router`]), by
 //!   `tower::ServiceExt::oneshot`, with no socket — or over HTTP to a URL. It
 //!   carries a bearer token, extra headers and `_meta` keys on every request,
 //!   speaks either protocol era, and offers `initialize`, `list_tools`,
