@@ -376,6 +376,7 @@ impl ToolResponse {
 
 /// Why a value could not become a result's `structuredContent`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StructuredContentError {
     /// The value's `Serialize` implementation failed.
     Render(serde_json::Error),
@@ -423,8 +424,14 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
 /// Every block carries optional [`Annotations`] and an optional `_meta`
 /// object, written only when set. The constructors build a bare block;
 /// [`Self::with_annotations`] adds the hints to any of them.
+///
+/// `#[non_exhaustive]`: the union grows with the specification (revision
+/// 2025-11-25 adds tool-use and tool-result blocks to sampling), so a match
+/// outside this crate keeps a wildcard arm, or reads a block through
+/// [`Self::as_text`] and [`Self::annotations`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum Content {
     /// Plain text (`"type": "text"`).
     #[serde(rename = "text")]
@@ -644,8 +651,12 @@ pub struct EmbeddedResource {
 ///
 /// Contents holding both are refused rather than read as one kind with the
 /// other field dropped, so a relayed block never loses its text or bytes.
+///
+/// `#[non_exhaustive]`, like [`Content`]: [`Self::uri`] and
+/// [`Self::mime_type`] read what every kind carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ResourceContents {
     /// Contents representable as text.
     Text(TextResourceContents),

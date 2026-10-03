@@ -16,6 +16,7 @@ use std::fmt;
 /// developer spends an afternoon on IAM bindings because their laptop has no
 /// metadata server.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IamError {
     /// The metadata server was unreachable or answered non-200.
     ///

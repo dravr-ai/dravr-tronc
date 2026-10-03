@@ -116,6 +116,7 @@ pub enum ArrayType {
 /// `enum`, `items`) before the plain ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum PrimitiveSchema {
     /// A single-select enum whose options carry titles (SEP-1330).
     TitledSingleSelect(TitledSingleSelectSchema),
@@ -164,6 +165,7 @@ pub struct StringSchema {
 
 /// The formats a [`StringSchema`] may require.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StringFormat {
     /// An e-mail address.
     #[serde(rename = "email")]

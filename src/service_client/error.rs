@@ -16,6 +16,7 @@ use crate::server::request_guard::REQUEST_ID_HEADER;
 
 /// Why a request that started was not finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Unfinished {
     /// A `504` whose `error.type` is the guard's
     /// [`REQUEST_TIMEOUT`](crate::server::request_guard::REQUEST_TIMEOUT): the
@@ -51,6 +52,7 @@ impl Unfinished {
 /// The [`Exchange`] is boxed so that a `Result` carrying this error stays
 /// small on the path where nothing failed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ServiceError {
     /// No identity token could be minted. Nothing was sent, so there is no
     /// request id.
@@ -231,6 +233,7 @@ impl StdError for ServiceError {
 
 /// Why a [`ServiceClient`](super::ServiceClient) could not be built.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The base URL does not parse, is not `http` or `https`, names no host,
     /// carries credentials, a query or a fragment, or is `http` for a service

@@ -38,7 +38,12 @@ use crate::mcp::tool::ToolContext;
 /// handle *in lieu of* the standard result, and MCP answers a call to a tool
 /// that does not exist with a protocol error rather than a result, so the
 /// dispatch path cannot be typed to [`ToolResponse`] alone.
+///
+/// `#[non_exhaustive]`: a host builds one of these variants and the engine
+/// reads it, so a way of answering a call that a later revision adds is a
+/// new variant, not a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CallToolOutcome {
     /// The tool ran to completion; return its result directly. A tool that
     /// ran and failed, or refused the caller, is still a result here: an

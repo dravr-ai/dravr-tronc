@@ -410,6 +410,7 @@ pub struct TaskOwner {
 
 /// Failure modes of a task operation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TaskError {
     /// No task with that id is visible to this owner. A task belonging to a
     /// different owner is reported as absent, never as forbidden, so the

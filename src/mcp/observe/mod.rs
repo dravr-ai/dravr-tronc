@@ -437,6 +437,7 @@ impl CapturedPayload {
 
 /// Why a payload was not captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OmissionReason {
     /// The host's redactor kept nothing.
     Redacted,

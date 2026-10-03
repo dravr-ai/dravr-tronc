@@ -150,6 +150,7 @@ pub struct ModernRequestMeta {
 /// Era detection keys off the presence of [`meta_keys::PROTOCOL_VERSION`]: a
 /// request without it is legacy (`initialize`-based); a request with it is
 /// modern and MUST also carry the other required fields.
+#[non_exhaustive]
 pub enum ModernMeta {
     /// No modern protocol version in `_meta` — handle as a legacy request.
     Legacy,

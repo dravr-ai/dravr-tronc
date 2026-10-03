@@ -92,6 +92,7 @@ pub struct SlackClient {
 
 /// Result of a Slack API call
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SlackResult {
     /// Message sent successfully
     Ok,
@@ -103,6 +104,7 @@ pub enum SlackResult {
 
 /// Error from Slack signature verification
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SignatureError {
     /// Missing required header
     MissingHeader(&'static str),

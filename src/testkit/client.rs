@@ -784,6 +784,7 @@ impl RawResponse {
 
 /// Why a test client call did not produce what it asked for.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TestClientError {
     /// The request could not be built (a header that is not valid HTTP,
     /// params that do not serialise).

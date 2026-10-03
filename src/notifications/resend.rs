@@ -96,6 +96,7 @@ impl<'a> Payload<'a> {
 
 /// Why a send failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResendError {
     /// The client was given an empty API key, which Resend can only refuse.
     MissingApiKey,

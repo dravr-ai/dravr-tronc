@@ -17,6 +17,7 @@ use std::io;
 
 /// How a request failed when no HTTP response came back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportFailure {
     /// The client's own timeout elapsed first.
     TimedOut,
