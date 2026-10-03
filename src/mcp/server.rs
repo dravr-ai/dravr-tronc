@@ -21,7 +21,7 @@ use crate::error::{
 use crate::mcp::auth::{AuthError, AuthHook};
 use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICATIONS_CANCELLED};
 use crate::mcp::client_channel::{
-    ClientConnection, PendingRequests, DEFAULT_CLIENT_REQUEST_TIMEOUT,
+    CallerKey, ClientConnection, PendingRequests, DEFAULT_CLIENT_REQUEST_TIMEOUT,
 };
 use crate::mcp::host::{CallToolOutcome, MethodHandler, ToolDispatcher};
 use crate::mcp::logging::{LogLevel, LOGGING_SET_LEVEL};
@@ -38,6 +38,7 @@ use crate::mcp::resource_metadata::ProtectedResourceMetadata;
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
 };
+use crate::mcp::session::{Session, SessionStore};
 use crate::mcp::tasks::{
     method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
     TaskManager, TaskOwner, TASKS_EXTENSION_ID,
@@ -61,6 +62,13 @@ fn default_supported_versions() -> Vec<String> {
 /// exhaust memory. It used to be axum's implicit 2 MB, which nothing in the
 /// crate stated, so a host could neither see nor change it.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// An idle time-to-live for [`McpServer::with_http_sessions`].
+///
+/// Long enough for a person to read an answer and type the next question
+/// without their client being told its session is gone; short enough that an
+/// abandoned client's state does not accumulate.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_mins(30);
 
 /// Source of the natural-language instructions a server advertises in
 /// `initialize` and `server/discover`.
@@ -114,8 +122,9 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     in_flight: InFlightRequests,
     observer: Option<Arc<dyn Observer>>,
     payload_capture: PayloadCapturePolicy,
-    /// Server requests sent over HTTP awaiting the client's answer.
+    /// Server requests sent over HTTP awaiting the client's answering `POST`.
     pending: Arc<PendingRequests>,
+    sessions: Option<Arc<SessionStore>>,
     client_request_timeout: Duration,
 }
 
@@ -152,6 +161,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             observer: None,
             payload_capture: PayloadCapturePolicy::disabled(),
             pending: Arc::new(PendingRequests::new()),
+            sessions: None,
             client_request_timeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
         }
     }
@@ -365,6 +375,33 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
+    /// Keep Streamable HTTP sessions (revision 2025-11-25): `initialize`
+    /// mints an `Mcp-Session-Id`, the client sends it back, and the session
+    /// carries what an `initialize`-era client declares once — its
+    /// capabilities, and the log level it sets with `logging/setLevel` — to
+    /// its later requests. A session idle for `ttl` ends
+    /// ([`DEFAULT_SESSION_TTL`] is a sensible one), and the client may end it
+    /// with `DELETE /mcp`.
+    ///
+    /// This is what lets a tool sample or elicit from an `initialize`-era
+    /// client over HTTP, and log to it at the level it asked for: without a
+    /// session the server cannot know the client declared either.
+    ///
+    /// Off by default. Sessions live in this process's memory, so a service
+    /// running several instances behind a load balancer turns them on only
+    /// with session affinity — a client whose request reaches an instance
+    /// that never minted its session is told the session is gone, and must
+    /// initialize again. A request without `Mcp-Session-Id` is still served,
+    /// sessionless, exactly as on a server without sessions, so a client that
+    /// never initializes keeps working; and revision 2026-07-28, which has no
+    /// sessions, is unaffected. stdio needs none of this: a connection is one
+    /// session.
+    #[must_use]
+    pub fn with_http_sessions(mut self, ttl: Duration) -> Self {
+        self.sessions = Some(Arc::new(SessionStore::new(ttl)));
+        self
+    }
+
     /// How long a call waits for its client to answer a server request
     /// (sampling, elicitation) before giving up with
     /// [`ClientRequestError::TimedOut`](crate::mcp::client_channel::ClientRequestError::TimedOut)
@@ -375,17 +412,25 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
         self
     }
 
+    /// The HTTP session store, when sessions are on.
+    pub(crate) fn sessions(&self) -> Option<&Arc<SessionStore>> {
+        self.sessions.as_ref()
+    }
+
     /// The connection a call over HTTP reaches its client through: messages
-    /// go out on `outbound`, the call's event stream.
+    /// go out on `outbound` (the call's event stream), answers come back
+    /// through this server's pending table, and `session` is the one the
+    /// request runs in.
     pub(crate) fn http_client_connection(
         &self,
         outbound: mpsc::UnboundedSender<JsonRpcMessage>,
+        session: Option<Arc<Session>>,
         ctx: &ToolContext,
     ) -> ClientConnection {
         ClientConnection::new(
             outbound,
             Arc::clone(&self.pending),
-            None,
+            session,
             ctx,
             self.client_request_timeout,
         )
@@ -394,6 +439,20 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// How long a call waits for its client's answer.
     pub(crate) const fn client_request_timeout(&self) -> Duration {
         self.client_request_timeout
+    }
+
+    /// Hand a client's `response`, sent by the caller `ctx` in the session
+    /// `session_id` names, to the server request it answers. Returns whether
+    /// a call was waiting for it; an answer from any other caller, or to a
+    /// request no longer waiting, reaches nothing.
+    pub(crate) fn deliver_client_response(
+        &self,
+        ctx: &ToolContext,
+        session_id: Option<&str>,
+        response: JsonRpcResponse,
+    ) -> bool {
+        self.pending
+            .deliver(&CallerKey::new(ctx, session_id), response)
     }
 
     /// The capabilities to advertise, with the tasks extension merged in when a
@@ -863,7 +922,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// Handle `logging/setLevel` — record the minimum level the client wants
     /// log messages at on its session.
     ///
-    /// A request with no session — one over HTTP, which keeps none — has
+    /// A request with no session — HTTP without
+    /// [`Self::with_http_sessions`], or a client that never initialized — has
     /// nowhere to keep the level, and is refused rather than told `{}` for a
     /// level no later call would honour.
     fn handle_set_level(
@@ -888,7 +948,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             return JsonRpcResponse::error(
                 id,
                 INVALID_REQUEST,
-                "logging/setLevel needs a session to keep the level in: initialize over stdio"
+                "logging/setLevel needs a session to keep the level in: initialize over stdio, \
+                 or over HTTP on a server that keeps sessions, and send its Mcp-Session-Id"
                     .to_owned(),
             );
         };

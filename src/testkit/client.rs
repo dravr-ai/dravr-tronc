@@ -1,5 +1,5 @@
-// ABOUTME: McpTestClient — MCP over the in-process router or HTTP, with bearer, headers and _meta
-// ABOUTME: Reads a streamed answer event by event; typed calls, a JSON-RPC request, and raw bodies
+// ABOUTME: McpTestClient — MCP over the in-process router or HTTP, with bearer, headers, _meta, session
+// ABOUTME: Reads a streamed answer event by event, answering the server's requests as a real client does
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -7,7 +7,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::Body;
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -17,11 +17,12 @@ use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use tower::ServiceExt;
 
+use crate::error::METHOD_NOT_FOUND;
 use crate::mcp::modern::{meta_keys, PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER};
 use crate::mcp::protocol::{JsonRpcError, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{Tool, ToolResponse};
 use crate::mcp::server::McpServer;
-use crate::mcp::transport::http::guarded_mcp_router;
+use crate::mcp::transport::http::{guarded_mcp_router, MCP_SESSION_ID_HEADER};
 use crate::mcp::transport::mirror::{
     encode_header_value, mirrored_name_field, MCP_METHOD_HEADER, MCP_NAME_HEADER,
 };
@@ -32,6 +33,11 @@ pub const TESTKIT_CLIENT_NAME: &str = "dravr-tronc-testkit";
 /// What a Streamable HTTP client accepts: both renderings, as the transport
 /// requires a client to declare.
 const ACCEPT_JSON_AND_SSE: &str = "application/json, text/event-stream";
+
+/// What answers a request the server sends the client mid-call: given its
+/// method and params, the result to send back, or the error.
+pub type ServerRequestHandler =
+    Arc<dyn Fn(&str, &Value) -> Result<Value, JsonRpcError> + Send + Sync>;
 
 /// Where a request goes.
 #[derive(Clone)]
@@ -50,9 +56,13 @@ enum Transport {
 /// set what every request should carry with the `with_*` builders. A client
 /// is cheap to clone into a second one with different credentials.
 ///
-/// A call the server answers with an event stream is read event by event,
-/// and the notifications it sends before its response are collected (see
-/// [`Self::exchange`]).
+/// A call the server answers with an event stream is read event by event:
+/// its notifications are collected (see [`Self::exchange`]), and a request
+/// the server sends mid-call is answered on the spot by the handler set with
+/// [`Self::on_server_request`] — or refused as method-not-found without one,
+/// as a client that cannot serve it would. The `Mcp-Session-Id` a server
+/// hands out at `initialize` is sent on every later request, by this client
+/// and every clone of it.
 #[derive(Clone)]
 pub struct McpTestClient {
     transport: Transport,
@@ -60,6 +70,9 @@ pub struct McpTestClient {
     headers: Vec<(String, String)>,
     meta: Map<String, Value>,
     next_id: Arc<AtomicI64>,
+    capabilities: Value,
+    session: Arc<Mutex<Option<String>>>,
+    on_server_request: Option<ServerRequestHandler>,
 }
 
 impl fmt::Debug for McpTestClient {
@@ -73,6 +86,8 @@ impl fmt::Debug for McpTestClient {
             .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
             .field("headers", &self.headers)
             .field("meta", &self.meta)
+            .field("capabilities", &self.capabilities)
+            .field("session", &self.session_id())
             .finish_non_exhaustive()
     }
 }
@@ -100,7 +115,56 @@ impl McpTestClient {
             headers: Vec::new(),
             meta: Map::new(),
             next_id: Arc::new(AtomicI64::new(1)),
+            capabilities: json!({}),
+            session: Arc::new(Mutex::new(None)),
+            on_server_request: None,
         }
+    }
+
+    /// Declare these client capabilities in [`Self::initialize`] — say
+    /// `{"sampling": {}, "elicitation": {}}` to let a tool ask the client.
+    /// Empty unless set.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Value) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Answer every request the server sends mid-call with `handler`, given
+    /// the request's method and params.
+    #[must_use]
+    pub fn on_server_request(
+        mut self,
+        handler: impl Fn(&str, &Value) -> Result<Value, JsonRpcError> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_server_request = Some(Arc::new(handler));
+        self
+    }
+
+    /// The `Mcp-Session-Id` the server handed out, if it has.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// End the session with `DELETE /mcp` and return the HTTP answer; the
+    /// client stops sending the id once the server accepts.
+    ///
+    /// # Errors
+    ///
+    /// A header that is not valid HTTP, or a transport failure.
+    pub async fn end_session(&self) -> Result<RawResponse, TestClientError> {
+        let reply = self
+            .send_with(Method::DELETE, String::new(), self.request_headers())
+            .await?;
+        let answer = reply.collect().await?;
+        if answer.status.is_success() {
+            *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+        Ok(answer)
     }
 
     /// Send `Authorization: Bearer <token>` on every request.
@@ -155,7 +219,7 @@ impl McpTestClient {
     pub async fn initialize(&self) -> Result<Value, TestClientError> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": self.capabilities,
             "clientInfo": { "name": TESTKIT_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
         });
         self.result("initialize", Some(params)).await
@@ -225,13 +289,14 @@ impl McpTestClient {
     }
 
     /// Send a JSON-RPC request for `method` and return everything the server
-    /// sent back: the messages that came before the response, and the
-    /// response itself.
+    /// sent back: the messages that came before the response — notifications,
+    /// and requests this client answered — and the response itself.
     ///
     /// # Errors
     ///
-    /// A transport failure, an answer that is not JSON-RPC, or a stream that
-    /// ended before the response.
+    /// A transport failure, an answer that is not JSON-RPC, a stream that
+    /// ended before the response, or a server request whose answer the server
+    /// refused.
     pub async fn exchange(
         &self,
         method: &str,
@@ -259,7 +324,8 @@ impl McpTestClient {
         self.read_stream(reply).await
     }
 
-    /// Read an event stream to its response.
+    /// Read an event stream to its response, answering each server request
+    /// on the way.
     async fn read_stream(&self, mut reply: Reply) -> Result<Exchange, TestClientError> {
         let mut buffer: Vec<u8> = Vec::new();
         let mut messages = Vec::new();
@@ -282,6 +348,9 @@ impl McpTestClient {
                     })?;
                     return Ok(Exchange { messages, response });
                 }
+                if message.get("id").is_some() {
+                    self.answer(&message).await?;
+                }
                 messages.push(message);
             }
             match reply.body.chunk().await? {
@@ -293,6 +362,41 @@ impl McpTestClient {
                     });
                 }
             }
+        }
+    }
+
+    /// Answer the server's `request` with this client's handler, as a POST.
+    async fn answer(&self, request: &Value) -> Result<(), TestClientError> {
+        let method = request["method"].as_str().unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let outcome = self.on_server_request.as_ref().map_or_else(
+            || {
+                Err(JsonRpcError::new(
+                    METHOD_NOT_FOUND,
+                    format!("Method not found: {method}"),
+                ))
+            },
+            |handler| handler(method, &params),
+        );
+        let mut answer = json!({ "jsonrpc": JSONRPC_VERSION, "id": request["id"] });
+        match outcome {
+            Ok(result) => answer["result"] = result,
+            Err(error) => {
+                answer["error"] = serde_json::to_value(error).map_err(TestClientError::Decode)?;
+            }
+        }
+        let accepted = self
+            .send_with(Method::POST, answer.to_string(), self.request_headers())
+            .await?
+            .collect()
+            .await?;
+        if accepted.status == StatusCode::ACCEPTED {
+            Ok(())
+        } else {
+            Err(TestClientError::NotJsonRpc {
+                status: accepted.status,
+                body: accepted.body,
+            })
         }
     }
 
@@ -342,21 +446,29 @@ impl McpTestClient {
     }
 
     /// Send `body` as `method` with exactly `headers`, and return the answer
-    /// as it starts to arrive.
+    /// as it starts to arrive. A session id the answer hands out is kept.
     async fn send_with(
         &self,
         method: Method,
         body: String,
         headers: Vec<(String, String)>,
     ) -> Result<Reply, TestClientError> {
-        match &self.transport {
+        let reply = match &self.transport {
             Transport::InProcess(router) => {
-                Self::in_process_reply(router.clone(), method, body, headers).await
+                Self::in_process_reply(router.clone(), method, body, headers).await?
             }
             Transport::Http { url, http } => {
-                Self::http_reply(http, url, method, body, headers).await
+                Self::http_reply(http, url, method, body, headers).await?
             }
+        };
+        if let Some(session) = reply
+            .headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(session.to_owned());
         }
+        Ok(reply)
     }
 
     /// The SEP-2243 mirrors a conforming client sends with `method`:
@@ -396,6 +508,9 @@ impl McpTestClient {
         ];
         if let Some(token) = &self.bearer {
             headers.push((AUTHORIZATION.as_str().to_owned(), format!("Bearer {token}")));
+        }
+        if let Some(session) = self.session_id() {
+            headers.push((MCP_SESSION_ID_HEADER.to_owned(), session));
         }
         headers.extend(self.headers.iter().cloned());
         headers
@@ -473,8 +588,9 @@ impl McpTestClient {
 /// What a JSON-RPC request got back.
 #[derive(Debug, Clone)]
 pub struct Exchange {
-    /// Every message the server sent before the response, in order. Empty
-    /// when the answer was not an event stream.
+    /// Every message the server sent before the response, in order:
+    /// notifications, and the requests this client answered. Empty when the
+    /// answer was not an event stream.
     pub messages: Vec<Value>,
     /// The response.
     pub response: JsonRpcResponse,

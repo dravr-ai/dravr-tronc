@@ -220,6 +220,28 @@ pub fn check_standard_headers(
     Ok(())
 }
 
+/// Check the headers of a client's JSON-RPC response sent back to the server.
+///
+/// A response has no method, name or arguments for a mirror to summarise, so
+/// it may carry none: a gateway routing on one would route on something the
+/// body does not say.
+///
+/// # Errors
+///
+/// The `HeaderMismatchError` message naming the first mirror present.
+pub fn check_response_headers(headers: &HeaderMap) -> Result<(), String> {
+    let mirror = headers.keys().map(HeaderName::as_str).find(|name| {
+        name.eq_ignore_ascii_case(MCP_METHOD_HEADER)
+            || name.eq_ignore_ascii_case(MCP_NAME_HEADER)
+            || is_param_header(name)
+    });
+    mirror.map_or(Ok(()), |name| {
+        Err(format!(
+            "Header mismatch: {name} mirrors a request, and a response has nothing for it to mirror"
+        ))
+    })
+}
+
 /// One argument a tool's input schema asks a caller to mirror into an
 /// `Mcp-Param-*` header.
 struct MirroredArgument<'s> {

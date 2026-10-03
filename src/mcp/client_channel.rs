@@ -17,9 +17,10 @@
 //! stdout like any other; over Streamable HTTP the call's `POST` is answered
 //! with an event stream that carries each message as an event and the
 //! response last. The client answers a server request with a JSON-RPC
-//! response — a line on stdin — and the transport routes it back here by the
-//! id the server minted, which is unguessable and keyed by the caller
-//! identity the request was sent to, so no other caller can answer it.
+//! response — a line on stdin, or a `POST` of its own — and the transport
+//! routes it back here by the id the server minted, which is unguessable and
+//! keyed by the caller identity (and session) the request was sent to, so no
+//! other caller can answer it.
 //!
 //! What a channel may send depends on the call:
 //!
@@ -179,8 +180,9 @@ struct PendingKey {
 
 /// The server requests awaiting an answer, by caller and id.
 ///
-/// A stdio connection holds its own and closes it when stdin does, failing
-/// every request still waiting.
+/// Over HTTP one table serves the whole server, since an answer arrives on a
+/// `POST` of its own; a stdio connection holds its own and closes it when
+/// stdin does, failing every request still waiting.
 #[derive(Debug)]
 pub(crate) struct PendingRequests {
     /// `None` once closed.
@@ -257,7 +259,7 @@ impl ClientConnection {
         ctx: &ToolContext,
         request_timeout: Duration,
     ) -> Self {
-        let caller = CallerKey::new(ctx, None);
+        let caller = CallerKey::new(ctx, session.as_ref().and_then(|s| s.id()));
         Self {
             outbound,
             pending,

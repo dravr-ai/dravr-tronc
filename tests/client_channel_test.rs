@@ -1,5 +1,5 @@
 // ABOUTME: Tests a running tool's channel to its client over Streamable HTTP, through the testkit
-// ABOUTME: Progress and logs stream as events before the response; requests need a session HTTP lacks
+// ABOUTME: Progress, logs, sampling and elicitation as streamed events; sessions mint, scope and end
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dravr_tronc::error::{INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND};
+use dravr_tronc::mcp::auth::{AuthError, AuthHook};
 use dravr_tronc::mcp::client_channel::ClientRequestError;
 use dravr_tronc::mcp::elicitation::{
     ElicitRequest, ElicitationSchema, PrimitiveSchema, StringSchema,
@@ -24,13 +25,16 @@ use dravr_tronc::mcp::elicitation::{
 use dravr_tronc::mcp::logging::LogLevel;
 use dravr_tronc::mcp::modern::meta_keys;
 use dravr_tronc::mcp::observe::{Observer, OperationInfo, OperationOutcome};
+use dravr_tronc::mcp::protocol::JsonRpcRequest;
 use dravr_tronc::mcp::schema::{
     CreateMessageRequest, LoggingCapability, ServerCapabilities, Tool, ToolResponse,
 };
-use dravr_tronc::mcp::server::McpServer;
+use dravr_tronc::mcp::server::{McpServer, DEFAULT_SESSION_TTL};
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
-use dravr_tronc::testkit::assert::{assert_rpc_error, assert_tool_error};
-use dravr_tronc::testkit::McpTestClient;
+use dravr_tronc::mcp::transport::http::MCP_SESSION_ID_HEADER;
+use dravr_tronc::protocol::JsonRpcError;
+use dravr_tronc::testkit::assert::{assert_rpc_error, assert_tool_error, assert_tool_success};
+use dravr_tronc::testkit::{McpTestClient, McpTestServer};
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::task::yield_now;
@@ -167,6 +171,12 @@ fn capabilities() -> ServerCapabilities {
     }
 }
 
+fn sessionful() -> McpServer<State> {
+    McpServer::new("channel-test", "0.1.0", registry(), Arc::new(State))
+        .with_capabilities(capabilities())
+        .with_http_sessions(DEFAULT_SESSION_TTL)
+}
+
 fn sessionless() -> McpServer<State> {
     McpServer::new("channel-test", "0.1.0", registry(), Arc::new(State))
         .with_capabilities(capabilities())
@@ -174,6 +184,26 @@ fn sessionless() -> McpServer<State> {
 
 fn call_params(name: &str, meta: &Value) -> Value {
     json!({ "name": name, "arguments": {}, "_meta": meta })
+}
+
+/// Answers sampling with a fixed message and elicitation with a fixed name.
+fn answering_client(server: McpServer<State>) -> McpTestClient {
+    McpTestClient::in_process(Arc::new(server))
+        .with_capabilities(json!({ "sampling": {}, "elicitation": {} }))
+        .on_server_request(|method, params| match method {
+            "sampling/createMessage" => {
+                assert_eq!(params["maxTokens"], 100);
+                Ok(
+                    json!({ "role": "assistant", "content": { "type": "text", "text": "hi" },
+                           "model": "test", "stopReason": "endTurn" }),
+                )
+            }
+            "elicitation/create" => {
+                assert_eq!(params["requestedSchema"]["required"], json!(["name"]));
+                Ok(json!({ "action": "accept", "content": { "name": "Ada" } }))
+            }
+            other => Err(JsonRpcError::new(METHOD_NOT_FOUND, other.to_owned())),
+        })
 }
 
 #[tokio::test]
@@ -210,8 +240,37 @@ async fn progress_streams_before_the_response_and_needs_a_token() {
 }
 
 #[tokio::test]
+async fn a_session_carries_the_log_level_to_later_calls() {
+    let client = answering_client(sessionful());
+    client.initialize().await.unwrap();
+    assert!(client.session_id().is_some(), "initialize minted a session");
+
+    let unasked = client
+        .exchange("tools/call", Some(call_params("logs", &json!({}))))
+        .await
+        .unwrap();
+    assert!(unasked.messages.is_empty(), "no level asked, no logs");
+
+    client
+        .result("logging/setLevel", Some(json!({ "level": "info" })))
+        .await
+        .unwrap();
+    let logged = client
+        .exchange("tools/call", Some(call_params("logs", &json!({}))))
+        .await
+        .unwrap();
+    let messages = logged.notifications("notifications/message");
+    let levels: Vec<&str> = messages
+        .iter()
+        .map(|m| m["params"]["level"].as_str().unwrap())
+        .collect();
+    assert_eq!(levels, vec!["info", "error"], "debug is below the level");
+    assert_eq!(messages[0]["params"]["logger"], "fixture");
+}
+
+#[tokio::test]
 async fn a_bad_level_is_invalid_params_and_a_sessionless_one_is_refused() {
-    let client = McpTestClient::in_process(Arc::new(sessionless()));
+    let client = answering_client(sessionful());
     client.initialize().await.unwrap();
     let bad = client
         .request("logging/setLevel", Some(json!({ "level": "loud" })))
@@ -219,7 +278,10 @@ async fn a_bad_level_is_invalid_params_and_a_sessionless_one_is_refused() {
         .unwrap();
     assert_rpc_error(&bad, INVALID_PARAMS);
 
-    let refused = client
+    let sessionless = McpTestClient::in_process(Arc::new(sessionless()));
+    sessionless.initialize().await.unwrap();
+    assert_eq!(sessionless.session_id(), None, "sessions are opt-in");
+    let refused = sessionless
         .request("logging/setLevel", Some(json!({ "level": "info" })))
         .await
         .unwrap();
@@ -228,7 +290,8 @@ async fn a_bad_level_is_invalid_params_and_a_sessionless_one_is_refused() {
 
 #[tokio::test]
 async fn set_level_is_unknown_on_a_server_without_logging() {
-    let server = McpServer::new("no-logging", "0.1.0", registry(), Arc::new(State));
+    let server = McpServer::new("no-logging", "0.1.0", registry(), Arc::new(State))
+        .with_http_sessions(DEFAULT_SESSION_TTL);
     let client = McpTestClient::in_process(Arc::new(server));
     client.initialize().await.unwrap();
     let unknown = client
@@ -239,20 +302,54 @@ async fn set_level_is_unknown_on_a_server_without_logging() {
 }
 
 #[tokio::test]
-async fn a_request_needs_a_session_holding_the_declared_capability() {
-    // HTTP keeps no session, so whatever initialize declared is not known
-    // to a later call.
-    let client = McpTestClient::in_process(Arc::new(sessionless()));
+async fn a_tool_samples_and_elicits_from_a_client_that_declared_both() {
+    let client = answering_client(sessionful());
     client.initialize().await.unwrap();
-    let refused = client.call_tool("sample", json!({})).await.unwrap();
+
+    let sampled = client
+        .exchange("tools/call", Some(call_params("sample", &json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(sampled.server_requests().len(), 1);
+    assert_eq!(
+        sampled.server_requests()[0]["method"],
+        "sampling/createMessage"
+    );
+    let result: ToolResponse = serde_json::from_value(sampled.response.result.unwrap()).unwrap();
+    assert_eq!(assert_tool_success(&result), "LLM: hi");
+
+    let asked = client.call_tool("ask", json!({})).await.unwrap();
+    assert_eq!(assert_tool_success(&asked), r#"Accept {"name":"Ada"}"#);
+}
+
+#[tokio::test]
+async fn a_request_needs_the_capability_declared_on_the_session() {
+    let undeclared = McpTestClient::in_process(Arc::new(sessionful()));
+    undeclared.initialize().await.unwrap();
+    let refused = undeclared.call_tool("sample", json!({})).await.unwrap();
     assert_tool_error(&refused, "sampling");
-    let refused = client.call_tool("ask", json!({})).await.unwrap();
+
+    // Declared at initialize, but on a server that keeps no session to
+    // remember it.
+    let forgotten = answering_client(sessionless());
+    forgotten.initialize().await.unwrap();
+    let refused = forgotten.call_tool("ask", json!({})).await.unwrap();
     assert_tool_error(&refused, "elicitation");
 }
 
 #[tokio::test]
+async fn a_client_error_reaches_the_tool() {
+    let client = McpTestClient::in_process(Arc::new(sessionful()))
+        .with_capabilities(json!({ "elicitation": {} }))
+        .on_server_request(|_, _| Err(JsonRpcError::new(-1, "no form today")));
+    client.initialize().await.unwrap();
+    let answer = client.call_tool("ask", json!({})).await.unwrap();
+    assert_tool_error(&answer, "client error -1");
+}
+
+#[tokio::test]
 async fn a_modern_call_logs_at_its_meta_level_and_never_sends_a_request() {
-    let client = McpTestClient::in_process(Arc::new(sessionless())).modern();
+    let client = McpTestClient::in_process(Arc::new(sessionful())).modern();
     let silent = client
         .exchange("tools/call", Some(call_params("logs", &json!({}))))
         .await
@@ -282,6 +379,87 @@ async fn a_modern_call_logs_at_its_meta_level_and_never_sends_a_request() {
     assert!(sampled.server_requests().is_empty());
     let result: ToolResponse = serde_json::from_value(sampled.response.result.unwrap()).unwrap();
     assert_tool_error(&result, "input-required");
+    assert_eq!(client.session_id(), None, "the modern era has no sessions");
+}
+
+#[tokio::test]
+async fn a_session_belongs_to_its_caller_and_ends_on_delete() {
+    let server = McpTestServer::start(Arc::new(
+        sessionful().with_auth_hook(Arc::new(BearerIsUser)),
+    ))
+    .await
+    .unwrap();
+    let alice = server.client().with_bearer("alice");
+    alice.initialize().await.unwrap();
+    let session = alice.session_id().unwrap();
+
+    // Bob presents Alice's session id: the server will not confirm it exists.
+    let bob = McpTestClient::http(server.url())
+        .with_bearer("bob")
+        .with_header(MCP_SESSION_ID_HEADER, session.clone());
+    let refused = bob
+        .raw(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(refused.status, 404);
+
+    let unknown = McpTestClient::http(server.url())
+        .with_bearer("alice")
+        .with_header(MCP_SESSION_ID_HEADER, "not-a-session");
+    let gone = unknown
+        .raw(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(gone.status, 404);
+    assert_eq!(gone.json().unwrap()["id"], 1);
+
+    let ended = alice.end_session().await.unwrap();
+    assert_eq!(ended.status, 204);
+    let after = McpTestClient::http(server.url())
+        .with_bearer("alice")
+        .with_header(MCP_SESSION_ID_HEADER, session);
+    let gone = after
+        .raw(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(gone.status, 404, "an ended session is gone");
+
+    // Requests without a session are still served.
+    let anonymous = server.client().with_bearer("alice");
+    assert!(anonymous.result("ping", None).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_server_without_sessions_mints_none_and_refuses_delete() {
+    let server = McpTestServer::start(Arc::new(sessionless())).await.unwrap();
+    let client = server.client();
+    client.initialize().await.unwrap();
+    assert_eq!(client.session_id(), None);
+    let delete = client
+        .with_header(MCP_SESSION_ID_HEADER, "whatever")
+        .end_session()
+        .await
+        .unwrap();
+    assert_eq!(delete.status, 405);
+}
+
+#[tokio::test]
+async fn a_response_post_carries_no_mirror_and_is_accepted() {
+    let client = McpTestClient::in_process(Arc::new(sessionless()));
+    let accepted = client
+        .raw(r#"{"jsonrpc":"2.0","id":"nobody-waits","result":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(accepted.status, 202, "{}", accepted.body);
+    assert!(accepted.body.is_empty());
+
+    let mirrored = client
+        .with_header("mcp-method", "tools/call")
+        .raw(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(mirrored.status, 400);
+    assert_eq!(mirrored.json().unwrap()["error"]["code"], -32_020);
 }
 
 #[tokio::test]
@@ -317,19 +495,104 @@ impl Observer for Completions {
 #[tokio::test]
 async fn a_streamed_call_is_observed_once() {
     let observer = Arc::new(Completions::default());
-    let server = sessionless().with_observer(observer.clone());
-    let client = McpTestClient::in_process(Arc::new(server));
+    let server = sessionful().with_observer(observer.clone());
+    let client = answering_client(server);
+    client.initialize().await.unwrap();
+    let before = observer.0.load(Ordering::SeqCst);
     let streamed = client
         .exchange(
             "tools/call",
-            Some(call_params("progress", &json!({ "progressToken": "o" }))),
+            Some(call_params("sample", &json!({ "progressToken": "o" }))),
         )
         .await
         .unwrap();
-    assert_eq!(streamed.notifications("notifications/progress").len(), 3);
+    assert_eq!(streamed.server_requests().len(), 1);
     assert_eq!(
-        observer.0.load(Ordering::SeqCst),
+        observer.0.load(Ordering::SeqCst) - before,
         1,
-        "a streamed call completes once"
+        "the call completes once; the client's answering POST is no operation"
+    );
+}
+
+/// Authenticates `Bearer <name>` as the user `<name>`.
+struct BearerIsUser;
+
+#[async_trait]
+impl AuthHook<State> for BearerIsUser {
+    async fn authenticate(
+        &self,
+        request: &JsonRpcRequest,
+        _state: &Arc<State>,
+    ) -> Result<ToolContext, AuthError> {
+        request.auth_token.as_deref().map_or_else(
+            || {
+                Err(AuthError::Unauthorized {
+                    www_authenticate: "Bearer".to_owned(),
+                })
+            },
+            |user| Ok(ToolContext::new().with_user(user)),
+        )
+    }
+}
+
+#[tokio::test]
+async fn an_answer_counts_only_from_the_caller_the_request_went_to() {
+    let server = McpTestServer::start(Arc::new(
+        sessionful().with_auth_hook(Arc::new(BearerIsUser)),
+    ))
+    .await
+    .unwrap();
+    let alice = server
+        .client()
+        .with_bearer("alice")
+        .with_capabilities(json!({ "elicitation": {} }));
+    alice.initialize().await.unwrap();
+    let session = alice.session_id().unwrap();
+
+    let http = reqwest::Client::new();
+    let post = |bearer: &str, session: Option<&str>, body: &Value| {
+        let mut request = http
+            .post(server.url())
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(body.to_string());
+        if let Some(session) = session {
+            request = request.header(MCP_SESSION_ID_HEADER, session);
+        }
+        request.send()
+    };
+
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": { "name": "ask", "arguments": {} } });
+    let mut stream = post("alice", Some(&session), &call).await.unwrap();
+    let mut text = String::new();
+    while !text.contains("\n\n") {
+        text.push_str(&String::from_utf8_lossy(
+            &stream.chunk().await.unwrap().unwrap(),
+        ));
+    }
+    let ask: Value =
+        serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+    assert_eq!(ask["method"], "elicitation/create");
+    let answer =
+        |action: &str| json!({ "jsonrpc": "2.0", "id": ask["id"], "result": { "action": action } });
+
+    // Bob cannot answer in Alice's session, and outside it reaches nothing.
+    let in_her_session = post("bob", Some(&session), &answer("accept"))
+        .await
+        .unwrap();
+    assert_eq!(in_her_session.status(), 404);
+    let outside = post("bob", None, &answer("accept")).await.unwrap();
+    assert_eq!(outside.status(), 202, "accepted, and routed to nothing");
+
+    let hers = post("alice", Some(&session), &answer("decline"))
+        .await
+        .unwrap();
+    assert_eq!(hers.status(), 202);
+    let rest = stream.text().await.unwrap();
+    assert!(
+        rest.contains("Decline"),
+        "Alice's answer is the one used: {rest}"
     );
 }

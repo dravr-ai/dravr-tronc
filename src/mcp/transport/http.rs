@@ -40,13 +40,20 @@ use crate::mcp::client_channel::ClientChannel;
 use crate::mcp::modern::{
     is_modern_revision, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_HEADER,
 };
-use crate::mcp::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION};
+use crate::mcp::protocol::{
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION,
+};
 use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTECTED_RESOURCE};
 use crate::mcp::server::McpServer;
+use crate::mcp::session::{Session, SessionStore, SessionUse};
 use crate::mcp::tool::ToolContext;
-use crate::mcp::transport::mirror::check_standard_headers;
+use crate::mcp::transport::mirror::{check_response_headers, check_standard_headers};
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
+
+/// `Mcp-Session-Id`: the session a request runs in, minted by `initialize` on
+/// a server with [`McpServer::with_http_sessions`] (revision 2025-11-25).
+pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// Build an Axum router with the `/mcp` POST endpoint
 ///
@@ -67,13 +74,17 @@ use crate::server::request_guard::guard_requests;
 /// When the server publishes [`ProtectedResourceMetadata`] (see
 /// [`McpServer::with_protected_resource_metadata`]), the router also answers
 /// `GET` with it at the document's well-known path, and at the bare
-/// `/.well-known/oauth-protected-resource` an MCP client falls back to.
+/// `/.well-known/oauth-protected-resource` an MCP client falls back to. When
+/// it keeps sessions ([`McpServer::with_http_sessions`]), `/mcp` also answers
+/// `DELETE`, which ends one.
 pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
     let body_limit = DefaultBodyLimit::max(server.max_request_bytes());
     let metadata = server.protected_resource_metadata().cloned();
-    let router = Router::new()
-        .route("/mcp", post(handle_mcp_post::<S>).layer(body_limit))
-        .with_state(server);
+    let mut endpoint = post(handle_mcp_post::<S>).layer(body_limit);
+    if server.sessions().is_some() {
+        endpoint = endpoint.delete(handle_mcp_delete::<S>);
+    }
+    let router = Router::new().route("/mcp", endpoint).with_state(server);
     match metadata {
         Some(metadata) => router.merge(resource_metadata_router(metadata)),
         None => router,
@@ -255,8 +266,10 @@ pub async fn shutdown_signal() {
 /// `Host` allowlist (403; see [`McpServer::with_allowed_hosts`]), refuses a body not declared
 /// `application/json` (415), a body over the size limit (413), and a client that does not accept both
 /// `application/json` and `text/event-stream` (406), refuses a body that is
-/// not a JSON-RPC Request (400), refuses an unsupported `MCP-Protocol-Version`
-/// (400, -32022) and a modern body sent without one (400, -32020), authenticates via the server's hook (401 +
+/// not a JSON-RPC message (400), refuses an unsupported `MCP-Protocol-Version`
+/// (400, -32022) and a modern body sent without one (400, -32020), resolves the
+/// request's `Mcp-Session-Id` on a server that keeps sessions (404 for one that
+/// is not live, or belongs to another caller), authenticates via the server's hook (401 +
 /// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
 /// spent budget; 500 when the host failed to decide), then dispatches under
 /// the resolved per-call context.
@@ -267,7 +280,12 @@ pub async fn shutdown_signal() {
 /// [`ClientChannel`]): then the
 /// answer is an event stream carrying each of those as an event, and the
 /// response last. An accepted notification is answered 202 Accepted with no
-/// body.
+/// body, and so is a client's response to a server request, which is routed
+/// to the call waiting for it when it comes from the caller (and session) the
+/// request was sent to.
+///
+/// On a server with [`McpServer::with_http_sessions`], a successful
+/// `initialize` is answered with a fresh `Mcp-Session-Id`.
 pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     State(server): State<Arc<McpServer<S>>>,
     uri: Uri,
@@ -316,12 +334,16 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         }
     };
 
-    // Parse the JSON-RPC envelope. A body that is not a Request — not JSON,
-    // a batch, a client's response, an id that is neither a string nor an
-    // integer — is one this server cannot accept, which Streamable HTTP
-    // answers with an HTTP error status, never a 2xx.
-    let request = match JsonRpcRequest::parse(&body) {
-        Ok(request) => request,
+    // Parse the JSON-RPC envelope. A body that is not a message — not JSON,
+    // a batch, an id that is neither a string nor an integer — is one this
+    // server cannot accept, which Streamable HTTP answers with an HTTP error
+    // status, never a 2xx. A client's response to a request the server sent
+    // it takes its own path.
+    let request = match JsonRpcMessage::parse(&body) {
+        Ok(JsonRpcMessage::Request(request)) => request,
+        Ok(JsonRpcMessage::Response(response)) => {
+            return accept_client_response(&server, &headers, response).await;
+        }
         Err(refusal) => return (StatusCode::BAD_REQUEST, Json(*refusal)).into_response(),
     };
     serve_request(server, &headers, request).await
@@ -426,22 +448,129 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
         return header_mismatch(request.id, &reason);
     }
 
-    // 5. Authenticate (RFC 9728 resource-server posture).
+    // 5. The session, on a server that keeps them: `initialize` starts a new
+    // one, any other request names its own. Revision 2026-07-28 has none.
+    let initialize = request.method == "initialize";
+    let sessions = server.sessions().filter(|_| !modern).cloned();
+    let session = match &sessions {
+        Some(_) if initialize => None,
+        Some(store) => match named_session(store, headers, request.id.as_ref()) {
+            Ok(session) => session,
+            Err(refusal) => return *refusal,
+        },
+        None => None,
+    };
+
+    // 6. Authenticate (RFC 9728 resource-server posture).
     let ctx = match server.authenticate(&request).await {
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
     };
+    if let Some(session) = &session {
+        if !session.is_owned_by(&ctx) {
+            return session_not_found(request.id);
+        }
+    }
+    let session = match (&sessions, initialize) {
+        (Some(_), true) => match Session::mint(&ctx) {
+            Ok(minted) => Some(minted),
+            Err(e) => {
+                error!(error = %e, "No OS randomness for a session id");
+                return transport_refusal(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    INTERNAL_ERROR,
+                    "Could not start a session",
+                );
+            }
+        },
+        _ => session,
+    };
 
-    // 6. Dispatch under the resolved context, connected to the client through
+    // 7. Dispatch under the resolved context, connected to the client through
     // the call's own answer.
+    let ctx = match &session {
+        Some(session) => ctx.with_cancellation(session.cancellation().clone()),
+        None => ctx,
+    };
     let (outbound, outbox) = mpsc::unbounded_channel();
-    let connection = server.http_client_connection(outbound, &ctx);
+    let connection = server.http_client_connection(outbound, session.clone(), &ctx);
     let ctx = ToolContext {
         client: ClientChannel::connected(connection),
         ..ctx
     };
+    let serving = session.as_ref().map(Session::enter);
     let prefers_sse = prefers_event_stream(headers);
-    answer_call(server, request, ctx, outbox, modern, prefers_sse).await
+
+    if initialize {
+        // A handshake runs no tool and sends nothing before its answer, which
+        // carries the new session's id when it succeeded.
+        let response = server.handle_request_with_context(request, &ctx).await;
+        drop(serving);
+        let minted = match (&sessions, session, &response) {
+            (Some(store), Some(session), Some(answer)) if answer.is_success() => {
+                let id = session.id().map(str::to_owned);
+                store.insert(session);
+                id
+            }
+            _ => None,
+        };
+        let mut rendered = render_response(response, modern, prefers_sse);
+        if let Some(id) = minted.and_then(|id| HeaderValue::from_str(&id).ok()) {
+            rendered.headers_mut().insert(MCP_SESSION_ID_HEADER, id);
+        }
+        return rendered;
+    }
+
+    answer_call(server, request, ctx, outbox, modern, prefers_sse, serving).await
+}
+
+/// The live session a request's `Mcp-Session-Id` names, `None` when it names
+/// none, or the refusal: 400 for a repeated or unreadable header, 404 for an
+/// id that is not live — which tells the client to initialize again.
+fn named_session(
+    store: &SessionStore,
+    headers: &HeaderMap,
+    id: Option<&Value>,
+) -> Result<Option<Arc<Session>>, Refusal> {
+    let mut values = headers.get_all(MCP_SESSION_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let session_id = match (value.to_str(), values.next()) {
+        (Ok(session_id), None) => session_id.trim(),
+        _ => {
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(JsonRpcResponse::error(
+                        id.cloned(),
+                        INVALID_REQUEST,
+                        "Mcp-Session-Id must be one visible-ASCII value",
+                    )),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    store
+        .find(session_id)
+        .map(Some)
+        .ok_or_else(|| Box::new(session_not_found(id.cloned())))
+}
+
+/// The 404 of a session id that is not live — expired, ended, never minted,
+/// or another caller's, which is reported the same way so the answer cannot
+/// confirm someone else's session exists.
+fn session_not_found(id: Option<Value>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(JsonRpcResponse::error(
+            id,
+            INVALID_REQUEST,
+            "Session not found: initialize a new session",
+        )),
+    )
+        .into_response()
 }
 
 /// A dispatched request's single answer: 202 with no body when there is none
@@ -479,8 +608,9 @@ type Dispatch = Pin<Box<dyn Future<Output = Option<JsonRpcResponse>> + Send>>;
 ///
 /// The choice is made by whichever comes first, the response or a message.
 /// Once streaming, the call is polled by the stream itself, so a client that
-/// goes away drops the call with it, exactly as hyper drops a handler whose
-/// connection closed.
+/// goes away drops the call — and any request it is waiting on — with it,
+/// exactly as hyper drops a handler whose connection closed. `serving` keeps
+/// the request counted in its session until the answer is over.
 async fn answer_call<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     request: JsonRpcRequest,
@@ -488,6 +618,7 @@ async fn answer_call<S: Send + Sync + ?Sized + 'static>(
     mut outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
     modern: bool,
     prefers_sse: bool,
+    serving: Option<SessionUse>,
 ) -> Response {
     let id = request.id.clone();
     let mut call: Dispatch =
@@ -498,12 +629,14 @@ async fn answer_call<S: Send + Sync + ?Sized + 'static>(
         response = &mut call => {
             let sent = drain(&mut outbox);
             if sent.is_empty() {
+                drop(serving);
                 return render_response(response, modern, prefers_sse);
             }
             let stream = CallStream {
                 phase: Phase::Draining(response),
                 sent: sent.into(),
                 outbox,
+                serving,
             };
             return Sse::new(stream.into_events()).into_response();
         }
@@ -527,6 +660,7 @@ async fn answer_call<S: Send + Sync + ?Sized + 'static>(
         phase: Phase::Running(call),
         sent: VecDeque::from([first]),
         outbox,
+        serving,
     };
     Sse::new(stream.into_events())
         .keep_alive(KeepAlive::default())
@@ -558,6 +692,8 @@ struct CallStream {
     /// Messages taken off the outbox, not yet sent.
     sent: VecDeque<JsonRpcMessage>,
     outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
+    /// Held until the stream ends, so the session counts the request busy.
+    serving: Option<SessionUse>,
 }
 
 impl CallStream {
@@ -586,6 +722,7 @@ impl CallStream {
                     }
                     let response = response.take();
                     self.phase = Phase::Done;
+                    self.serving = None;
                     return response.map(JsonRpcMessage::Response);
                 }
                 Phase::Done => return None,
@@ -599,6 +736,122 @@ impl CallStream {
             Some((Ok(sse_event(&message)), call))
         })
     }
+}
+
+/// Accept a client's response to a server request: 202 with no body once it
+/// is judged, routed to the call waiting for it when the caller and session
+/// match the ones the request was sent to.
+///
+/// It passes the gates a request does — protocol version, an `Mcp-Session-Id`
+/// that is live and the caller's own, authentication — and carries none of
+/// the SEP-2243 mirrors, which a response has nothing to fill. Whether a call
+/// was waiting does not change the answer, so a caller cannot probe for
+/// another's pending requests, and a late answer to one already given up on
+/// is not an error.
+async fn accept_client_response<S: Send + Sync + ?Sized + 'static>(
+    server: &McpServer<S>,
+    headers: &HeaderMap,
+    response: JsonRpcResponse,
+) -> Response {
+    let version = match accepted_protocol_version(server, headers, None) {
+        Ok(version) => version,
+        Err(refusal) => return *refusal,
+    };
+    if let Err(reason) = check_response_headers(headers) {
+        return header_mismatch(None, &reason);
+    }
+    let modern = version.is_some_and(is_modern_revision);
+    let session = match server.sessions().filter(|_| !modern) {
+        Some(store) => match named_session(store, headers, None) {
+            Ok(session) => session,
+            Err(refusal) => return *refusal,
+        },
+        None => None,
+    };
+    let message = transport_message(headers, response.id.clone(), version);
+    let ctx = match server.authenticate(&message).await {
+        Ok(ctx) => ctx,
+        Err(refusal) => return auth_refusal_response(refusal),
+    };
+    if let Some(session) = &session {
+        if !session.is_owned_by(&ctx) {
+            return session_not_found(None);
+        }
+    }
+    let delivered =
+        server.deliver_client_response(&ctx, session.as_ref().and_then(|s| s.id()), response);
+    debug!(delivered, "Client answered a server request");
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// End the session `Mcp-Session-Id` names: `DELETE /mcp`, routed only on a
+/// server with [`McpServer::with_http_sessions`].
+///
+/// Passes the `Origin` and `Host` gates and authentication as a `POST` does;
+/// answers 204 once the session is ended (its calls still running are
+/// cancelled), 400 without the header, and 404 for a session that is not
+/// live or not the caller's.
+pub async fn handle_mcp_delete<S: Send + Sync + ?Sized + 'static>(
+    State(server): State<Arc<McpServer<S>>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(refusal) = check_origin_and_host(&server, &headers, &uri) {
+        return *refusal;
+    }
+    let Some(store) = server.sessions() else {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    };
+    let session = match named_session(store, &headers, None) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return transport_refusal(
+                StatusCode::BAD_REQUEST,
+                INVALID_REQUEST,
+                "DELETE needs the Mcp-Session-Id of the session to end",
+            );
+        }
+        Err(refusal) => return *refusal,
+    };
+    let version = protocol_version_header(&headers).ok().flatten();
+    let ctx = match server
+        .authenticate(&transport_message(&headers, None, version))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(refusal) => return auth_refusal_response(refusal),
+    };
+    if !session.is_owned_by(&ctx) {
+        return session_not_found(None);
+    }
+    if let Some(id) = session.id() {
+        store.end(id);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// What the auth hook is handed for an HTTP message that is not a JSON-RPC
+/// request — a client's response, a `DELETE` ending a session: an empty
+/// `method`, the message's `id` if it has one, and the credential and headers
+/// the transport read, exactly as a request carries them.
+fn transport_message(
+    headers: &HeaderMap,
+    id: Option<Value>,
+    version: Option<&str>,
+) -> JsonRpcRequest {
+    let mut message = JsonRpcRequest {
+        jsonrpc: JSONRPC_VERSION.to_owned(),
+        method: String::new(),
+        params: None,
+        id,
+        auth_token: bearer_token(headers),
+        headers: forwarded_headers(headers),
+        metadata: HashMap::new(),
+    };
+    if let Some(version) = version {
+        message = message.with_metadata(PROTOCOL_VERSION_HEADER, version);
+    }
+    message
 }
 
 /// Render an [`AuthHook`](crate::mcp::auth::AuthHook) refusal as its status
@@ -1301,9 +1554,9 @@ mod tests {
     #[tokio::test]
     async fn json_that_is_not_a_request_is_refused_with_400_invalid_request() {
         for body in [
-            // A client's response: this transport never sends the client a
-            // request, so there is nothing for it to answer.
-            r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+            // A message with no method that is no response either.
+            r#"{"jsonrpc":"2.0","id":7}"#,
+            r#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":1,"message":"x"}}"#,
             // A batch: MCP carries none.
             r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
             // A null id: not a notification, and not answerable either.

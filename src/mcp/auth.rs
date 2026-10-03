@@ -104,6 +104,13 @@ pub enum AuthError {
 /// reject with an [`AuthError`]. A server configured with no hook authenticates
 /// every request as the default (anonymous) context, which suits stdio or a
 /// trusted-network deployment.
+///
+/// The hook also authenticates what reaches `/mcp` that is not a JSON-RPC
+/// request: a client's response to a request a tool sent it, and a `DELETE`
+/// ending a session. It is handed those with an empty `method` (and the
+/// response's `id`), carrying the credential and headers as a request does.
+/// The caller it resolves must be the one the request or session belongs to,
+/// so a hook authenticates them exactly as it would any request.
 #[async_trait]
 pub trait AuthHook<S: Send + Sync + ?Sized>: Send + Sync {
     /// Authenticate a request, yielding its per-call context or a rejection.
