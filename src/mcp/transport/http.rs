@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::{pending, Future};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use axum::{Json, Router};
 use futures::stream;
 use serde_json::Value;
 use tokio::net::{lookup_host, TcpListener};
+use tokio::signal;
 use tracing::{debug, error, info};
 
 use crate::error::{
@@ -93,6 +95,10 @@ pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServ
 /// its name to 127.0.0.1 reaches a loopback server with that name in `Host`,
 /// so this is what stops it where the `Origin` gate cannot.
 ///
+/// It shuts down gracefully on [`shutdown_signal`] (SIGINT, or SIGTERM on
+/// Unix): it stops accepting, lets every request in flight finish, then
+/// returns `Ok`. [`serve_with_shutdown`] takes the trigger from the caller.
+///
 /// # Errors
 ///
 /// An [`InsecureBindError`] for a reachable bind with no hook; otherwise a
@@ -102,6 +108,30 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     host: &str,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    serve_with_shutdown(server, host, port, shutdown_signal()).await
+}
+
+/// [`serve`], shutting down gracefully when `shutdown` resolves.
+///
+/// Once it does, no new connection is accepted, every request in flight is
+/// answered, and the call returns `Ok` once the last one is.
+///
+/// For a binary that owns its own shutdown sequence (draining a queue,
+/// flushing telemetry) and triggers the transport's part of it itself.
+///
+/// # Errors
+///
+/// As [`serve`].
+pub async fn serve_with_shutdown<S, F>(
+    server: Arc<McpServer<S>>,
+    host: &str,
+    port: u16,
+    shutdown: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    S: Send + Sync + ?Sized + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     let authenticated = server.has_auth_hook();
     let addr = format!("{host}:{port}");
     let resolved: Vec<SocketAddr> = lookup_host(&addr)
@@ -133,10 +163,48 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     );
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(|e| format!("HTTP server error: {e}"))?;
 
+    info!(address = %addr, "HTTP MCP transport stopped");
     Ok(())
+}
+
+/// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
+/// SIGTERM — what Cloud Run and Kubernetes send before they kill a container.
+///
+/// [`serve`] shuts down on it; a binary serving its own router passes it to
+/// `axum::serve(..).with_graceful_shutdown`. A signal whose handler cannot be
+/// installed is logged and never resolves, leaving the other to stop the
+/// process.
+pub async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(e) = signal::ctrl_c().await {
+            error!(error = %e, "Cannot listen for SIGINT; it will not stop the server gracefully");
+            pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "Cannot listen for SIGTERM; it will not stop the server gracefully");
+                pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = pending::<()>();
+
+    tokio::select! {
+        () = interrupt => info!("SIGINT received, shutting down"),
+        () = terminate => info!("SIGTERM received, shutting down"),
+    }
 }
 
 /// Handle an incoming MCP POST request
