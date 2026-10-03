@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitflags::bitflags;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::modern::{meta_keys, ModernClientInfo};
+use crate::mcp::schema::{ProgressToken, Tool, ToolResponse};
 use crate::mcp::tasks::{CancellationToken, TASKS_EXTENSION_ID};
 
 bitflags! {
@@ -44,6 +46,100 @@ bitflags! {
         /// or the reverse. Folded together, a grant for one is a grant for
         /// both, and the consent screen cannot say which was asked for.
         const PROFILE = 0b0100_0000;
+    }
+}
+
+/// `_meta` key of the progress token a client attaches to a request.
+const PROGRESS_TOKEN_KEY: &str = "progressToken";
+
+/// The `params._meta` object of the request being served, verbatim, with
+/// typed accessors for the keys the specification defines.
+///
+/// Kept as the object the client sent rather than parsed into fixed fields:
+/// `_meta` is open to any key under a reverse-DNS prefix, and a host reading
+/// its own extension key reads it here with [`Self::get_as`] instead of
+/// reaching back into the raw request. Empty when the request carried no
+/// `_meta`, or one that was not an object.
+///
+/// The capabilities a modern request declares are read from
+/// [`ToolContext::client_capabilities`], not from here: they count only on a
+/// request that is modern as a whole, a judgment the server makes once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestMeta {
+    entries: Map<String, Value>,
+}
+
+impl RequestMeta {
+    /// Wrap a `_meta` object.
+    #[must_use]
+    pub fn new(entries: Map<String, Value>) -> Self {
+        Self { entries }
+    }
+
+    /// Read `_meta` off a request's `params`.
+    #[must_use]
+    pub fn from_params(params: Option<&Value>) -> Self {
+        params
+            .and_then(|p| p.get("_meta"))
+            .and_then(Value::as_object)
+            .map_or_else(Self::default, |entries| Self::new(entries.clone()))
+    }
+
+    /// The token the client asked progress to be reported under, when it is
+    /// a string or an integer as the specification requires.
+    #[must_use]
+    pub fn progress_token(&self) -> Option<ProgressToken> {
+        self.get_as(PROGRESS_TOKEN_KEY).and_then(Result::ok)
+    }
+
+    /// The protocol revision a modern request declares
+    /// (`io.modelcontextprotocol/protocolVersion`).
+    #[must_use]
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.get(meta_keys::PROTOCOL_VERSION)
+            .and_then(Value::as_str)
+    }
+
+    /// The client identity a modern request carries
+    /// (`io.modelcontextprotocol/clientInfo`), when it is well-formed.
+    #[must_use]
+    pub fn client_info(&self) -> Option<ModernClientInfo> {
+        self.get_as(meta_keys::CLIENT_INFO).and_then(Result::ok)
+    }
+
+    /// The minimum log level a modern request asks for
+    /// (`io.modelcontextprotocol/logLevel`).
+    #[must_use]
+    pub fn log_level(&self) -> Option<&str> {
+        self.get(meta_keys::LOG_LEVEL).and_then(Value::as_str)
+    }
+
+    /// The value under `key`, verbatim.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.entries.get(key)
+    }
+
+    /// The value under `key`, read as `T`.
+    ///
+    /// `None` when the key is absent; `Some(Err(_))` when it is present but is
+    /// not a `T`, so a host can tell a client that omitted its extension key
+    /// from one that sent it malformed.
+    #[must_use]
+    pub fn get_as<T: DeserializeOwned>(&self, key: &str) -> Option<Result<T, serde_json::Error>> {
+        self.get(key).map(|value| T::deserialize(value))
+    }
+
+    /// The whole `_meta` object.
+    #[must_use]
+    pub const fn entries(&self) -> &Map<String, Value> {
+        &self.entries
+    }
+
+    /// Whether the request carried no `_meta` keys.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -104,6 +200,11 @@ pub struct ToolContext {
     /// The `requestState` an earlier input-required answer handed the client,
     /// echoed back on its retry. Client-held, so verify anything relied on.
     pub request_state: Option<String>,
+    /// The `_meta` of the request being served — its progress token, the
+    /// modern per-request keys, and any extension key the client sent.
+    ///
+    /// Set by the server on every request it dispatches, in both eras.
+    pub meta: RequestMeta,
 }
 
 impl ToolContext {
@@ -159,6 +260,13 @@ impl ToolContext {
     #[must_use]
     pub fn with_client_capabilities(mut self, capabilities: Value) -> Self {
         self.client_capabilities = Some(capabilities);
+        self
+    }
+
+    /// Record the `_meta` of the request being served.
+    #[must_use]
+    pub fn with_meta(mut self, meta: RequestMeta) -> Self {
+        self.meta = meta;
         self
     }
 

@@ -843,12 +843,45 @@ pub struct ProgressNotification {
     pub params: ProgressParams,
 }
 
+/// The token a client puts in a request's `_meta.progressToken` to ask for
+/// progress on it, echoed back in every `notifications/progress` about it.
+///
+/// The specification types it `string | number` and requires it unique across
+/// the client's active requests; a server only ever echoes the value it was
+/// given, so it keeps the variant it arrived as.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgressToken {
+    /// A string token.
+    String(String),
+    /// An integer token.
+    Integer(i64),
+}
+
+impl From<String> for ProgressToken {
+    fn from(token: String) -> Self {
+        Self::String(token)
+    }
+}
+
+impl From<&str> for ProgressToken {
+    fn from(token: &str) -> Self {
+        Self::String(token.to_owned())
+    }
+}
+
+impl From<i64> for ProgressToken {
+    fn from(token: i64) -> Self {
+        Self::Integer(token)
+    }
+}
+
 /// Parameters for a progress notification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressParams {
     /// Token identifying the operation being tracked.
     #[serde(rename = "progressToken")]
-    pub progress_token: String,
+    pub progress_token: ProgressToken,
     /// Current progress value.
     pub progress: f64,
     /// Total the progress counts toward, when known. Omitted when unknown:
@@ -864,7 +897,7 @@ impl ProgressNotification {
     /// Create a progress notification.
     #[must_use]
     pub fn new(
-        progress_token: String,
+        progress_token: impl Into<ProgressToken>,
         progress: f64,
         total: Option<f64>,
         message: Option<String>,
@@ -873,7 +906,7 @@ impl ProgressNotification {
             jsonrpc: JSONRPC_VERSION.to_owned(),
             method: METHOD_PROGRESS.to_owned(),
             params: ProgressParams {
-                progress_token,
+                progress_token: progress_token.into(),
                 progress,
                 total,
                 message,

@@ -30,7 +30,7 @@ use crate::mcp::tasks::{
     method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
     TaskManager, TaskOwner, TASKS_EXTENSION_ID,
 };
-use crate::mcp::tool::{ToolContext, ToolRegistry};
+use crate::mcp::tool::{RequestMeta, ToolContext, ToolRegistry};
 
 /// The protocol revisions a default [`McpServer`] advertises, in preference
 /// order: the modern stateless era first, then the current legacy revision.
@@ -421,12 +421,17 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Era detection — see `mcp::modern` + the dual-era spec.
     async fn dispatch(&self, request: JsonRpcRequest, ctx: &ToolContext) -> JsonRpcResponse {
+        // Every handler reads this request's `_meta` off the context, typed,
+        // rather than reaching back into the raw params.
+        let ctx = ctx
+            .clone()
+            .with_meta(RequestMeta::from_params(request.params.as_ref()));
         match ModernRequestMeta::from_params(request.params.as_ref()) {
             ModernMeta::Malformed(reason) => {
                 JsonRpcResponse::error(request.id, INVALID_PARAMS, reason)
             }
-            ModernMeta::Modern(meta) => self.process_modern(request, *meta, ctx).await,
-            ModernMeta::Legacy => self.process_legacy(request, ctx).await,
+            ModernMeta::Modern(meta) => self.process_modern(request, *meta, &ctx).await,
+            ModernMeta::Legacy => self.process_legacy(request, &ctx).await,
         }
     }
 
