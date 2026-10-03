@@ -439,6 +439,7 @@ dependencies = [
  "serial_test",
  "subtle",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-opentelemetry",

@@ -73,6 +73,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "signal", "time"] }
+# CancellationToken: the signal a task's operation and an in-flight request watch.
+tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }

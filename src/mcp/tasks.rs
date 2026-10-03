@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
@@ -34,6 +34,10 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::RwLock;
+
+/// The token a [`TaskRun`] carries, re-exported so a host names it without a
+/// direct `tokio-util` dependency.
+pub use tokio_util::sync::CancellationToken;
 
 /// Reverse-DNS identifier for the tasks extension, used both in a client's
 /// declared capabilities and in the server's `server/discover` advertisement.
@@ -440,6 +444,14 @@ impl Display for TaskError {
 
 impl StdError for TaskError {}
 
+/// The state change a [`TaskStore::update`] applies to the stored task.
+///
+/// Called with the current state while the store holds whatever lock or
+/// transaction makes the read-then-write atomic; returning an error leaves the
+/// task untouched.
+pub type TaskUpdate<'a> =
+    &'a (dyn Fn(&DetailedTask) -> Result<DetailedTask, TaskError> + Send + Sync);
+
 /// Persistence seam for tasks.
 ///
 /// The engine ships [`InMemoryTaskStore`]; a host that needs tasks to survive a
@@ -453,11 +465,24 @@ pub trait TaskStore: Send + Sync {
     /// Fetch a task visible to `owner`, or `None` when absent or expired.
     async fn get(&self, owner: &TaskOwner, id: &TaskId) -> Result<Option<DetailedTask>, TaskError>;
 
-    /// Overwrite a task's state.
-    async fn put(&self, owner: &TaskOwner, task: DetailedTask) -> Result<(), TaskError>;
+    /// Atomically read a task visible to `owner`, pass it to `apply`, and store
+    /// what `apply` returns.
+    ///
+    /// The read and the write MUST be one atomic step (a lock, a transaction,
+    /// a compare-and-set): the manager's rule that no transition leaves a
+    /// terminal state is decided inside `apply`, and two writers that both read
+    /// `working` before either wrote would otherwise let a late `complete`
+    /// overwrite a `cancelled`. Returns [`TaskError::NotFound`] when the task
+    /// is absent, expired, or owned by someone else.
+    async fn update(
+        &self,
+        owner: &TaskOwner,
+        id: &TaskId,
+        apply: TaskUpdate<'_>,
+    ) -> Result<DetailedTask, TaskError>;
 
-    /// Drop tasks whose TTL has elapsed, returning how many were removed.
-    async fn sweep_expired(&self) -> Result<usize, TaskError>;
+    /// Drop tasks whose TTL has elapsed, returning the ids removed.
+    async fn sweep_expired(&self) -> Result<Vec<TaskId>, TaskError>;
 }
 
 /// Process-local [`TaskStore`]. Tasks vanish on restart, which is the right
@@ -504,17 +529,33 @@ impl TaskStore for InMemoryTaskStore {
             .map(|(_, task)| task.clone()))
     }
 
-    async fn put(&self, owner: &TaskOwner, task: DetailedTask) -> Result<(), TaskError> {
+    async fn update(
+        &self,
+        owner: &TaskOwner,
+        id: &TaskId,
+        apply: TaskUpdate<'_>,
+    ) -> Result<DetailedTask, TaskError> {
         let mut entries = self.entries.write().await;
-        entries.insert(task.task.task_id.clone(), (owner.clone(), task));
-        Ok(())
+        let (_, stored) = entries
+            .get_mut(id)
+            .filter(|(task_owner, task)| task_owner == owner && !is_expired(&task.task))
+            .ok_or_else(|| TaskError::NotFound(id.clone()))?;
+        let updated = apply(stored)?;
+        stored.clone_from(&updated);
+        Ok(updated)
     }
 
-    async fn sweep_expired(&self) -> Result<usize, TaskError> {
+    async fn sweep_expired(&self) -> Result<Vec<TaskId>, TaskError> {
         let mut entries = self.entries.write().await;
-        let before = entries.len();
-        entries.retain(|_, (_, task)| !is_expired(&task.task));
-        Ok(before - entries.len())
+        let mut removed = Vec::new();
+        entries.retain(|id, (_, task)| {
+            let expired = is_expired(&task.task);
+            if expired {
+                removed.push(id.clone());
+            }
+            !expired
+        });
+        Ok(removed)
     }
 }
 
@@ -536,15 +577,25 @@ impl Default for TaskOptions {
     }
 }
 
+/// What the manager holds for a task whose operation is running in this
+/// process: the signal [`TaskManager::cancel`] fires.
+#[derive(Debug)]
+struct LiveRun {
+    cancel: CancellationToken,
+}
+
 /// Owns the task store and applies the lifecycle rules on top of it.
 ///
-/// The manager does not execute work; a host spawns its own operation and
-/// reports progress through [`TaskManager::complete`], [`TaskManager::fail`],
-/// or [`TaskManager::request_input`]. Keeping execution out of the engine is
-/// what lets a host use its own runtime, database and cancellation model.
+/// The manager does not execute work: [`TaskManager::create`] hands the host a
+/// [`TaskRun`], the host spawns its own operation around it, and the operation
+/// settles the task through the run. Keeping execution out of the engine is
+/// what lets a host use its own runtime and database; the run is how the
+/// engine still reaches that operation — `tasks/cancel` fires its
+/// [`TaskRun::cancellation`] token.
 pub struct TaskManager {
     store: Arc<dyn TaskStore>,
     options: TaskOptions,
+    runs: Mutex<HashMap<TaskId, LiveRun>>,
 }
 
 impl Debug for TaskManager {
@@ -559,16 +610,17 @@ impl TaskManager {
     /// Build a manager over the given store, with default retention.
     #[must_use]
     pub fn new(store: Arc<dyn TaskStore>) -> Self {
-        Self {
-            store,
-            options: TaskOptions::default(),
-        }
+        Self::with_options(store, TaskOptions::default())
     }
 
     /// Build a manager with explicit retention and pacing.
     #[must_use]
     pub fn with_options(store: Arc<dyn TaskStore>, options: TaskOptions) -> Self {
-        Self { store, options }
+        Self {
+            store,
+            options,
+            runs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The retention and pacing this manager applies.
@@ -583,11 +635,21 @@ impl TaskManager {
         &self.store
     }
 
-    /// Create a working task owned by `owner` and return its seed state.
+    /// The live-run table, recovered from a poisoned lock: every critical
+    /// section is a single map insert, remove or lookup, so a panic elsewhere
+    /// cannot leave it half-written.
+    fn runs(&self) -> MutexGuard<'_, HashMap<TaskId, LiveRun>> {
+        self.runs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Create a working task owned by `owner` and return the run that drives
+    /// it.
     ///
     /// The engine mints the id with [`TaskId::generate`]; a host that keys its
-    /// own records on it reads it back from the returned task.
-    pub async fn create(&self, owner: &TaskOwner) -> Result<Task, TaskError> {
+    /// own records on it reads it back from [`TaskRun::task`]. Answer the call
+    /// with that seed task, then move the run into the operation that does the
+    /// work: it carries the cancellation token and settles the task.
+    pub async fn create(self: &Arc<Self>, owner: &TaskOwner) -> Result<TaskRun, TaskError> {
         let task = Task::new(
             TaskId::generate()?,
             self.options.ttl_ms,
@@ -595,7 +657,19 @@ impl TaskManager {
         );
         let detailed = DetailedTask::new(task.clone(), TaskPayload::Working);
         self.store.create(owner, detailed).await?;
-        Ok(task)
+        let cancel = CancellationToken::new();
+        self.runs().insert(
+            task.task_id.clone(),
+            LiveRun {
+                cancel: cancel.clone(),
+            },
+        );
+        Ok(TaskRun {
+            manager: Arc::clone(self),
+            owner: owner.clone(),
+            task,
+            cancel,
+        })
     }
 
     /// Fetch a task visible to `owner`.
@@ -608,24 +682,28 @@ impl TaskManager {
 
     /// Move a task to a new payload, refusing any transition out of a terminal
     /// state. Returns the updated task.
+    ///
+    /// The check and the write are one atomic store update, so a terminal
+    /// state is final even against a concurrent writer.
     pub async fn transition(
         &self,
         owner: &TaskOwner,
         id: &TaskId,
         payload: TaskPayload,
     ) -> Result<DetailedTask, TaskError> {
-        let current = self.get(owner, id).await?;
-        if current.status().is_terminal() {
-            return Err(TaskError::InvalidState {
-                task_id: id.clone(),
-                status: current.status(),
-            });
-        }
-        let mut task = current.task;
-        task.last_updated_at = current_timestamp();
-        let updated = DetailedTask::new(task, payload);
-        self.store.put(owner, updated.clone()).await?;
-        Ok(updated)
+        self.store
+            .update(owner, id, &|current| {
+                if current.status().is_terminal() {
+                    return Err(TaskError::InvalidState {
+                        task_id: id.clone(),
+                        status: current.status(),
+                    });
+                }
+                let mut task = current.task.clone();
+                task.last_updated_at = current_timestamp();
+                Ok(DetailedTask::new(task, payload.clone()))
+            })
+            .await
     }
 
     /// Complete a task with the original request's result shape.
@@ -683,14 +761,118 @@ impl TaskManager {
         self.transition(owner, id, TaskPayload::Working).await
     }
 
-    /// Cancel a task. Cancellation is cooperative and eventually consistent:
-    /// this records the request, and the host's own operation observes it.
+    /// Cancel a task: record `cancelled`, then fire the cancellation token of
+    /// the operation running it in this process.
+    ///
+    /// The state is written first, so once the token fires a late
+    /// [`TaskRun::complete`] from the operation is refused rather than
+    /// overwriting the cancellation. The operation itself stops cooperatively,
+    /// at its next look at the token.
     pub async fn cancel(&self, owner: &TaskOwner, id: &TaskId) -> Result<DetailedTask, TaskError> {
-        self.transition(owner, id, TaskPayload::Cancelled).await
+        let cancelled = self.transition(owner, id, TaskPayload::Cancelled).await?;
+        if let Some(run) = self.runs().get(id) {
+            run.cancel.cancel();
+        }
+        Ok(cancelled)
     }
 
-    /// Drop tasks whose TTL elapsed.
+    /// Drop tasks whose TTL elapsed, returning how many were removed.
+    ///
+    /// An expired task's result can no longer be retrieved, so the operation
+    /// still running it is cancelled too.
     pub async fn sweep_expired(&self) -> Result<usize, TaskError> {
-        self.store.sweep_expired().await
+        let removed = self.store.sweep_expired().await?;
+        let runs = self.runs();
+        for id in &removed {
+            if let Some(run) = runs.get(id) {
+                run.cancel.cancel();
+            }
+        }
+        Ok(removed.len())
+    }
+
+    /// Forget a run whose [`TaskRun`] was dropped.
+    fn release(&self, id: &TaskId) {
+        self.runs().remove(id);
+    }
+}
+
+/// The host's handle on a running task, returned by [`TaskManager::create`].
+///
+/// Move it into the operation doing the work. The operation watches
+/// [`Self::cancellation`] — fired by `tasks/cancel` and by TTL expiry — and
+/// settles the task with [`Self::complete`] or [`Self::fail`]. Dropping the run
+/// unregisters it; the task's stored state is untouched, so a host that
+/// settles from elsewhere by id through [`TaskManager::complete`] still can.
+pub struct TaskRun {
+    manager: Arc<TaskManager>,
+    owner: TaskOwner,
+    task: Task,
+    cancel: CancellationToken,
+}
+
+impl Debug for TaskRun {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("TaskRun")
+            .field("task_id", &self.task.task_id)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TaskRun {
+    /// The seed state, to answer the originating request with as a
+    /// [`CreateTaskResult`] handle.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        &self.task
+    }
+
+    /// The minted task id.
+    #[must_use]
+    pub const fn id(&self) -> &TaskId {
+        &self.task.task_id
+    }
+
+    /// The owner the task is bound to.
+    #[must_use]
+    pub const fn owner(&self) -> &TaskOwner {
+        &self.owner
+    }
+
+    /// The token `tasks/cancel` and TTL expiry fire. Clone it into whatever
+    /// part of the operation needs to stop.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Whether the task has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Complete the task with the original request's result shape.
+    ///
+    /// Refused with [`TaskError::InvalidState`] when the task is already
+    /// terminal — cancelled while the operation was finishing, typically.
+    pub async fn complete(self, result: Map<String, Value>) -> Result<DetailedTask, TaskError> {
+        self.manager
+            .complete(&self.owner, &self.task.task_id, result)
+            .await
+    }
+
+    /// Fail the task with a JSON-RPC error object.
+    pub async fn fail(self, error: Map<String, Value>) -> Result<DetailedTask, TaskError> {
+        self.manager
+            .fail(&self.owner, &self.task.task_id, error)
+            .await
+    }
+}
+
+impl Drop for TaskRun {
+    fn drop(&mut self) {
+        self.manager.release(&self.task.task_id);
     }
 }

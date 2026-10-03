@@ -87,9 +87,10 @@ pub trait ToolDispatcher<S: Send + Sync + ?Sized>: Send + Sync {
     /// call, which the engine reports as a protocol error; a refusal or a
     /// failure of a tool that does exist is an error [`ToolResponse`] in
     /// [`CallToolOutcome::Immediate`]. A host implementing the Tasks
-    /// extension may instead mint a task with
-    /// [`TaskManager::create`](crate::mcp::tasks::TaskManager::create), spawn
-    /// the work, and answer [`CallToolOutcome::Task`].
+    /// extension may instead create a task with
+    /// [`TaskManager::create`](crate::mcp::tasks::TaskManager::create), move
+    /// the returned [`TaskRun`](crate::mcp::tasks::TaskRun) into the spawned
+    /// work, and answer [`CallToolOutcome::Task`] with its seed task.
     async fn call_tool(
         &self,
         name: &str,

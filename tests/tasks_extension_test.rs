@@ -13,16 +13,20 @@
 
 use dravr_tronc::mcp::tasks::CreateTaskResult;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dravr_tronc::mcp::host::{CallToolOutcome, ToolDispatcher};
 use dravr_tronc::mcp::schema::{TaskSupport, Tool, ToolExecution, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tasks::{
-    DetailedTask, InMemoryTaskStore, Task, TaskId, TaskManager, TaskOwner, TaskPayload, TaskStatus,
+    DetailedTask, InMemoryTaskStore, Task, TaskError, TaskId, TaskManager, TaskOwner, TaskPayload,
+    TaskRun, TaskStatus,
 };
 use dravr_tronc::mcp::tool::{ToolContext, ToolRegistry};
 use serde_json::{json, Map, Value};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 /// State for the test server.
 struct TestState;
@@ -31,6 +35,8 @@ struct TestState;
 /// path is exercised end to end.
 struct TaskingDispatcher {
     manager: Arc<TaskManager>,
+    /// Runs kept alive the way a host's spawned operation would hold them.
+    runs: Arc<Mutex<Vec<TaskRun>>>,
 }
 
 #[async_trait]
@@ -58,7 +64,11 @@ impl ToolDispatcher<TestState> for TaskingDispatcher {
             tenant_id: ctx.tenant_id.clone(),
         };
         match self.manager.create(&owner).await {
-            Ok(task) => CallToolOutcome::Task(Box::new(task)),
+            Ok(run) => {
+                let task = run.task().clone();
+                self.runs.lock().await.push(run);
+                CallToolOutcome::Task(Box::new(task))
+            }
             Err(e) => CallToolOutcome::Immediate(Box::new(ToolResponse::error(e.to_string()))),
         }
     }
@@ -69,6 +79,15 @@ fn manager() -> Arc<TaskManager> {
 }
 
 fn server_with_tasks(manager: Arc<TaskManager>) -> McpServer<TestState> {
+    server_with_runs(manager, Arc::new(Mutex::new(Vec::new())))
+}
+
+/// A tasking server whose dispatcher parks each run in `runs`, so a test can
+/// drive the operation side.
+fn server_with_runs(
+    manager: Arc<TaskManager>,
+    runs: Arc<Mutex<Vec<TaskRun>>>,
+) -> McpServer<TestState> {
     McpServer::new(
         "test-server",
         "0.1.0",
@@ -77,6 +96,7 @@ fn server_with_tasks(manager: Arc<TaskManager>) -> McpServer<TestState> {
     )
     .with_tool_dispatcher(Arc::new(TaskingDispatcher {
         manager: Arc::clone(&manager),
+        runs,
     }))
     .with_task_manager(manager)
 }
@@ -235,8 +255,8 @@ async fn tools_call_returns_a_task_handle_only_when_declared() {
 async fn task_ids_are_minted_unguessable_by_the_engine() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let first = manager.create(&owner).await.expect("created").task_id;
-    let second = manager.create(&owner).await.expect("created").task_id;
+    let first = manager.create(&owner).await.expect("created").id().clone();
+    let second = manager.create(&owner).await.expect("created").id().clone();
     assert_ne!(first, second);
     assert_eq!(first.as_str().len(), 32);
     assert_ne!(first.as_str(), "0".repeat(32));
@@ -335,7 +355,7 @@ async fn a_task_is_invisible_to_a_different_owner() {
         tenant_id: Some("t2".to_owned()),
     };
 
-    let secret = manager.create(&alice).await.expect("created").task_id;
+    let secret = manager.create(&alice).await.expect("created").id().clone();
 
     assert!(
         manager.get(&alice, &secret).await.is_ok(),
@@ -351,7 +371,7 @@ async fn a_task_is_invisible_to_a_different_owner() {
 async fn a_terminal_task_refuses_further_transitions() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let id = manager.create(&owner).await.expect("created").task_id;
+    let id = manager.create(&owner).await.expect("created").id().clone();
     manager
         .complete(&owner, &id, Map::new())
         .await
@@ -368,7 +388,7 @@ async fn a_terminal_task_refuses_further_transitions() {
 async fn tasks_update_requires_the_task_to_be_awaiting_input() {
     let manager = manager();
     let owner = TaskOwner::default();
-    let id = manager.create(&owner).await.expect("created").task_id;
+    let id = manager.create(&owner).await.expect("created").id().clone();
 
     assert!(
         manager.apply_input(&owner, &id).await.is_err(),
@@ -465,6 +485,105 @@ async fn tasks_cancel_moves_the_task_to_cancelled() {
             .status(),
         TaskStatus::Cancelled
     );
+}
+
+/// `tasks/cancel` must reach the running operation, not only the stored state:
+/// the run's token fires, and the operation's late result cannot resurrect the
+/// task.
+#[tokio::test]
+async fn tasks_cancel_signals_the_operation_and_the_cancellation_is_final() {
+    let manager = manager();
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let server = server_with_runs(Arc::clone(&manager), Arc::clone(&runs));
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "slow", "arguments": {}, "_meta": modern_meta(true) }
+    })
+    .to_string();
+    server.handle_raw(&call).await.expect("created");
+    let run = runs
+        .lock()
+        .await
+        .pop()
+        .expect("the dispatcher parked its run");
+    let token = run.cancellation();
+    assert!(!token.is_cancelled());
+
+    let cancel = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tasks/cancel",
+        "params": { "taskId": run.id().as_str(), "_meta": modern_meta(true) }
+    })
+    .to_string();
+    let response = server.handle_raw(&cancel).await.expect("response");
+    assert!(
+        response.result.is_some(),
+        "cancel acknowledged: {response:?}"
+    );
+
+    // The operation observes the signal without polling the store.
+    timeout(Duration::from_secs(1), token.cancelled())
+        .await
+        .expect("the run's token fires on tasks/cancel");
+
+    let id = run.id().clone();
+    let late = run.complete(Map::new()).await;
+    assert!(
+        matches!(
+            late,
+            Err(TaskError::InvalidState {
+                status: TaskStatus::Cancelled,
+                ..
+            })
+        ),
+        "a late result must not overwrite the cancellation: {late:?}"
+    );
+    assert_eq!(
+        manager
+            .get(&TaskOwner::default(), &id)
+            .await
+            .expect("readable")
+            .status(),
+        TaskStatus::Cancelled
+    );
+}
+
+/// The terminal check and the write are one atomic store step: racing a
+/// completion against a cancellation settles exactly one of them, and the
+/// stored state is the winner's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_writers_settle_a_task_exactly_once() {
+    let manager = manager();
+    let owner = TaskOwner::default();
+    for _ in 0..64 {
+        let id = manager.create(&owner).await.expect("created").id().clone();
+        let completing = {
+            let manager = Arc::clone(&manager);
+            let owner = owner.clone();
+            let id = id.clone();
+            tokio::spawn(async move { manager.complete(&owner, &id, Map::new()).await })
+        };
+        let cancelling = {
+            let manager = Arc::clone(&manager);
+            let owner = owner.clone();
+            let id = id.clone();
+            tokio::spawn(async move { manager.cancel(&owner, &id).await })
+        };
+        let completed = completing.await.expect("joined");
+        let cancelled = cancelling.await.expect("joined");
+        assert!(
+            completed.is_ok() != cancelled.is_ok(),
+            "exactly one writer settles the task"
+        );
+        let winner = if completed.is_ok() {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Cancelled
+        };
+        assert_eq!(
+            manager.get(&owner, &id).await.expect("readable").status(),
+            winner
+        );
+    }
 }
 
 #[tokio::test]
