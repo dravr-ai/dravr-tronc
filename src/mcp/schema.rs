@@ -12,6 +12,8 @@
 //! free of any project-specific coupling so every `dravr-*` MCP server shares a
 //! single canonical wire vocabulary.
 
+#[cfg(feature = "computation")]
+use schemars::JsonSchema as DeriveJsonSchema;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -371,6 +373,46 @@ impl ToolResponse {
             is_error: false,
             structured_content: Some(structured),
         })
+    }
+}
+
+/// A list result, as the JSON object `{"items": [...]}`.
+///
+/// `structuredContent` and the root of an `outputSchema` are JSON objects in
+/// every revision of the specification, so a tool whose result is a list
+/// cannot return the bare array: [`ToolResponse::structured`] refuses it, and
+/// a [`Computation`](crate::mcp::computation::Computation) whose `Output` is
+/// a `Vec` would declare an array schema. Wrapping the list in `Listed` gives
+/// every server the same shape for it — one `items` member — instead of each
+/// naming its own wrapper.
+///
+/// With the `computation` feature it derives `schemars::JsonSchema`, so it
+/// is a `Computation::Output` as it stands: `type Output = Listed<Row>;`,
+/// and `Ok(rows.into())` or `.collect()` to build it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "computation", derive(DeriveJsonSchema))]
+pub struct Listed<T> {
+    /// The items, in order.
+    pub items: Vec<T>,
+}
+
+impl<T> Listed<T> {
+    /// A list result of `items`.
+    #[must_use]
+    pub const fn new(items: Vec<T>) -> Self {
+        Self { items }
+    }
+}
+
+impl<T> From<Vec<T>> for Listed<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self::new(items)
+    }
+}
+
+impl<T> FromIterator<T> for Listed<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::new(iter.into_iter().collect())
     }
 }
 

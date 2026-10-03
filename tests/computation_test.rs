@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::mcp::schema::{Listed, Tool, ToolResponse};
 use dravr_tronc::testkit::assert::{
     assert_structured_content, assert_tool_error, assert_tool_success, tool_text,
 };
@@ -177,4 +177,45 @@ async fn an_output_that_is_not_an_object_is_a_tool_error_naming_the_tool() {
         "celsius: could not render the result: structured content must be a JSON object, \
          but the result is an array"
     );
+}
+
+/// A computation whose result is a list, in the shared wrapper.
+struct Sorted;
+
+impl Computation for Sorted {
+    type Input = Readings;
+    type Output = Listed<f32>;
+    const NAME: &'static str = "sorted";
+    const TITLE: &'static str = "Sorted";
+    const DESCRIPTION: &'static str = "The readings, coldest first.";
+
+    fn compute(&self, input: Readings) -> Result<Listed<f32>, String> {
+        let mut celsius = input.celsius;
+        celsius.sort_by(f32::total_cmp);
+        Ok(celsius.into())
+    }
+}
+
+#[tokio::test]
+async fn a_listed_output_is_an_object_holding_the_items() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(Sorted));
+    let client = McpTestClient::in_process(Arc::new(McpServer::new(
+        "computation-test",
+        "0",
+        registry,
+        Arc::new(()),
+    )));
+    let tools = client.list_tools().await.expect("tools/list");
+    let output = tools[0].output_schema.clone().expect("an outputSchema");
+    assert_eq!(output["type"], "object");
+    assert_eq!(output["required"], json!(["items"]));
+    assert_eq!(output["properties"]["items"]["type"], "array");
+    assert_eq!(output["properties"]["items"]["items"]["type"], "number");
+
+    let result = client
+        .call_tool("sorted", json!({ "celsius": [12.8, 9.5] }))
+        .await
+        .expect("a tool result");
+    assert_structured_content(&result, &json!({ "items": [9.5, 12.8] }));
 }

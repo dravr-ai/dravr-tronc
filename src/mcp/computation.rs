@@ -68,7 +68,9 @@ pub trait Computation: Send + Sync {
     ///
     /// It must serialise to a JSON object — a struct or a map — because both
     /// `outputSchema` and `structuredContent` are objects in the
-    /// specification. A list or a scalar is wrapped in a struct that names it.
+    /// specification. A list is returned as a
+    /// [`Listed`](crate::mcp::schema::Listed), the one wrapper every server
+    /// shares; a scalar is wrapped in a struct that names it.
     type Output: Serialize + JsonSchema;
 
     /// Tool name, as `tools/call` addresses it.
