@@ -795,3 +795,54 @@ async fn a_client_sending_no_accept_is_served() {
     );
     assert!(events.contains("\"id\":2"), "{events}");
 }
+
+/// Admits everyone as the anonymous caller, taking its time over `slow`.
+struct SlowAuth;
+
+#[async_trait]
+impl AuthHook<State> for SlowAuth {
+    async fn authenticate(
+        &self,
+        request: &JsonRpcRequest,
+        _state: &Arc<State>,
+    ) -> Result<ToolContext, AuthError> {
+        if request.auth_token.as_deref() == Some("slow") {
+            sleep(Duration::from_millis(300)).await;
+        }
+        Ok(ToolContext::new())
+    }
+}
+
+/// A session that expires while its request is being authenticated is
+/// refused with 404 — the client initializes again — and never served in
+/// the ended session, where the request would be cancelled unanswered.
+#[tokio::test]
+async fn a_session_expiring_during_authentication_is_not_entered() {
+    let ttl = Duration::from_millis(100);
+    let server = Arc::new(
+        McpServer::new("channel-test", "0.1.0", registry(), Arc::new(State))
+            .with_http_sessions(ttl)
+            .with_auth_hook(Arc::new(SlowAuth)),
+    );
+    let client = McpTestClient::in_process(Arc::clone(&server)).with_bearer("fast");
+    client.initialize().await.unwrap();
+    assert!(client.result("ping", None).await.is_ok());
+
+    let slow = client.clone().with_bearer("slow");
+    let request = tokio::spawn(async move {
+        slow.raw(r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#)
+            .await
+    });
+    // Past the time-to-live, another handshake sweeps the idle session out
+    // while the first request is still authenticating.
+    sleep(ttl + ttl / 2).await;
+    McpTestClient::in_process(server)
+        .with_bearer("fast")
+        .initialize()
+        .await
+        .unwrap();
+
+    let answer = request.await.unwrap().unwrap();
+    assert_eq!(answer.status, 404, "{}", answer.body);
+    assert_eq!(answer.json().unwrap()["id"], 9);
+}

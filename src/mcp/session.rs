@@ -222,6 +222,13 @@ pub(crate) struct SessionUse {
     session: Arc<Session>,
 }
 
+impl SessionUse {
+    /// The session the request is served in.
+    pub(crate) fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+}
+
 impl Drop for SessionUse {
     fn drop(&mut self) {
         *self.session.last_seen() = Instant::now();
@@ -362,6 +369,25 @@ impl SessionStore {
         Some(Arc::clone(session))
     }
 
+    /// Serve a request of the caller `ctx` in the live session `id` names:
+    /// the session is looked up and counted busy in one step under the
+    /// store's lock, so no sweep can expire it between the two. `None` when
+    /// no live session has that id, or it is another caller's; one that
+    /// expired is ended and forgotten on the way.
+    pub(crate) fn enter(&self, id: &str, ctx: &ToolContext) -> Option<SessionUse> {
+        let now = Instant::now();
+        self.sweep_if_due(now);
+        let mut sessions = self.sessions();
+        let session = sessions.get(id)?;
+        if session.is_expired(self.ttl, now) {
+            if let Some(expired) = sessions.remove(id) {
+                expired.end();
+            }
+            return None;
+        }
+        session.is_owned_by(ctx).then(|| session.enter())
+    }
+
     /// End the session `id` names and forget it. Returns whether one did.
     pub(crate) fn end(&self, id: &str) -> bool {
         let removed = self.sessions().remove(id);
@@ -403,6 +429,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::sleep;
 
     fn limits(total: usize, per_caller: usize) -> SessionLimits {
         SessionLimits {
@@ -464,6 +491,38 @@ mod tests {
         assert!(store.find(&busy_id).is_some(), "a request is in flight");
         drop(serving);
         assert!(store.find(&busy_id).is_none(), "idle once it finished");
+    }
+
+    /// Entering looks the session up and counts it busy in one step: once
+    /// entered it outlives its time-to-live, and an expired or foreign one
+    /// is never entered.
+    #[test]
+    fn entering_a_session_is_atomic_with_its_expiry() {
+        let ttl = Duration::from_millis(50);
+        let store = store(ttl);
+        let owner = ToolContext::new().with_user("u1");
+        let (session, id) = minted(&owner);
+        store.insert(session).expect("room"); // Safe: test assertion
+
+        assert!(
+            store
+                .enter(&id, &ToolContext::new().with_user("u2"))
+                .is_none(),
+            "another caller's session is not entered"
+        );
+        let serving = store.enter(&id, &owner).expect("live and the owner's"); // Safe: test assertion
+        let token = serving.session().cancellation().child_token();
+        sleep(ttl * 2);
+        assert!(store.find(&id).is_some(), "busy past its time-to-live");
+        assert!(!token.is_cancelled());
+
+        drop(serving);
+        sleep(ttl * 2);
+        assert!(
+            store.enter(&id, &owner).is_none(),
+            "idle past its time-to-live"
+        );
+        assert!(token.is_cancelled(), "an expired session ends");
     }
 
     #[test]

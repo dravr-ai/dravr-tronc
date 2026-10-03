@@ -267,12 +267,14 @@ pub async fn shutdown_signal() {
 /// `application/json` (415), a body over the size limit (413), and a client whose `Accept`
 /// admits neither `application/json` nor `text/event-stream` (406), refuses a body that is
 /// not a JSON-RPC message (400), refuses an unsupported `MCP-Protocol-Version`
-/// (400, -32022) and a modern body sent without one (400, -32020), resolves the
-/// request's `Mcp-Session-Id` on a server that keeps sessions (404 for one that
-/// is not live, or belongs to another caller), authenticates via the server's hook (401 +
-/// `WWW-Authenticate` on rejection, per RFC 9728; 429 + `Retry-After` on a
-/// spent budget; 500 when the host failed to decide), then dispatches under
-/// the resolved per-call context.
+/// (400, -32022) and a modern body sent without one (400, -32020), authenticates
+/// via the server's hook (401 + `WWW-Authenticate` on rejection, per RFC 9728;
+/// 429 + `Retry-After` on a spent budget; 500 when the host failed to decide),
+/// then, on a server that keeps sessions, enters the session the request's
+/// `Mcp-Session-Id` names — looked up and counted busy in one step, so it
+/// cannot expire in between (400 for a malformed header, 404 for a session
+/// that is not live or belongs to another caller) — and dispatches under the
+/// resolved per-call context.
 ///
 /// The answer follows the client's `Accept` (RFC 9110 §12.5.1), where no
 /// `Accept` at all means `*/*`. A single response is JSON unless the client
@@ -454,17 +456,17 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
         return header_mismatch(request.id, &reason);
     }
 
-    // 5. The session, on a server that keeps them: `initialize` starts a new
-    // one, any other request names its own. Revision 2026-07-28 has none.
+    // 5. The session id, on a server that keeps them: `initialize` starts a
+    // new session, any other request names its own. Revision 2026-07-28 has
+    // none.
     let initialize = request.method == "initialize";
     let sessions = server.sessions().filter(|_| !modern).cloned();
-    let session = match &sessions {
-        Some(_) if initialize => None,
-        Some(store) => match named_session(store, headers, request.id.as_ref()) {
-            Ok(session) => session,
+    let session_id = match &sessions {
+        Some(_) if !initialize => match session_id_header(headers, request.id.as_ref()) {
+            Ok(session_id) => session_id.map(str::to_owned),
             Err(refusal) => return *refusal,
         },
-        None => None,
+        _ => None,
     };
 
     // 6. Authenticate (RFC 9728 resource-server posture).
@@ -472,11 +474,16 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
     };
-    if let Some(session) = &session {
-        if !session.is_owned_by(&ctx) {
-            return session_not_found(request.id);
-        }
-    }
+
+    // The caller's session, looked up and counted busy in one step now the
+    // caller is known, so it cannot expire between the two.
+    let serving = match (&sessions, session_id) {
+        (Some(store), Some(session_id)) => match store.enter(&session_id, &ctx) {
+            Some(serving) => Some(serving),
+            None => return session_not_found(request.id),
+        },
+        _ => None,
+    };
     let session = match (&sessions, initialize) {
         (Some(_), true) => match Session::mint(&ctx) {
             Ok(minted) => Some(minted),
@@ -489,7 +496,9 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
                 );
             }
         },
-        _ => session,
+        _ => serving
+            .as_ref()
+            .map(|serving| Arc::clone(serving.session())),
     };
 
     // 7. Dispatch under the resolved context, connected to the client through
@@ -510,7 +519,8 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
         client: ClientChannel::connected(connection),
         ..ctx
     };
-    let serving = session.as_ref().map(Session::enter);
+    // A minted session counts its handshake busy too.
+    let serving = serving.or_else(|| session.as_ref().map(Session::enter));
 
     if initialize {
         // A handshake runs no tool and sends nothing before its answer, which
@@ -540,38 +550,41 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
     answer_call(server, request, ctx, outbox, modern, rendering, serving).await
 }
 
-/// The live session a request's `Mcp-Session-Id` names, `None` when it names
-/// none, or the refusal: 400 for a repeated or unreadable header, 404 for an
-/// id that is not live — which tells the client to initialize again.
-fn named_session(
-    store: &SessionStore,
-    headers: &HeaderMap,
+/// The `Mcp-Session-Id` a request names, `None` when it names none, or the
+/// 400 for a repeated or unreadable header.
+fn session_id_header<'h>(
+    headers: &'h HeaderMap,
     id: Option<&Value>,
-) -> Result<Option<Arc<Session>>, Refusal> {
+) -> Result<Option<&'h str>, Refusal> {
     let mut values = headers.get_all(MCP_SESSION_ID_HEADER).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
-    let session_id = match (value.to_str(), values.next()) {
-        (Ok(session_id), None) => session_id.trim(),
-        _ => {
-            return Err(Box::new(
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(JsonRpcResponse::error(
-                        id.cloned(),
-                        INVALID_REQUEST,
-                        "Mcp-Session-Id must be one visible-ASCII value",
-                    )),
-                )
-                    .into_response(),
-            ));
-        }
-    };
+    match (value.to_str(), values.next()) {
+        (Ok(session_id), None) => Ok(Some(session_id.trim())),
+        _ => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(JsonRpcResponse::error(
+                    id.cloned(),
+                    INVALID_REQUEST,
+                    "Mcp-Session-Id must be one visible-ASCII value",
+                )),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// The live session `session_id` names when it is the caller `ctx`'s own.
+fn owned_session(
+    store: &SessionStore,
+    session_id: &str,
+    ctx: &ToolContext,
+) -> Option<Arc<Session>> {
     store
         .find(session_id)
-        .map(Some)
-        .ok_or_else(|| Box::new(session_not_found(id.cloned())))
+        .filter(|session| session.is_owned_by(ctx))
 }
 
 /// The 503 of an `initialize` whose session the store has no room for: the
@@ -796,11 +809,10 @@ async fn accept_client_response<S: Send + Sync + ?Sized + 'static>(
         return header_mismatch(None, &reason);
     }
     let modern = version.is_some_and(is_modern_revision);
-    let session = match server.sessions().filter(|_| !modern) {
-        Some(store) => match named_session(store, headers, None) {
-            Ok(session) => session,
-            Err(refusal) => return *refusal,
-        },
+    let store = server.sessions().filter(|_| !modern);
+    let session_id = match store.map(|_| session_id_header(headers, None)) {
+        Some(Ok(session_id)) => session_id,
+        Some(Err(refusal)) => return *refusal,
         None => None,
     };
     let message = transport_message(headers, response.id.clone(), version);
@@ -808,11 +820,13 @@ async fn accept_client_response<S: Send + Sync + ?Sized + 'static>(
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
     };
-    if let Some(session) = &session {
-        if !session.is_owned_by(&ctx) {
-            return session_not_found(None);
-        }
-    }
+    let session = match (store, session_id) {
+        (Some(store), Some(session_id)) => match owned_session(store, session_id, &ctx) {
+            Some(session) => Some(session),
+            None => return session_not_found(None),
+        },
+        _ => None,
+    };
     let delivered = server.deliver_client_response(
         &ctx,
         session.as_ref().and_then(|s| s.id()),
@@ -841,8 +855,8 @@ pub async fn handle_mcp_delete<S: Send + Sync + ?Sized + 'static>(
     let Some(store) = server.sessions() else {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     };
-    let session = match named_session(store, &headers, None) {
-        Ok(Some(session)) => session,
+    let session_id = match session_id_header(&headers, None) {
+        Ok(Some(session_id)) => session_id,
         Ok(None) => {
             return transport_refusal(
                 StatusCode::BAD_REQUEST,
@@ -860,12 +874,10 @@ pub async fn handle_mcp_delete<S: Send + Sync + ?Sized + 'static>(
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
     };
-    if !session.is_owned_by(&ctx) {
+    if owned_session(store, session_id, &ctx).is_none() {
         return session_not_found(None);
     }
-    if let Some(id) = session.id() {
-        store.end(id);
-    }
+    store.end(session_id);
     StatusCode::NO_CONTENT.into_response()
 }
 
