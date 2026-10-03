@@ -17,11 +17,14 @@ use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use tower::ServiceExt;
 
-use crate::mcp::modern::{meta_keys, PROTOCOL_VERSION_2026_07_28};
+use crate::mcp::modern::{meta_keys, PROTOCOL_VERSION_2026_07_28, PROTOCOL_VERSION_HEADER};
 use crate::mcp::protocol::{JsonRpcError, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION};
 use crate::mcp::schema::{Tool, ToolResponse};
 use crate::mcp::server::McpServer;
 use crate::mcp::transport::http::guarded_mcp_router;
+use crate::mcp::transport::mirror::{
+    encode_header_value, mirrored_name_field, MCP_METHOD_HEADER, MCP_NAME_HEADER,
+};
 
 /// The `clientInfo.name` the test client introduces itself with.
 pub const TESTKIT_CLIENT_NAME: &str = "dravr-tronc-testkit";
@@ -29,9 +32,6 @@ pub const TESTKIT_CLIENT_NAME: &str = "dravr-tronc-testkit";
 /// What a Streamable HTTP client accepts: both renderings, as the transport
 /// requires a client to declare.
 const ACCEPT_JSON_AND_SSE: &str = "application/json, text/event-stream";
-
-/// The header a modern client states its revision in.
-const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 /// Where a request goes.
 #[derive(Clone)]
@@ -139,7 +139,7 @@ impl McpTestClient {
             json!({ "name": TESTKIT_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") }),
         )
         .with_meta(meta_keys::CLIENT_CAPABILITIES, json!({}))
-        .with_header(MCP_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
+        .with_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_2026_07_28)
     }
 
     /// Run the legacy `initialize` handshake and return its result.
@@ -219,10 +219,12 @@ impl McpTestClient {
     ) -> Result<JsonRpcResponse, TestClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "method": method });
-        if let Some(params) = self.with_client_meta(params) {
+        let params = self.with_client_meta(params);
+        let mirrors = self.mirror_headers(method, params.as_ref());
+        if let Some(params) = params {
             request["params"] = params;
         }
-        self.raw(request.to_string()).await?.rpc()
+        self.send(request.to_string(), mirrors).await?.rpc()
     }
 
     /// Send a JSON-RPC notification: no id, so no JSON-RPC answer, only the
@@ -237,10 +239,12 @@ impl McpTestClient {
         params: Option<Value>,
     ) -> Result<RawResponse, TestClientError> {
         let mut notification = json!({ "jsonrpc": JSONRPC_VERSION, "method": method });
-        if let Some(params) = self.with_client_meta(params) {
+        let params = self.with_client_meta(params);
+        let mirrors = self.mirror_headers(method, params.as_ref());
+        if let Some(params) = params {
             notification["params"] = params;
         }
-        self.raw(notification.to_string()).await
+        self.send(notification.to_string(), mirrors).await
     }
 
     /// POST `body` as it is — no id, no `_meta` added — with this client's
@@ -250,11 +254,49 @@ impl McpTestClient {
     ///
     /// A header that is not valid HTTP, or a transport failure.
     pub async fn raw(&self, body: impl Into<String>) -> Result<RawResponse, TestClientError> {
-        let body = body.into();
+        self.send(body.into(), Vec::new()).await
+    }
+
+    /// POST `body` with this client's headers plus `mirrors`.
+    async fn send(
+        &self,
+        body: String,
+        mirrors: Vec<(String, String)>,
+    ) -> Result<RawResponse, TestClientError> {
+        let mut headers = self.request_headers();
+        headers.extend(mirrors);
         match &self.transport {
-            Transport::InProcess(router) => self.raw_in_process(router.clone(), body).await,
-            Transport::Http { url, http } => self.raw_http(http, url, body).await,
+            Transport::InProcess(router) => {
+                Self::raw_in_process(router.clone(), body, headers).await
+            }
+            Transport::Http { url, http } => Self::raw_http(http, url, body, headers).await,
         }
+    }
+
+    /// The SEP-2243 mirrors a conforming client sends with `method`:
+    /// `Mcp-Method`, `Mcp-Name` for a method that names a target, and
+    /// `MCP-Protocol-Version` when the params declare a revision in `_meta`
+    /// and this client sets no such header itself.
+    fn mirror_headers(&self, method: &str, params: Option<&Value>) -> Vec<(String, String)> {
+        let mut mirrors = vec![(MCP_METHOD_HEADER.to_owned(), encode_header_value(method))];
+        let name = mirrored_name_field(method)
+            .and_then(|field| params.and_then(|p| p.get(field)))
+            .and_then(Value::as_str);
+        if let Some(name) = name {
+            mirrors.push((MCP_NAME_HEADER.to_owned(), encode_header_value(name)));
+        }
+        let declared = params
+            .and_then(|p| p.get("_meta"))
+            .and_then(|meta| meta.get(meta_keys::PROTOCOL_VERSION))
+            .and_then(Value::as_str);
+        let has_header = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(PROTOCOL_VERSION_HEADER));
+        if let (Some(version), false) = (declared, has_header) {
+            mirrors.push((PROTOCOL_VERSION_HEADER.to_owned(), version.to_owned()));
+        }
+        mirrors
     }
 
     /// The headers every request carries, in order.
@@ -274,12 +316,12 @@ impl McpTestClient {
     }
 
     async fn raw_in_process(
-        &self,
         router: Router,
         body: String,
+        headers: Vec<(String, String)>,
     ) -> Result<RawResponse, TestClientError> {
         let mut builder = Request::builder().method(Method::POST).uri("/mcp");
-        for (name, value) in self.request_headers() {
+        for (name, value) in headers {
             builder = builder.header(name, value);
         }
         let request = builder
@@ -305,13 +347,13 @@ impl McpTestClient {
     }
 
     async fn raw_http(
-        &self,
         http: &reqwest::Client,
         url: &str,
         body: String,
+        headers: Vec<(String, String)>,
     ) -> Result<RawResponse, TestClientError> {
         let mut request = http.post(url).body(body);
-        for (name, value) in self.request_headers() {
+        for (name, value) in headers {
             request = request.header(name, value);
         }
         let response = request

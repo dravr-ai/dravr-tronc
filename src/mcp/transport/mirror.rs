@@ -88,6 +88,19 @@ pub fn decode_header_value(raw: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Base64 payload is not UTF-8".to_owned())
 }
 
+/// Encode a mirror's value for the wire, the counterpart of [`decode_header_value`].
+///
+/// The value goes as it is when every byte is permitted in a field value, and
+/// wrapped in the `=?base64?…?=` sentinel otherwise.
+#[must_use]
+pub fn encode_header_value(value: &str) -> String {
+    if is_permitted_field_value(value.as_bytes()) && value.trim() == value {
+        value.to_owned()
+    } else {
+        format!("{BASE64_PREFIX}{}{BASE64_SUFFIX}", STANDARD.encode(value))
+    }
+}
+
 /// The single value of header `name`, as text.
 ///
 /// # Errors

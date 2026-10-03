@@ -31,7 +31,7 @@ trap 'kill "$SERVER_PID" 2>/dev/null' EXIT
 
 ready=0
 for _ in $(seq 1 50); do
-    if curl -sf -X POST "$URL" -H 'content-type: application/json' \
+    if curl -sf -X POST "$URL" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
         -d '{"jsonrpc":"2.0","id":0,"method":"ping"}' >/dev/null; then
         ready=1
         break
