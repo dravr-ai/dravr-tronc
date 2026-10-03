@@ -123,7 +123,10 @@ fn registry() -> ToolRegistry<State> {
             run: |ctx| {
                 Box::pin(async move {
                     match ctx.client.create_message(&sampling_request()).await {
-                        Ok(result) => ToolResponse::text(format!("LLM: {}", result.content.text)),
+                        Ok(result) => ToolResponse::text(format!(
+                            "LLM: {}",
+                            result.content.as_text().unwrap_or_default()
+                        )),
                         Err(e) => ToolResponse::error(e.to_string()),
                     }
                 })

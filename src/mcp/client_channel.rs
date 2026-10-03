@@ -939,7 +939,7 @@ mod tests {
             .await
             .expect("the call ran") // Safe: test assertion
             .expect("the client answered"); // Safe: test assertion
-        assert_eq!(result.content.text, "hi");
+        assert_eq!(result.content.as_text(), Some("hi"));
     }
 
     #[tokio::test]

@@ -1393,28 +1393,29 @@ pub struct CreateMessageRequest {
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
-/// Result of a create-message (sampling) request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The client's answer to a `sampling/createMessage`: the message its model
+/// produced.
+///
+/// `content` is a [`Content`] block, so an image or audio answer reads as one
+/// rather than failing to parse, and its annotations and `_meta` survive. A
+/// sampled message is text, image or audio in the specification; [`Content`]
+/// also holds the resource blocks, which a client does not send here.
+///
+/// Read off the wire, never built by a server, so it is `#[non_exhaustive]`:
+/// a field the specification adds to the result is not a breaking change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CreateMessageResult {
-    /// Role of the message (usually `"assistant"`).
-    pub role: String,
-    /// Generated message content.
-    pub content: MessageContent,
-    /// Model that was used.
+    /// Who sent the message — the assistant, for a model's answer.
+    pub role: Role,
+    /// The message the model produced.
+    pub content: Content,
+    /// The name of the model that produced it.
     pub model: String,
-    /// Stop reason for completion.
+    /// Why the model stopped (`"endTurn"`, `"stopSequence"`, `"maxTokens"`,
+    /// or the client's own reason).
     #[serde(rename = "stopReason", skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
-}
-
-/// Message content wrapper for sampling results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageContent {
-    /// Content type (usually `"text"`).
-    #[serde(rename = "type")]
-    pub content_type: String,
-    /// Text content.
-    pub text: String,
 }
 
 /// Model preferences for sampling.
@@ -2018,5 +2019,34 @@ mod tests {
         )
         .expect("deserialize"); // Safe: test assertion
         assert_eq!(assistant.role, Role::Assistant);
+    }
+
+    #[test]
+    fn a_sampled_message_is_a_content_block_under_a_spec_role() {
+        let text: CreateMessageResult = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": { "type": "text", "text": "hi" },
+            "model": "m",
+            "stopReason": "endTurn"
+        }))
+        .expect("deserialize"); // Safe: test assertion
+        assert_eq!(text.role, Role::Assistant);
+        assert_eq!(text.content.as_text(), Some("hi"));
+        assert_eq!(text.stop_reason.as_deref(), Some("endTurn"));
+
+        let image: CreateMessageResult = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": { "type": "image", "data": "iVBO", "mimeType": "image/png" },
+            "model": "m"
+        }))
+        .expect("an image answer parses"); // Safe: test assertion
+        assert_eq!(image.content, Content::image("iVBO", "image/png"));
+
+        let unknown_role = serde_json::from_value::<CreateMessageResult>(json!({
+            "role": "system",
+            "content": { "type": "text", "text": "hi" },
+            "model": "m"
+        }));
+        assert!(unknown_role.is_err(), "a role is user or assistant");
     }
 }

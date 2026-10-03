@@ -364,7 +364,10 @@ async fn sample(ctx: &ToolContext, prompt: &str) -> ToolResponse {
         Err(e) => return ToolResponse::error(format!("Sampling request: {e}")),
     };
     match ctx.client.create_message(&request).await {
-        Ok(result) => ToolResponse::text(format!("LLM response: {}", result.content.text)),
+        Ok(result) => result.content.as_text().map_or_else(
+            || ToolResponse::error("Sampling answered with a non-text block".to_owned()),
+            |text| ToolResponse::text(format!("LLM response: {text}")),
+        ),
         Err(e) => ToolResponse::error(format!("Sampling failed: {e}")),
     }
 }
