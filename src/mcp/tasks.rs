@@ -445,6 +445,7 @@ pub enum TaskError {
     /// The task is visible but no operation in this process is running it,
     /// so there is nothing to hand client input to. Seen when the operation
     /// ended without settling the task, or ran on another instance.
+    // LIMITATION(registre#761): Detached — task input and cancel signals reach only an operation in this process
     Detached(TaskId),
     /// The backing store failed.
     Store(String),
