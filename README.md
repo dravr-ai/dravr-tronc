@@ -249,7 +249,10 @@ let app = rest_routes
   characters of `[A-Za-z0-9-_.:]`, a minted one otherwise — echoes it on the response, and puts it
   in the request's extensions as `RequestId`. It logs one INFO line per request (`method`, route
   template as `path`, `status`, `latency_ms`, `request_id`; never the concrete path or its query,
-  which carry ids). A handler panic becomes a `500` with
+  which carry ids). A request that took at least the slow-request threshold completes with a WARN
+  line instead, which adds `threshold_ms`: `SLOW_REQUEST_THRESHOLD_MS` sets it (default 10000, `0`
+  turns it off, an unreadable value keeps the default), and `guard_requests_with_threshold` takes
+  one from a server that configures itself elsewhere. A handler panic becomes a `500` with
   `{"error":{"type":"handler_panic",…}}` and an ERROR line carrying the panic payload. A request
   dropped before it answered — the client closed the connection mid-request, or the server went
   down — is logged at WARN with how long it ran.

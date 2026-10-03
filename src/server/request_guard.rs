@@ -1,5 +1,5 @@
 // ABOUTME: Request guard for dravr HTTP servers: request ids, panic containment, deadlines, completion logs
-// ABOUTME: A handler that panics or outlives its deadline answers a JSON 500/504, never a dropped connection
+// ABOUTME: A panicking or late handler answers a JSON 500/504; a slow request completes with a WARN line
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -11,7 +11,9 @@
 //!   gives every request an id — the caller's [`REQUEST_ID_HEADER`] when it
 //!   sends a usable one, a minted one otherwise — and echoes it on the
 //!   response. It logs one INFO line per request when the response is ready
-//!   (method, route template, status, latency, id), and it turns a handler
+//!   (method, route template, status, latency, id) — a WARN line instead when
+//!   the request ran past the [slow-request threshold](slow_request_threshold)
+//!   — and it turns a handler
 //!   panic into a `500` whose JSON body carries [`HANDLER_PANIC`], logging the
 //!   panic payload at ERROR under the request id. A request whose future is
 //!   dropped before it answered is logged at WARN with how long it ran: hyper
@@ -57,6 +59,7 @@
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;
+use std::env;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::panic::AssertUnwindSafe;
@@ -93,6 +96,22 @@ pub const REQUEST_TIMEOUT: &str = "request_timeout";
 /// Long enough for a UUID, a W3C trace id, or a prefixed composite of them; a
 /// longer value is replaced rather than copied into every log line.
 pub const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Environment variable holding the slow-request threshold, in milliseconds.
+///
+/// A request that takes at least this long to answer is logged at WARN
+/// instead of INFO, so a latency regression shows up in an alerting query on
+/// level rather than in a scan of every `latency_ms`. `0` turns the warning
+/// off. Unset, empty or unreadable, the threshold is
+/// [`DEFAULT_SLOW_REQUEST_THRESHOLD`].
+pub const SLOW_REQUEST_THRESHOLD_ENV: &str = "SLOW_REQUEST_THRESHOLD_MS";
+
+/// Slow-request threshold of a process that does not set
+/// [`SLOW_REQUEST_THRESHOLD_ENV`].
+///
+/// Well above a REST route's normal latency and below the usual deadlines, so
+/// a request past it is worth a look while still well short of a deadline.
+pub const DEFAULT_SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
 
 /// Route logged for a request no route matched (the router's fallback).
 ///
@@ -175,7 +194,49 @@ fn route_template(request: &Request) -> String {
 
 /// Milliseconds since `started`, saturating.
 fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    duration_ms(started.elapsed())
+}
+
+/// `duration` in whole milliseconds, saturating.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The slow-request threshold [`guard_requests`] applies, read once from
+/// [`SLOW_REQUEST_THRESHOLD_ENV`]; `None` when the warning is turned off.
+///
+/// Read on first use and kept for the life of the process, like the rest of a
+/// service's environment configuration.
+#[must_use]
+pub fn slow_request_threshold() -> Option<Duration> {
+    static THRESHOLD: OnceLock<Option<Duration>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        parse_slow_request_threshold(env::var(SLOW_REQUEST_THRESHOLD_ENV).ok().as_deref())
+    })
+}
+
+/// Read a [`SLOW_REQUEST_THRESHOLD_ENV`] value: milliseconds, `0` for off.
+///
+/// A value that is not a whole number keeps the default and says so once, at
+/// WARN: a typo must not silently turn the warning off.
+#[must_use]
+pub fn parse_slow_request_threshold(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Some(DEFAULT_SLOW_REQUEST_THRESHOLD);
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(ms) => Some(Duration::from_millis(ms)),
+        Err(_) => {
+            warn!(
+                variable = SLOW_REQUEST_THRESHOLD_ENV,
+                value = raw,
+                default_ms = duration_ms(DEFAULT_SLOW_REQUEST_THRESHOLD),
+                "slow-request threshold is not a whole number of milliseconds; using the default"
+            );
+            Some(DEFAULT_SLOW_REQUEST_THRESHOLD)
+        }
+    }
 }
 
 /// A failure answer in the crate's [`ErrorResponse`] shape.
@@ -204,31 +265,51 @@ struct InFlight {
     method: Method,
     path: String,
     started: Instant,
+    slow_threshold: Option<Duration>,
     finished: bool,
 }
 
 impl InFlight {
-    fn start(request_id: RequestId, method: Method, path: String) -> Self {
+    fn start(
+        request_id: RequestId,
+        method: Method,
+        path: String,
+        slow_threshold: Option<Duration>,
+    ) -> Self {
         Self {
             request_id,
             method,
             path,
             started: Instant::now(),
+            slow_threshold,
             finished: false,
         }
     }
 
-    /// Log the completed request at INFO.
+    /// Log the completed request: at INFO, or at WARN when it took at least
+    /// the slow-request threshold.
     fn finish(mut self, status: StatusCode) {
         self.finished = true;
-        info!(
-            request_id = %self.request_id,
-            method = %self.method,
-            path = %self.path,
-            status = status.as_u16(),
-            latency_ms = elapsed_ms(self.started),
-            "request completed"
-        );
+        let latency = self.started.elapsed();
+        match self.slow_threshold {
+            Some(threshold) if latency >= threshold => warn!(
+                request_id = %self.request_id,
+                method = %self.method,
+                path = %self.path,
+                status = status.as_u16(),
+                latency_ms = duration_ms(latency),
+                threshold_ms = duration_ms(threshold),
+                "slow request completed past the slow-request threshold"
+            ),
+            _ => info!(
+                request_id = %self.request_id,
+                method = %self.method,
+                path = %self.path,
+                status = status.as_u16(),
+                latency_ms = duration_ms(latency),
+                "request completed"
+            ),
+        }
     }
 }
 
@@ -253,14 +334,31 @@ impl Drop for InFlight {
 /// `router.layer(axum::middleware::from_fn(guard_requests))` — so it wraps
 /// every route, every other middleware, and the fallback. See the
 /// [module docs](self) for what it logs and why a contained panic needs
-/// `panic = "unwind"`.
-pub async fn guard_requests(mut request: Request, next: Next) -> Response {
+/// `panic = "unwind"`. The slow-request threshold is the environment's,
+/// [`slow_request_threshold`]; [`guard_requests_with_threshold`] takes one
+/// from the caller instead.
+pub async fn guard_requests(request: Request, next: Next) -> Response {
+    guard_requests_with_threshold(slow_request_threshold(), request, next).await
+}
+
+/// [`guard_requests`] under an explicit slow-request threshold, `None` for no
+/// slow-request warning.
+///
+/// For a server that keeps its configuration somewhere other than the
+/// environment:
+/// `router.layer(from_fn(move |req, next| guard_requests_with_threshold(threshold, req, next)))`.
+pub async fn guard_requests_with_threshold(
+    slow_threshold: Option<Duration>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let request_id = RequestId::from_headers(request.headers());
     request.extensions_mut().insert(request_id.clone());
     let in_flight = InFlight::start(
         request_id.clone(),
         request.method().clone(),
         route_template(&request),
+        slow_threshold,
     );
 
     // Every event the handler logs carries the id through this span.
@@ -321,7 +419,7 @@ pub async fn enforce_deadline(deadline: Duration, request: Request, next: Next) 
         request_id = request_id.as_ref().map_or("unassigned", RequestId::as_str),
         method = %method,
         path = %path,
-        deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        deadline_ms = duration_ms(deadline),
         "request outlived its deadline; answering 504"
     );
     failure_response(

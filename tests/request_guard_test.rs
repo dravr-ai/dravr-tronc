@@ -32,7 +32,8 @@ use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
 use dravr_tronc::mcp::transport::http::{mcp_router, serve};
 use dravr_tronc::server::request_guard::{
-    enforce_deadline, guard_requests, RequestId, HANDLER_PANIC, MAX_REQUEST_ID_LEN,
+    enforce_deadline, guard_requests, guard_requests_with_threshold, parse_slow_request_threshold,
+    RequestId, DEFAULT_SLOW_REQUEST_THRESHOLD, HANDLER_PANIC, MAX_REQUEST_ID_LEN,
     REQUEST_ID_HEADER, REQUEST_TIMEOUT,
 };
 use http_body_util::BodyExt;
@@ -547,6 +548,113 @@ async fn a_request_dropped_before_its_response_is_logged() {
         !logs.contains("request completed"),
         "a request that never answered is not logged as completed: {logs}"
     );
+}
+
+// ============================================================================
+// Slow-request warning
+// ============================================================================
+
+/// A request that ran past the threshold completes with one WARN line naming
+/// the threshold, instead of the INFO line.
+#[tokio::test]
+async fn a_request_past_the_slow_threshold_completes_at_warn() {
+    let (logs, _subscriber) = capture_logs();
+    let threshold = Some(Duration::from_millis(20));
+    let app = Router::new()
+        .route(
+            "/api/report",
+            get(|| async {
+                time::sleep(Duration::from_millis(40)).await;
+                "done"
+            }),
+        )
+        .layer(from_fn(move |req, next| {
+            guard_requests_with_threshold(threshold, req, next)
+        }));
+
+    let response = app
+        .oneshot(
+            Request::get("/api/report")
+                .header(REQUEST_ID_HEADER, "slow-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let logs = logs.text();
+    let slow = logs
+        .lines()
+        .find(|line| line.contains("slow request completed"))
+        .unwrap_or_else(|| panic!("the slow request is logged: {logs}"));
+    assert!(slow.contains(" WARN "), "{slow}");
+    assert!(slow.contains("request_id=slow-1"), "{slow}");
+    assert!(slow.contains("path=/api/report"), "{slow}");
+    assert!(slow.contains("status=200"), "{slow}");
+    assert!(slow.contains("threshold_ms=20"), "{slow}");
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("request completed"))
+            .count(),
+        1,
+        "one completion line per request: {logs}"
+    );
+}
+
+/// Under the threshold, or with the warning off, the completion stays INFO.
+#[tokio::test]
+async fn a_fast_request_or_a_disabled_threshold_completes_at_info() {
+    for threshold in [Some(Duration::from_secs(60)), None] {
+        let (logs, _subscriber) = capture_logs();
+        let app = Router::new()
+            .route(
+                "/api/report",
+                get(|| async {
+                    time::sleep(Duration::from_millis(5)).await;
+                    "done"
+                }),
+            )
+            .layer(from_fn(move |req, next| {
+                guard_requests_with_threshold(threshold, req, next)
+            }));
+
+        let response = app
+            .oneshot(Request::get("/api/report").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let logs = logs.text();
+        let completion = logs
+            .lines()
+            .find(|line| line.contains("request completed"))
+            .unwrap_or_else(|| panic!("one completion line per request: {logs}"));
+        assert!(completion.contains(" INFO "), "{threshold:?}: {completion}");
+        assert!(!logs.contains(" WARN "), "{threshold:?}: {logs}");
+    }
+}
+
+/// The environment value is milliseconds; `0` turns the warning off, and an
+/// unset, empty or unreadable value keeps the default rather than disarming it.
+#[test]
+fn the_slow_threshold_is_read_as_milliseconds_with_zero_for_off() {
+    assert_eq!(
+        parse_slow_request_threshold(Some("2500")),
+        Some(Duration::from_millis(2500))
+    );
+    assert_eq!(
+        parse_slow_request_threshold(Some(" 750 ")),
+        Some(Duration::from_millis(750))
+    );
+    assert_eq!(parse_slow_request_threshold(Some("0")), None);
+    for kept in [None, Some(""), Some("ten seconds"), Some("-5")] {
+        assert_eq!(
+            parse_slow_request_threshold(kept),
+            Some(DEFAULT_SLOW_REQUEST_THRESHOLD),
+            "{kept:?}"
+        );
+    }
 }
 
 // ============================================================================
