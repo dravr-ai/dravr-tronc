@@ -76,7 +76,7 @@ where
     let session = Session::connection();
     let pending = Arc::new(PendingRequests::new());
     let connection = ClientConnection::new(
-        outbound.clone(),
+        Some(outbound.clone()),
         Arc::clone(&pending),
         Some(Arc::clone(&session)),
         &caller,

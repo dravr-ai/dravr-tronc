@@ -264,8 +264,8 @@ pub async fn shutdown_signal() {
 ///
 /// Enforces the `Origin` allowlist (403) and, when the server names one, the
 /// `Host` allowlist (403; see [`McpServer::with_allowed_hosts`]), refuses a body not declared
-/// `application/json` (415), a body over the size limit (413), and a client that does not accept both
-/// `application/json` and `text/event-stream` (406), refuses a body that is
+/// `application/json` (415), a body over the size limit (413), and a client whose `Accept`
+/// admits neither `application/json` nor `text/event-stream` (406), refuses a body that is
 /// not a JSON-RPC message (400), refuses an unsupported `MCP-Protocol-Version`
 /// (400, -32022) and a modern body sent without one (400, -32020), resolves the
 /// request's `Mcp-Session-Id` on a server that keeps sessions (404 for one that
@@ -274,12 +274,17 @@ pub async fn shutdown_signal() {
 /// spent budget; 500 when the host failed to decide), then dispatches under
 /// the resolved per-call context.
 ///
-/// A request's response is rendered as JSON or a single SSE event, whichever
-/// the client's `Accept` weighs higher — unless the call talks to its client
-/// before it answers (progress, log messages, a request of its own; see
-/// [`ClientChannel`]): then the
-/// answer is an event stream carrying each of those as an event, and the
-/// response last. An accepted notification is answered 202 Accepted with no
+/// The answer follows the client's `Accept` (RFC 9110 §12.5.1), where no
+/// `Accept` at all means `*/*`. A single response is JSON unless the client
+/// weighs `text/event-stream` strictly higher; a tie, `*/*` and a missing
+/// header all get JSON. A call that talks to its client before it answers
+/// (progress, log messages, a request of its own; see [`ClientChannel`]) is
+/// answered as an event stream carrying each of those as an event and the
+/// response last, whenever the client accepts `text/event-stream` at all. One
+/// that accepts only JSON gets the single JSON response: the call's
+/// notifications are dropped and its requests fail with
+/// [`ClientRequestError::NoEventStream`](crate::mcp::client_channel::ClientRequestError::NoEventStream).
+/// An accepted notification is answered 202 Accepted with no
 /// body, and so is a client's response to a server request, which is routed
 /// to the call waiting for it when it comes from the caller (and session) the
 /// request was sent to.
@@ -302,7 +307,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
     // it is parsed: a browser sends `text/plain` and form bodies cross-origin
     // without a CORS preflight, so admitting them would let a page reach the
     // tools without the CORS policy ever being consulted. And the client must
-    // accept both answers this endpoint may give.
+    // accept one of the two answers this endpoint gives.
     if !is_json_content_type(&headers) {
         return transport_refusal(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -310,13 +315,13 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
             "Unsupported Media Type: Content-Type must be application/json",
         );
     }
-    if !accepts_json_and_event_stream(&headers) {
+    let Some(rendering) = Rendering::negotiate(&headers) else {
         return transport_refusal(
             StatusCode::NOT_ACCEPTABLE,
             INVALID_REQUEST,
-            "Not Acceptable: Accept must list application/json and text/event-stream",
+            "Not Acceptable: Accept must admit application/json or text/event-stream",
         );
-    }
+    };
 
     // 3. Read the body. One over the limit is a 413, one that is not UTF-8
     // cannot be JSON; neither reached the parser, so neither has an id.
@@ -346,7 +351,7 @@ pub async fn handle_mcp_post<S: Send + Sync + ?Sized + 'static>(
         }
         Err(refusal) => return (StatusCode::BAD_REQUEST, Json(*refusal)).into_response(),
     };
-    serve_request(server, &headers, request).await
+    serve_request(server, &headers, request, rendering).await
 }
 
 /// The `Origin` gate and, when the server names a host list, the `Host` gate:
@@ -408,6 +413,7 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     headers: &HeaderMap,
     mut request: JsonRpcRequest,
+    rendering: Rendering,
 ) -> Response {
     // 4. Populate transport-derived fields for the auth hook. The credential
     // comes from the `Authorization` header only; `parse` never reads one out
@@ -487,19 +493,19 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
     };
 
     // 7. Dispatch under the resolved context, connected to the client through
-    // the call's own answer.
+    // the call's own answer when that may be an event stream.
     let ctx = match &session {
         Some(session) => ctx.with_cancellation(session.cancellation().clone()),
         None => ctx,
     };
     let (outbound, outbox) = mpsc::unbounded_channel();
+    let outbound = rendering.may_stream.then_some(outbound);
     let connection = server.http_client_connection(outbound, session.clone(), &ctx);
     let ctx = ToolContext {
         client: ClientChannel::connected(connection),
         ..ctx
     };
     let serving = session.as_ref().map(Session::enter);
-    let prefers_sse = prefers_event_stream(headers);
 
     if initialize {
         // A handshake runs no tool and sends nothing before its answer, which
@@ -519,14 +525,14 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
             }
             _ => None,
         };
-        let mut rendered = render_response(response, modern, prefers_sse);
+        let mut rendered = render_response(response, modern, rendering);
         if let Some(id) = minted.and_then(|id| HeaderValue::from_str(&id).ok()) {
             rendered.headers_mut().insert(MCP_SESSION_ID_HEADER, id);
         }
         return rendered;
     }
 
-    answer_call(server, request, ctx, outbox, modern, prefers_sse, serving).await
+    answer_call(server, request, ctx, outbox, modern, rendering, serving).await
 }
 
 /// The live session a request's `Mcp-Session-Id` names, `None` when it names
@@ -595,8 +601,12 @@ fn session_not_found(id: Option<Value>) -> Response {
 
 /// A dispatched request's single answer: 202 with no body when there is none
 /// (a notification, or a request the client cancelled), else the response
-/// under its status, as JSON or one SSE event, whichever the client prefers.
-fn render_response(response: Option<JsonRpcResponse>, modern: bool, prefers_sse: bool) -> Response {
+/// under its status, as JSON or one SSE event as `rendering` says.
+fn render_response(
+    response: Option<JsonRpcResponse>,
+    modern: bool,
+    rendering: Rendering,
+) -> Response {
     let Some(response) = response else {
         // An accepted notification: Streamable HTTP requires 202 Accepted with
         // no body (basic/transports §Sending Messages to the Server).
@@ -606,13 +616,12 @@ fn render_response(response: Option<JsonRpcResponse>, modern: bool, prefers_sse:
     debug!(method = "mcp", "Handled HTTP MCP request");
 
     // A modern refusal carries its HTTP status; anything else is a 200
-    // rendered as JSON or a single SSE event, whichever the client weighs
-    // higher (a tie is answered as an event stream).
+    // rendered as JSON unless the client weighs an event stream higher.
     let status = response_status(&response, modern);
     if status != StatusCode::OK {
         return (status, Json(response)).into_response();
     }
-    if prefers_sse {
+    if rendering.single_as_event {
         respond_sse(&response)
     } else {
         Json(response).into_response()
@@ -624,7 +633,8 @@ type Dispatch = Pin<Box<dyn Future<Output = Option<JsonRpcResponse>> + Send>>;
 
 /// Dispatch `request` and answer it: as [`render_response`] when the call
 /// sent its client nothing first, else as an event stream of what it sent,
-/// the response last.
+/// the response last. A call whose client accepts no event stream has
+/// nothing to send it on, so it always takes the first way.
 ///
 /// The choice is made by whichever comes first, the response or a message.
 /// Once streaming, the call is polled by the stream itself, so a client that
@@ -637,7 +647,7 @@ async fn answer_call<S: Send + Sync + ?Sized + 'static>(
     ctx: ToolContext,
     mut outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
     modern: bool,
-    prefers_sse: bool,
+    rendering: Rendering,
     serving: Option<SessionUse>,
 ) -> Response {
     let id = request.id.clone();
@@ -650,7 +660,7 @@ async fn answer_call<S: Send + Sync + ?Sized + 'static>(
             let sent = drain(&mut outbox);
             if sent.is_empty() {
                 drop(serving);
-                return render_response(response, modern, prefers_sse);
+                return render_response(response, modern, rendering);
             }
             let stream = CallStream {
                 phase: Phase::Draining(response),
@@ -1042,8 +1052,15 @@ impl MediaRange<'_> {
 }
 
 /// The media ranges of the request's `Accept` header (RFC 9110 §12.5.1). A
-/// range without a readable `q` weighs 1; an unreadable header lists none.
+/// range without a readable `q` weighs 1; an unreadable header lists none,
+/// and no header at all is `*/*`.
 fn accept_ranges(headers: &HeaderMap) -> Vec<MediaRange<'_>> {
+    if !headers.contains_key(header::ACCEPT) {
+        return vec![MediaRange {
+            media: "*/*",
+            quality: 1.0,
+        }];
+    }
     headers
         .get_all(header::ACCEPT)
         .iter()
@@ -1075,20 +1092,34 @@ fn accept_weight(ranges: &[MediaRange<'_>], media: &str) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// Whether the client accepts both answers a POST may get — the Streamable
-/// HTTP rule that its `Accept` list `application/json` and
-/// `text/event-stream`. A range weighted `q=0` refuses its type.
-fn accepts_json_and_event_stream(headers: &HeaderMap) -> bool {
-    let ranges = accept_ranges(headers);
-    accept_weight(&ranges, APPLICATION_JSON) > 0.0
-        && accept_weight(&ranges, TEXT_EVENT_STREAM) > 0.0
+/// How a `POST /mcp` may be answered, as the client's `Accept` weighs the
+/// two renderings this endpoint has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rendering {
+    /// A single response goes out as one SSE event instead of JSON: the
+    /// client weighs `text/event-stream` strictly above `application/json`.
+    single_as_event: bool,
+    /// The call may answer as an event stream carrying what it sends its
+    /// client first: the client accepts `text/event-stream` at all.
+    may_stream: bool,
 }
 
-/// Whether to answer as an event stream: the client weighs it at least as
-/// high as JSON.
-fn prefers_event_stream(headers: &HeaderMap) -> bool {
-    let ranges = accept_ranges(headers);
-    accept_weight(&ranges, TEXT_EVENT_STREAM) >= accept_weight(&ranges, APPLICATION_JSON)
+impl Rendering {
+    /// Read the request's `Accept`; `None` when it admits neither rendering —
+    /// every range covering one weighted `q=0`, or none covering either.
+    ///
+    /// JSON wins a tie, so a client sending `*/*`, both types unweighted, or
+    /// no `Accept` at all gets a single response as JSON, and still gets an
+    /// event stream for a call that talks to it before answering.
+    fn negotiate(headers: &HeaderMap) -> Option<Self> {
+        let ranges = accept_ranges(headers);
+        let json = accept_weight(&ranges, APPLICATION_JSON);
+        let event_stream = accept_weight(&ranges, TEXT_EVENT_STREAM);
+        (json > 0.0 || event_stream > 0.0).then_some(Self {
+            single_as_event: event_stream > json,
+            may_stream: event_stream > 0.0,
+        })
+    }
 }
 
 /// Whether a request with these `headers` passes the `allowed` `Origin` list —
@@ -1358,8 +1389,8 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    /// What a conforming client sends, weighted so the answer is plain JSON.
-    const TEST_ACCEPT: &str = "application/json, text/event-stream;q=0.5";
+    /// What a conforming client sends; a single response is JSON on the tie.
+    const TEST_ACCEPT: &str = "application/json, text/event-stream";
 
     struct TestState;
 
@@ -1942,7 +1973,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
+            .header("accept", "application/json;q=0.9, text/event-stream")
             .body(body.to_owned())
             .expect("request"); // Safe: test assertion
 
@@ -2015,46 +2046,92 @@ mod tests {
         }
     }
 
-    /// A client that does not accept both answers this endpoint may give is
+    /// Only an `Accept` admitting neither answer this endpoint gives is
     /// refused with 406.
     #[tokio::test]
-    async fn an_accept_missing_either_type_is_refused_with_406() {
+    async fn an_accept_admitting_neither_type_is_refused_with_406() {
         for accept in [
-            None,
-            Some("application/json"),
-            Some("text/event-stream"),
-            Some("text/html"),
-            Some("application/json, text/event-stream;q=0"),
-            Some("*/*;q=0"),
+            "text/html",
+            "image/*",
+            "application/json;q=0, text/event-stream;q=0",
+            "*/*;q=0",
+            "",
         ] {
-            let mut headers = vec![("content-type", APPLICATION_JSON)];
-            if let Some(accept) = accept {
-                headers.push(("accept", accept));
-            }
-            let (status, body) = post_raw(&headers).await;
+            let (status, body) =
+                post_raw(&[("content-type", APPLICATION_JSON), ("accept", accept)]).await;
             assert_eq!(status, StatusCode::NOT_ACCEPTABLE, "{accept:?}");
             let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
             assert_eq!(json["error"]["code"], INVALID_REQUEST);
         }
     }
 
-    /// Wildcards cover both types, and the higher weight picks the rendering;
-    /// a tie is answered as an event stream.
+    /// No `Accept` is `*/*` (RFC 9110 §12.5.1); either type alone is enough;
+    /// a single response is JSON unless the event stream weighs strictly
+    /// more, so a tie and every wildcard get JSON.
     #[tokio::test]
-    async fn accept_wildcards_pass_and_weights_pick_the_rendering() {
+    async fn accept_weights_pick_the_rendering_and_json_wins_a_tie() {
         for (accept, sse) in [
-            ("*/*", true),
-            ("application/*, text/*", true),
-            ("application/json, text/event-stream", true),
-            ("application/json;q=0.4, text/event-stream;q=0.9", true),
-            ("application/json, text/event-stream;q=0.5", false),
-            ("application/json, */*;q=0.1", false),
+            (None, false),
+            (Some("*/*"), false),
+            (Some("application/*, text/*"), false),
+            (Some("application/json, text/event-stream"), false),
+            (Some("application/json"), false),
+            (Some("application/json, text/event-stream;q=0.5"), false),
+            (Some("application/json, */*;q=0.1"), false),
+            (Some("text/event-stream"), true),
+            (
+                Some("application/json;q=0.4, text/event-stream;q=0.9"),
+                true,
+            ),
+            (Some("text/event-stream, application/json;q=0"), true),
         ] {
-            let (status, body) =
-                post_raw(&[("content-type", APPLICATION_JSON), ("accept", accept)]).await;
-            assert_eq!(status, StatusCode::OK, "{accept}");
-            assert_eq!(body.starts_with("data:"), sse, "{accept}: {body}");
+            let mut headers = vec![("content-type", APPLICATION_JSON)];
+            if let Some(accept) = accept {
+                headers.push(("accept", accept));
+            }
+            let (status, body) = post_raw(&headers).await;
+            assert_eq!(status, StatusCode::OK, "{accept:?}");
+            assert_eq!(body.starts_with("data:"), sse, "{accept:?}: {body}");
         }
+    }
+
+    #[test]
+    fn negotiation_streams_whenever_the_event_stream_is_admitted() {
+        let negotiate = |accept: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(accept) = accept {
+                headers.insert(
+                    header::ACCEPT,
+                    HeaderValue::from_str(accept).expect("a header value"), // Safe: test fixture
+                );
+            }
+            Rendering::negotiate(&headers)
+        };
+        let json_streaming = Some(Rendering {
+            single_as_event: false,
+            may_stream: true,
+        });
+        assert_eq!(negotiate(None), json_streaming);
+        assert_eq!(negotiate(Some("*/*")), json_streaming);
+        assert_eq!(
+            negotiate(Some("application/json, text/event-stream")),
+            json_streaming
+        );
+        assert_eq!(
+            negotiate(Some("application/json")),
+            Some(Rendering {
+                single_as_event: false,
+                may_stream: false,
+            })
+        );
+        assert_eq!(
+            negotiate(Some("application/json, text/event-stream;q=0")),
+            Some(Rendering {
+                single_as_event: false,
+                may_stream: false,
+            })
+        );
+        assert_eq!(negotiate(Some("text/plain")), None);
     }
 
     #[tokio::test]

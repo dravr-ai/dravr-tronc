@@ -235,9 +235,10 @@ async fn raw_sends_what_the_typed_calls_never_would() {
 
 #[tokio::test]
 async fn an_event_stream_answer_is_read_as_its_event() {
-    // The client accepts both renderings, as Streamable HTTP requires, so
-    // the server answers this one as SSE.
+    // An `Accept` set on the client replaces its own; this one weighs the
+    // event stream higher, so the server answers a single response as SSE.
     let answer = client()
+        .with_header("accept", "text/event-stream, application/json;q=0.5")
         .raw(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#)
         .await
         .expect("an answer");

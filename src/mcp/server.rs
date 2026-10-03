@@ -481,12 +481,12 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     }
 
     /// The connection a call over HTTP reaches its client through: messages
-    /// go out on `outbound` (the call's event stream), answers come back
-    /// through this server's pending table, and `session` is the one the
-    /// request runs in.
+    /// go out on `outbound` (the call's event stream; none when the client
+    /// accepts no event stream), answers come back through this server's
+    /// pending table, and `session` is the one the request runs in.
     pub(crate) fn http_client_connection(
         &self,
-        outbound: mpsc::UnboundedSender<JsonRpcMessage>,
+        outbound: Option<mpsc::UnboundedSender<JsonRpcMessage>>,
         session: Option<Arc<Session>>,
         ctx: &ToolContext,
     ) -> ClientConnection {

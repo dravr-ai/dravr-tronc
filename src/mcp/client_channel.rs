@@ -36,6 +36,12 @@
 //!   [`CallToolOutcome::InputRequired`](crate::mcp::host::CallToolOutcome::InputRequired)
 //!   instead.
 //!
+//! A call answered over Streamable HTTP reaches its client only when the
+//! client's `Accept` admits `text/event-stream`, since the event stream is
+//! what carries those messages ahead of the response. A client accepting only
+//! `application/json` gets the one JSON response: the call's notifications are
+//! dropped and its requests fail with [`ClientRequestError::NoEventStream`].
+//!
 //! A notification that may not be sent is dropped silently — progress and
 //! logs are advisory — while a request that may not be sent fails with a
 //! [`ClientRequestError`] saying why.
@@ -93,6 +99,10 @@ pub enum ClientRequestError {
         /// The capability, as the client would declare it.
         capability: &'static str,
     },
+    /// The call is answered over Streamable HTTP to a client whose `Accept`
+    /// admits no `text/event-stream`, so its one JSON response is all the
+    /// client reads: nothing can reach it before that.
+    NoEventStream,
     /// The call was cancelled while it waited.
     Cancelled,
     /// The client did not answer in time.
@@ -120,6 +130,9 @@ impl fmt::Display for ClientRequestError {
                 "the client did not declare the '{capability}' capability on a session this \
                  server holds"
             ),
+            Self::NoEventStream => f.write_str(
+                "the client accepts no event stream on this call, which a request to it travels on",
+            ),
             Self::Cancelled => f.write_str("the call was cancelled while waiting for the client"),
             Self::TimedOut(after) => write!(f, "the client did not answer within {after:?}"),
             Self::Disconnected => f.write_str("the connection closed before the client answered"),
@@ -141,6 +154,7 @@ impl StdError for ClientRequestError {
             Self::NoConnection
             | Self::StatelessRevision
             | Self::CapabilityNotDeclared { .. }
+            | Self::NoEventStream
             | Self::Cancelled
             | Self::TimedOut(_)
             | Self::Disconnected
@@ -242,7 +256,9 @@ impl PendingRequests {
 /// answers come back, and the session the call runs in.
 #[derive(Clone)]
 pub(crate) struct ClientConnection {
-    outbound: mpsc::UnboundedSender<JsonRpcMessage>,
+    /// `None` when nothing reaches the client before the call's response: an
+    /// HTTP client whose `Accept` admits no event stream.
+    outbound: Option<mpsc::UnboundedSender<JsonRpcMessage>>,
     pending: Arc<PendingRequests>,
     session: Option<Arc<Session>>,
     caller: CallerKey,
@@ -250,10 +266,11 @@ pub(crate) struct ClientConnection {
 }
 
 impl ClientConnection {
-    /// A connection sending on `outbound`, awaiting answers in `pending`, for
-    /// the caller `ctx` in `session`.
+    /// A connection sending on `outbound` (none: nothing reaches the client
+    /// before the response), awaiting answers in `pending`, for the caller
+    /// `ctx` in `session`.
     pub(crate) fn new(
-        outbound: mpsc::UnboundedSender<JsonRpcMessage>,
+        outbound: Option<mpsc::UnboundedSender<JsonRpcMessage>>,
         pending: Arc<PendingRequests>,
         session: Option<Arc<Session>>,
         ctx: &ToolContext,
@@ -270,7 +287,14 @@ impl ClientConnection {
     }
 
     fn send(&self, message: JsonRpcRequest) -> bool {
-        self.outbound.send(JsonRpcMessage::Request(message)).is_ok()
+        self.outbound
+            .as_ref()
+            .is_some_and(|outbound| outbound.send(JsonRpcMessage::Request(message)).is_ok())
+    }
+
+    /// Whether anything sent before the call's response reaches the client.
+    const fn reaches_client(&self) -> bool {
+        self.outbound.is_some()
     }
 }
 
@@ -441,7 +465,10 @@ impl ClientChannel {
     /// data no one will read.
     #[must_use]
     pub fn wants_log(&self, level: LogLevel) -> bool {
-        self.connection.is_some() && self.log_level().is_some_and(|minimum| level >= minimum)
+        self.connection
+            .as_ref()
+            .is_some_and(ClientConnection::reaches_client)
+            && self.log_level().is_some_and(|minimum| level >= minimum)
     }
 
     /// Send a log message at `level`, from the logger named `logger` when
@@ -517,6 +544,9 @@ impl ClientChannel {
             return Err(ClientRequestError::CapabilityNotDeclared {
                 capability: needs.capability(),
             });
+        }
+        if !connection.reaches_client() {
+            return Err(ClientRequestError::NoEventStream);
         }
 
         let params = serde_json::to_value(params)
@@ -654,7 +684,7 @@ mod tests {
         let session = Session::connection();
         session.record_capabilities(capabilities);
         let connection = ClientConnection::new(
-            outbound,
+            Some(outbound),
             Arc::clone(&pending),
             Some(session),
             &ctx,
@@ -731,7 +761,7 @@ mod tests {
         let (outbound, mut inbox) = mpsc::unbounded_channel();
         let ctx = ToolContext::default();
         let connection = ClientConnection::new(
-            outbound,
+            Some(outbound),
             Arc::new(PendingRequests::new()),
             None,
             &ctx,
@@ -760,7 +790,7 @@ mod tests {
         let (outbound, mut inbox) = mpsc::unbounded_channel();
         let ctx = ToolContext::default();
         let connection = ClientConnection::new(
-            outbound,
+            Some(outbound),
             Arc::new(PendingRequests::new()),
             None,
             &ctx,
@@ -852,7 +882,7 @@ mod tests {
         let session = Session::connection();
         session.record_capabilities(Some(&json!({ "sampling": {} })));
         let connection = ClientConnection::new(
-            outbound,
+            Some(outbound),
             Arc::clone(&pending),
             Some(session),
             &ctx,
@@ -904,7 +934,7 @@ mod tests {
         let session = Session::connection();
         session.record_capabilities(Some(&json!({ "sampling": {} })));
         let connection = ClientConnection::new(
-            outbound,
+            Some(outbound),
             Arc::new(PendingRequests::new()),
             Some(session),
             &ctx,

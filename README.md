@@ -99,9 +99,12 @@ gracefully on SIGINT or SIGTERM, answering every request in flight first;
 
 What `POST /mcp` requires of a client (Streamable HTTP, revision 2026-07-28):
 
-- `Content-Type: application/json` (else 415) and an `Accept` listing both `application/json` and
-  `text/event-stream` (else 406); a body over `McpServer::max_request_bytes` (4 MiB by default) is
-  a 413.
+- `Content-Type: application/json` (else 415); a body over `McpServer::max_request_bytes` (4 MiB
+  by default) is a 413.
+- An `Accept` admitting `application/json` or `text/event-stream` (else 406). No `Accept` at all is
+  `*/*` (RFC 9110 §12.5.1), so `curl`, reqwest and k6 defaults are served. A single response is
+  JSON unless `text/event-stream` weighs strictly more; a tie, `*/*` and a missing header get
+  JSON.
 - `MCP-Protocol-Version` on every modern request, naming the revision its `_meta` names; a request
   with neither is an `initialize`-era one.
 - The SEP-2243 mirrors: `Mcp-Method` on every modern request, `Mcp-Name` on `tools/call`,
@@ -115,8 +118,11 @@ on a server that declares the `logging` capability, at or above the level the cl
 (`logging/setLevel` on its session, or the `io.modelcontextprotocol/logLevel` `_meta` key) and
 never when it asked for none; `create_message` and `elicit` (form mode, SEP-1034 defaults, the five
 SEP-1330 enum shapes) ask the client and wait for its answer. A call that sends anything before its
-response is answered with an event stream — each message an event, the response last — and the
-client POSTs its answer to a server request back to `/mcp` (202). A server request goes only to an
+response is answered with an event stream — each message an event, the response last — whenever
+the client's `Accept` admits `text/event-stream` (explicitly, through `*/*`, or by sending none),
+and the client POSTs its answer to a server request back to `/mcp` (202). A client accepting only
+`application/json` gets the one JSON response: the call's progress and logs are dropped, and a
+server request fails with `ClientRequestError::NoEventStream`. A server request goes only to an
 `initialize`-era client that declared the capability, and fails with a typed `ClientRequestError`
 otherwise; revision 2026-07-28 carries none inside a call, so a tool there answers
 `CallToolOutcome::InputRequired`. Over stdio all of this is interleaved on the one connection.

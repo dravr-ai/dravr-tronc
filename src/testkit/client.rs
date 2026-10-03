@@ -30,8 +30,10 @@ use crate::mcp::transport::mirror::{
 /// The `clientInfo.name` the test client introduces itself with.
 pub const TESTKIT_CLIENT_NAME: &str = "dravr-tronc-testkit";
 
-/// What a Streamable HTTP client accepts: both renderings, as the transport
-/// requires a client to declare.
+/// What a Streamable HTTP client accepts: both renderings, unweighted, as the
+/// specification has a client declare. The server answers a single response
+/// as JSON on that tie, and a call that talks to its client first as an
+/// event stream.
 const ACCEPT_JSON_AND_SSE: &str = "application/json, text/event-stream";
 
 /// What answers a request the server sends the client mid-call: given its
@@ -174,7 +176,8 @@ impl McpTestClient {
         self
     }
 
-    /// Send this header on every request.
+    /// Send this header on every request. An `Accept` set here replaces the
+    /// client's own, which lists both renderings unweighted.
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
@@ -499,13 +502,17 @@ impl McpTestClient {
 
     /// The headers every request carries, in order.
     fn request_headers(&self) -> Vec<(String, String)> {
-        let mut headers = vec![
-            (
-                CONTENT_TYPE.as_str().to_owned(),
-                "application/json".to_owned(),
-            ),
-            (ACCEPT.as_str().to_owned(), ACCEPT_JSON_AND_SSE.to_owned()),
-        ];
+        let mut headers = vec![(
+            CONTENT_TYPE.as_str().to_owned(),
+            "application/json".to_owned(),
+        )];
+        let own_accept = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(ACCEPT.as_str()));
+        if !own_accept {
+            headers.push((ACCEPT.as_str().to_owned(), ACCEPT_JSON_AND_SSE.to_owned()));
+        }
         if let Some(token) = &self.bearer {
             headers.push((AUTHORIZATION.as_str().to_owned(), format!("Bearer {token}")));
         }

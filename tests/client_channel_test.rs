@@ -723,3 +723,75 @@ async fn the_session_store_is_bounded_per_caller_and_in_total() {
     assert_eq!(refused.json().unwrap()["id"], 7);
     assert!(again.result("ping", None).await.is_ok());
 }
+
+/// A client accepting only JSON gets one JSON response for a call that talks
+/// to its client first: the call's notifications are dropped, and its request
+/// fails with the typed error naming why.
+#[tokio::test]
+async fn a_client_accepting_only_json_gets_one_json_response() {
+    let client = answering_client(sessionful()).with_header("accept", "application/json");
+    client.initialize().await.unwrap();
+    client
+        .result("logging/setLevel", Some(json!({ "level": "debug" })))
+        .await
+        .unwrap();
+
+    for name in ["progress", "logs"] {
+        let answered = client
+            .exchange(
+                "tools/call",
+                Some(call_params(name, &json!({ "progressToken": "p-1" }))),
+            )
+            .await
+            .unwrap();
+        assert!(
+            answered.messages.is_empty(),
+            "{name}: {:?}",
+            answered.messages
+        );
+        assert!(answered.response.result.is_some(), "{name}");
+    }
+
+    let asked = client.call_tool("ask", json!({})).await.unwrap();
+    assert_tool_error(&asked, &ClientRequestError::NoEventStream.to_string());
+}
+
+/// No `Accept` is `*/*`: a single response is JSON, and a call that talks to
+/// its client first is still answered as the event stream it needs.
+#[tokio::test]
+async fn a_client_sending_no_accept_is_served() {
+    let server = McpTestServer::start(Arc::new(sessionless())).await.unwrap();
+    let post = |body: Value| {
+        reqwest::Client::new()
+            .post(server.url())
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+    };
+
+    let ping = post(json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+        .await
+        .unwrap();
+    assert_eq!(ping.status(), 200);
+    assert!(ping.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+
+    let streamed = post(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                "params": call_params("progress", &json!({ "progressToken": "p" })) }))
+    .await
+    .unwrap();
+    assert_eq!(streamed.status(), 200);
+    assert!(streamed.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let events = streamed.text().await.unwrap();
+    assert_eq!(
+        events.matches("notifications/progress").count(),
+        3,
+        "{events}"
+    );
+    assert!(events.contains("\"id\":2"), "{events}");
+}
