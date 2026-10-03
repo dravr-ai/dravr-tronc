@@ -112,9 +112,10 @@ where
 
 /// Initialize tracing with the error notification layer enabled
 ///
-/// Same as [`init`] but adds an [`ErrorNotificationLayer`] that captures
-/// ERROR-level events and dispatches them to Slack and/or email based on
-/// environment configuration.
+/// Same as [`init`] — including the OTLP layer when the `otel` feature is on
+/// and `OTEL_EXPORTER_OTLP_ENDPOINT` is set — but adds an
+/// [`ErrorNotificationLayer`] that captures ERROR-level events and dispatches
+/// them to Slack and/or email based on environment configuration.
 ///
 /// Call this instead of [`init`] when you want automatic error alerting.
 ///
@@ -134,28 +135,21 @@ pub fn init_with_notifications(transport: &str) {
     let has_channels = slack.is_some() || email.is_some();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let error_layer = has_channels.then(|| ErrorNotificationLayer::new(config, slack, email));
 
     if transport == "stdio" {
         let registry = tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_writer(io::stderr));
-
-        if has_channels {
-            let error_layer = ErrorNotificationLayer::new(config, slack, email);
-            registry.with(error_layer).init();
-        } else {
-            registry.init();
-        }
+        #[cfg(feature = "otel")]
+        let registry = registry.with(build_otel_layer());
+        registry.with(error_layer).init();
     } else {
         let registry = tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer());
-
-        if has_channels {
-            let error_layer = ErrorNotificationLayer::new(config, slack, email);
-            registry.with(error_layer).init();
-        } else {
-            registry.init();
-        }
+        #[cfg(feature = "otel")]
+        let registry = registry.with(build_otel_layer());
+        registry.with(error_layer).init();
     }
 }
