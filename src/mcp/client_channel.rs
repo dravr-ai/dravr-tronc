@@ -63,7 +63,7 @@ use crate::mcp::random_id::random_hex_id;
 use crate::mcp::schema::{
     CreateMessageRequest, CreateMessageResult, ProgressNotification, ProgressToken,
 };
-use crate::mcp::session::Session;
+use crate::mcp::session::{DeclaredCapabilities, Session};
 use crate::mcp::tool::ToolContext;
 
 /// `sampling/createMessage`: the server asks the client's model for a message.
@@ -332,19 +332,11 @@ impl Needs {
         }
     }
 
-    /// Whether `capabilities`, as declared in `initialize`, covers it.
-    ///
-    /// Form elicitation is declared as `elicitation: {}` — what every client
-    /// before URL mode sends — or with a `form` member.
-    fn declared_in(self, capabilities: &Value) -> bool {
+    /// Whether what the client declared in `initialize` covers it.
+    const fn declared_in(self, declared: DeclaredCapabilities) -> bool {
         match self {
-            Self::Sampling => capabilities.get("sampling").is_some_and(Value::is_object),
-            Self::FormElicitation => capabilities
-                .get("elicitation")
-                .and_then(Value::as_object)
-                .is_some_and(|elicitation| {
-                    elicitation.is_empty() || elicitation.contains_key("form")
-                }),
+            Self::Sampling => declared.sampling,
+            Self::FormElicitation => declared.form_elicitation,
         }
     }
 }
@@ -520,8 +512,7 @@ impl ClientChannel {
         let declared = connection
             .session
             .as_ref()
-            .and_then(|session| session.capabilities())
-            .is_some_and(|capabilities| needs.declared_in(&capabilities));
+            .is_some_and(|session| needs.declared_in(session.capabilities()));
         if !declared {
             return Err(ClientRequestError::CapabilityNotDeclared {
                 capability: needs.capability(),
@@ -650,7 +641,7 @@ mod tests {
     /// A legacy-era channel over a fresh connection whose session declared
     /// `capabilities`, and the receiving end of what it sends.
     fn legacy_channel(
-        capabilities: Option<Value>,
+        capabilities: Option<&Value>,
         progress_token: Option<ProgressToken>,
     ) -> (
         ClientChannel,
@@ -793,7 +784,7 @@ mod tests {
             Err(ClientRequestError::NoConnection)
         ));
 
-        let (channel, mut inbox, _) = legacy_channel(Some(json!({ "elicitation": {} })), None);
+        let (channel, mut inbox, _) = legacy_channel(Some(&json!({ "elicitation": {} })), None);
         assert!(matches!(
             channel.create_message(&sampling_request()).await,
             Err(ClientRequestError::CapabilityNotDeclared {
@@ -802,7 +793,7 @@ mod tests {
         ));
         assert!(inbox.try_recv().is_err(), "a refused request is never sent");
 
-        let (url_only, _, _) = legacy_channel(Some(json!({ "elicitation": { "url": {} } })), None);
+        let (url_only, _, _) = legacy_channel(Some(&json!({ "elicitation": { "url": {} } })), None);
         let form = ElicitRequest {
             message: "who?".to_owned(),
             requested_schema: ElicitationSchema::default(),
@@ -817,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_reaches_the_request_it_names() {
-        let (channel, mut inbox, pending) = legacy_channel(Some(json!({ "sampling": {} })), None);
+        let (channel, mut inbox, pending) = legacy_channel(Some(&json!({ "sampling": {} })), None);
         let call = tokio::spawn(async move { channel.create_message(&sampling_request()).await });
 
         let request = loop {
@@ -859,7 +850,7 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let ctx = ToolContext::default();
         let session = Session::connection();
-        session.record_capabilities(Some(json!({ "sampling": {} })));
+        session.record_capabilities(Some(&json!({ "sampling": {} })));
         let connection = ClientConnection::new(
             outbound,
             Arc::clone(&pending),
@@ -894,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_table_fails_the_waiting_request() {
-        let (channel, mut inbox, pending) = legacy_channel(Some(json!({ "sampling": {} })), None);
+        let (channel, mut inbox, pending) = legacy_channel(Some(&json!({ "sampling": {} })), None);
         let call = tokio::spawn(async move { channel.create_message(&sampling_request()).await });
         while inbox.try_recv().is_err() {
             yield_now().await;
@@ -911,7 +902,7 @@ mod tests {
         let (outbound, _inbox) = mpsc::unbounded_channel();
         let ctx = ToolContext::default();
         let session = Session::connection();
-        session.record_capabilities(Some(json!({ "sampling": {} })));
+        session.record_capabilities(Some(&json!({ "sampling": {} })));
         let connection = ClientConnection::new(
             outbound,
             Arc::new(PendingRequests::new()),

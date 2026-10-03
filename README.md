@@ -127,7 +127,11 @@ is a 404, `DELETE /mcp` ends one, and one idle for `ttl` expires. They carry wha
 `initialize`-era client declares once (capabilities, log level), which is what lets a tool sample,
 elicit or log to it over HTTP. They are off by default because they live in process memory: turn
 them on only where a client's requests all reach one instance. A request without the header is
-served sessionless either way, and the stateless 2026-07-28 era never uses one.
+served sessionless either way, and the stateless 2026-07-28 era never uses one. The store is
+bounded, since anyone reaching `initialize` starts a session: a session keeps the client's
+capabilities as flags, not the object it sent, and `with_http_session_limits(total, per_caller)`
+caps how many are held (10 000, and 1 000 per caller identity, by default). A caller at its limit
+gives up its least recently used idle session; a full server answers `initialize` with 503.
 
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same

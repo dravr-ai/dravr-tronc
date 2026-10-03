@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio::net::{lookup_host, TcpListener};
 use tokio::signal;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{
     HEADER_MISMATCH, INTERNAL_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND,
@@ -45,7 +45,7 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTECTED_RESOURCE};
 use crate::mcp::server::McpServer;
-use crate::mcp::session::{Session, SessionStore, SessionUse};
+use crate::mcp::session::{Session, SessionRefusal, SessionStore, SessionUse};
 use crate::mcp::tool::ToolContext;
 use crate::mcp::transport::mirror::{check_response_headers, check_standard_headers};
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
@@ -503,13 +503,18 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
 
     if initialize {
         // A handshake runs no tool and sends nothing before its answer, which
-        // carries the new session's id when it succeeded.
+        // carries the new session's id when it succeeded and the store had
+        // room for it.
+        let request_id = request.id.clone();
         let response = server.handle_request_with_context(request, &ctx).await;
         drop(serving);
         let minted = match (&sessions, session, &response) {
             (Some(store), Some(session), Some(answer)) if answer.is_success() => {
                 let id = session.id().map(str::to_owned);
-                store.insert(session);
+                if let Err(refusal) = store.insert(session) {
+                    warn!(%refusal, "Refused to start an HTTP session");
+                    return no_room_for_session(request_id, refusal);
+                }
                 id
             }
             _ => None,
@@ -556,6 +561,21 @@ fn named_session(
         .find(session_id)
         .map(Some)
         .ok_or_else(|| Box::new(session_not_found(id.cloned())))
+}
+
+/// The 503 of an `initialize` whose session the store has no room for: the
+/// handshake is not answered, since a session-keeping server's answer names
+/// the session the client goes on in.
+fn no_room_for_session(id: Option<Value>, refusal: SessionRefusal) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            refusal.to_string(),
+        )),
+    )
+        .into_response()
 }
 
 /// The 404 of a session id that is not live — expired, ended, never minted,

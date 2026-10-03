@@ -11,6 +11,7 @@
     clippy::str_to_string
 )]
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -678,4 +679,47 @@ async fn a_cancellation_reaches_only_the_requests_of_its_own_session() {
         !rest.contains("\"id\":2"),
         "a cancelled call is answered with nothing: {rest}"
     );
+}
+
+#[tokio::test]
+async fn the_session_store_is_bounded_per_caller_and_in_total() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let server = McpTestServer::start(Arc::new(
+        sessionful()
+            .with_http_session_limits(NonZeroUsize::new(2).unwrap(), one)
+            .with_auth_hook(Arc::new(BearerIsUser)),
+    ))
+    .await
+    .unwrap();
+
+    // A caller at its limit gives up its idle session for the new one.
+    let first = server.client().with_bearer("alice");
+    first.initialize().await.unwrap();
+    let again = server.client().with_bearer("alice");
+    again.initialize().await.unwrap();
+    assert!(again.result("ping", None).await.is_ok());
+    let evicted = first
+        .raw(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(evicted.status, 404, "told to initialize again");
+
+    // A full server ends no other caller's session to make room.
+    server
+        .client()
+        .with_bearer("bob")
+        .initialize()
+        .await
+        .unwrap();
+    let refused = server
+        .client()
+        .with_bearer("carol")
+        .raw(
+            r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status, 503, "{}", refused.body);
+    assert_eq!(refused.json().unwrap()["id"], 7);
+    assert!(again.result("ping", None).await.is_ok());
 }

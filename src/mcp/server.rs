@@ -38,7 +38,7 @@ use crate::mcp::resource_metadata::ProtectedResourceMetadata;
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
 };
-use crate::mcp::session::{Session, SessionStore};
+use crate::mcp::session::{Session, SessionLimits, SessionStore};
 use crate::mcp::tasks::{
     method_names as task_methods, CreateTaskResult, GetTaskResult, TaskAck, TaskError, TaskId,
     TaskManager, TaskOwner, TASKS_EXTENSION_ID,
@@ -76,6 +76,27 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// without their client being told its session is gone; short enough that an
 /// abandoned client's state does not accumulate.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_mins(30);
+
+/// The most HTTP sessions a server holds at once unless
+/// [`McpServer::with_http_session_limits`] says otherwise.
+///
+/// A session holds a few hundred bytes, so this bounds the store at a few
+/// megabytes while leaving room for ten thousand clients between requests.
+pub const DEFAULT_MAX_HTTP_SESSIONS: NonZeroUsize = match NonZeroUsize::new(10_000) {
+    Some(limit) => limit,
+    None => NonZeroUsize::MIN,
+};
+
+/// The most HTTP sessions one caller identity holds at once unless
+/// [`McpServer::with_http_session_limits`] says otherwise.
+///
+/// Every client the auth hook cannot tell apart is one caller — on a server
+/// without one, every client — so this is also how many anonymous clients
+/// keep a session between requests before the least recently used gives way.
+pub const DEFAULT_MAX_HTTP_SESSIONS_PER_CALLER: NonZeroUsize = match NonZeroUsize::new(1_000) {
+    Some(limit) => limit,
+    None => NonZeroUsize::MIN,
+};
 
 /// Source of the natural-language instructions a server advertises in
 /// `initialize` and `server/discover`.
@@ -132,6 +153,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     /// Server requests sent over HTTP awaiting the client's answering `POST`.
     pending: Arc<PendingRequests>,
     sessions: Option<Arc<SessionStore>>,
+    session_limits: SessionLimits,
     client_request_timeout: Duration,
 }
 
@@ -169,6 +191,10 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             payload_capture: PayloadCapturePolicy::disabled(),
             pending: Arc::new(PendingRequests::new()),
             sessions: None,
+            session_limits: SessionLimits {
+                total: DEFAULT_MAX_HTTP_SESSIONS,
+                per_caller: DEFAULT_MAX_HTTP_SESSIONS_PER_CALLER,
+            },
             client_request_timeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
         }
     }
@@ -403,9 +429,39 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// never initializes keeps working; and revision 2026-07-28, which has no
     /// sessions, is unaffected. stdio needs none of this: a connection is one
     /// session.
+    ///
+    /// Anyone who can reach `initialize` can start a session, so the store is
+    /// bounded ([`Self::with_http_session_limits`]): a caller at its own limit
+    /// gives up its least recently used idle session for the new one, and a
+    /// server holding its total limit answers `initialize` with 503 until one
+    /// ends or expires.
     #[must_use]
     pub fn with_http_sessions(mut self, ttl: Duration) -> Self {
-        self.sessions = Some(Arc::new(SessionStore::new(ttl)));
+        self.sessions = Some(Arc::new(SessionStore::new(ttl, self.session_limits)));
+        self
+    }
+
+    /// Hold at most `total` HTTP sessions at once, at most `per_caller` of
+    /// them for one caller identity ([`DEFAULT_MAX_HTTP_SESSIONS`] and
+    /// [`DEFAULT_MAX_HTTP_SESSIONS_PER_CALLER`] unless set). Takes effect with
+    /// [`Self::with_http_sessions`], before or after it.
+    ///
+    /// Every client the auth hook cannot tell apart counts as one caller, so
+    /// a server serving many anonymous clients raises `per_caller` to the
+    /// number it expects to hold a session at once.
+    #[must_use]
+    pub fn with_http_session_limits(
+        mut self,
+        total: NonZeroUsize,
+        per_caller: NonZeroUsize,
+    ) -> Self {
+        self.session_limits = SessionLimits { total, per_caller };
+        if let Some(store) = &self.sessions {
+            self.sessions = Some(Arc::new(SessionStore::new(
+                store.ttl(),
+                self.session_limits,
+            )));
+        }
         self
     }
 
@@ -907,7 +963,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     ) -> JsonRpcResponse {
         let init = params.and_then(|p| serde_json::from_value::<InitializeRequest>(p.clone()).ok());
         if let Some(session) = ctx.client.session() {
-            session.record_capabilities(params.and_then(|p| p.get("capabilities")).cloned());
+            session.record_capabilities(params.and_then(|p| p.get("capabilities")));
         }
 
         if let Some(req) = &init {
