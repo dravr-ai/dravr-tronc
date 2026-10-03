@@ -136,10 +136,14 @@ async fn an_f32_result_is_written_at_its_own_precision() {
 async fn malformed_arguments_name_the_tool() {
     let (is_error, text) = call(json!({ "celsius": "warm" })).await;
     assert!(is_error);
-    assert!(
-        text.starts_with("warmest_reading: invalid arguments: invalid type: string"),
-        "{text}"
-    );
+    // With schema validation the generated inputSchema refuses the call before
+    // serde reads it; without, the parse does. Either way the tool is named.
+    let expected = if cfg!(feature = "schema-validation") {
+        r#"warmest_reading: invalid arguments: /celsius: "warm" is not of type "array""#
+    } else {
+        "warmest_reading: invalid arguments: invalid type: string"
+    };
+    assert!(text.starts_with(expected), "{text}");
 }
 
 #[tokio::test]

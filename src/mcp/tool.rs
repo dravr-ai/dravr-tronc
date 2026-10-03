@@ -15,6 +15,8 @@ use serde_json::{Map, Value};
 use crate::mcp::modern::{meta_keys, ModernClientInfo};
 use crate::mcp::schema::{ProgressToken, Tool, ToolResponse};
 use crate::mcp::tasks::{CancellationToken, TASKS_EXTENSION_ID};
+#[cfg(feature = "schema-validation")]
+use crate::mcp::validation::{SchemaCompileError, ToolSchemaValidator};
 
 bitflags! {
     /// Host-agnostic classification flags a tool declares for discovery + gating.
@@ -322,9 +324,16 @@ pub trait McpTool<S: Send + Sync + ?Sized>: Send + Sync {
 ///
 /// Tools are registered at server startup and looked up by name
 /// when `tools/call` requests arrive from the MCP client.
+///
+/// With the `schema-validation` feature, each tool's schemas are compiled
+/// when it is registered, and [`Self::execute`] checks a call's arguments
+/// against the `inputSchema` and its result against the `outputSchema` (see
+/// [`crate::mcp::validation`]).
 pub struct ToolRegistry<S: Send + Sync + ?Sized> {
     tools: HashMap<String, Box<dyn McpTool<S>>>,
     categories: HashMap<String, Vec<String>>,
+    #[cfg(feature = "schema-validation")]
+    validators: HashMap<String, Result<ToolSchemaValidator, SchemaCompileError>>,
 }
 
 impl<S: Send + Sync + ?Sized> Default for ToolRegistry<S> {
@@ -339,23 +348,40 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
         Self {
             tools: HashMap::new(),
             categories: HashMap::new(),
+            #[cfg(feature = "schema-validation")]
+            validators: HashMap::new(),
         }
     }
 
     /// Register a tool handler, keyed by its definition name
     pub fn register(&mut self, tool: Box<dyn McpTool<S>>) {
-        let name = tool.definition().name;
-        self.tools.insert(name, tool);
+        self.insert(tool);
     }
 
     /// Register a tool handler and record it under the given category
     pub fn register_with_category(&mut self, tool: Box<dyn McpTool<S>>, category: &str) {
-        let name = tool.definition().name;
+        let name = self.insert(tool);
         self.categories
             .entry(category.to_owned())
             .or_default()
-            .push(name.clone());
-        self.tools.insert(name, tool);
+            .push(name);
+    }
+
+    /// Key `tool` by its definition name — compiling its schemas when
+    /// validation is on — and return the name.
+    fn insert(&mut self, tool: Box<dyn McpTool<S>>) -> String {
+        let definition = tool.definition();
+        #[cfg(feature = "schema-validation")]
+        {
+            let compiled = ToolSchemaValidator::compile(&definition);
+            if let Err(e) = &compiled {
+                tracing::error!(tool = %definition.name, error = %e, "Tool schema does not compile; every call to it will be refused");
+            }
+            self.validators.insert(definition.name.clone(), compiled);
+        }
+        let name = definition.name;
+        self.tools.insert(name.clone(), tool);
+        name
     }
 
     /// Return the number of registered tools
@@ -419,7 +445,27 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
                 "Tool '{name}' requires admin privileges"
             )));
         }
-        Some(tool.execute(state, ctx, arguments).await)
+        #[cfg(feature = "schema-validation")]
+        let validator = match self.validators.get(name) {
+            Some(Ok(validator)) => validator,
+            Some(Err(e)) => return Some(ToolResponse::error(format!("{name}: {e}"))),
+            None => return None,
+        };
+        #[cfg(feature = "schema-validation")]
+        if let Err(violations) = validator.check_arguments(&arguments) {
+            return Some(ToolResponse::error(format!(
+                "{name}: invalid arguments: {violations}"
+            )));
+        }
+        let response = tool.execute(state, ctx, arguments).await;
+        #[cfg(feature = "schema-validation")]
+        if let Err(violations) = validator.check_result(&response) {
+            tracing::error!(tool = %name, %violations, "Tool result does not match its outputSchema");
+            return Some(ToolResponse::error(format!(
+                "{name}: the result does not match the tool's outputSchema: {violations}"
+            )));
+        }
+        Some(response)
     }
 }
 

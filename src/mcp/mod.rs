@@ -16,3 +16,5 @@ pub mod server;
 pub mod tasks;
 pub mod tool;
 pub mod transport;
+#[cfg(feature = "schema-validation")]
+pub mod validation;

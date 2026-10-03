@@ -119,6 +119,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision |
+| `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
