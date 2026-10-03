@@ -66,11 +66,14 @@ pub trait Computation: Send + Sync {
     /// What the computation returns. Its derived schema is the tool's output
     /// schema, and the value is the result's `structuredContent`.
     ///
-    /// It must serialise to a JSON object — a struct or a map — because both
-    /// `outputSchema` and `structuredContent` are objects in the
-    /// specification. A list is returned as a
-    /// [`Listed`](crate::mcp::schema::Listed), the one wrapper every server
-    /// shares; a scalar is wrapped in a struct that names it.
+    /// It must be a struct with named fields or a map, whose schema has the
+    /// `type: "object"` root the specification requires of an
+    /// `outputSchema`, as `structuredContent` is an object. A list is
+    /// returned as a [`Listed`](crate::mcp::schema::Listed), the one wrapper
+    /// every server shares; an `Option`, an enum, a newtype or a scalar is
+    /// wrapped in a struct that names it, and a `serde_json::Value` field
+    /// carries a doc comment, so that its schema is an object. A tool whose
+    /// derived schema is not one is refused when it is registered.
     type Output: Serialize + JsonSchema;
 
     /// Tool name, as `tools/call` addresses it.

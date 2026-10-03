@@ -305,28 +305,47 @@ impl ToolContext {
     }
 }
 
-/// The JSON type an `outputSchema` confines its root to, when that type can
-/// never be an object: `"array"`, `"string"`, `["array", "null"]`.
+/// What makes `schema` an `outputSchema` the specification does not allow,
+/// or `None` when it is one.
 ///
-/// `None` when the root may be an object — a `type` naming `"object"`, no
-/// `type` at all (a `$ref`, or an untyped schema) — or when every branch of
-/// a root `oneOf`/`anyOf` may be one. Only a root that is certainly not an
-/// object is refused at registration; a value that is not an object at run
-/// time is still refused by [`ToolResponse::structured`].
-fn non_object_root(schema: &Value) -> Option<String> {
+/// The specification types `Tool.outputSchema` as `{ type: "object",
+/// properties?: { [name]: object }, required?: string[] }`, and a client
+/// that validates `tools/list` against that type — the reference TypeScript
+/// SDK does — rejects the whole listing over one tool that departs from it,
+/// losing every tool of the server. So the root `type` must be exactly
+/// `"object"`: not a type list such as `["object", "null"]`, and not absent,
+/// which is what schemars derives for an `Option` (an `anyOf`), a newtype
+/// (a `$ref`), an internally tagged enum (a `oneOf`) or a
+/// `serde_json::Value`. Each property's schema must be an object, not the
+/// boolean schema `true` schemars derives for an undocumented
+/// `serde_json::Value` field; and `required` must list names.
+fn output_schema_defect(schema: &Value) -> Option<String> {
     match schema.get("type") {
-        Some(Value::String(kind)) => (kind != "object").then(|| kind.clone()),
-        Some(Value::Array(kinds)) => (!kinds.iter().any(|kind| kind == "object"))
-            .then(|| Value::Array(kinds.clone()).to_string()),
-        Some(_) => None,
-        None => ["oneOf", "anyOf"].into_iter().find_map(|union| {
-            let branches = schema.get(union)?.as_array()?;
-            let kinds: Option<Vec<String>> = branches.iter().map(non_object_root).collect();
-            kinds
-                .filter(|kinds| !kinds.is_empty())
-                .map(|kinds| kinds.join(" or "))
-        }),
+        Some(Value::String(kind)) if kind == "object" => {}
+        Some(kind) => return Some(format!("root type is {kind}, not \"object\"")),
+        None => return Some("root has no type".to_owned()),
     }
+    if let Some(properties) = schema.get("properties") {
+        let Some(properties) = properties.as_object() else {
+            return Some(format!("properties is {properties}, not an object"));
+        };
+        if let Some((name, property)) = properties
+            .iter()
+            .find(|(_, property)| !property.is_object())
+        {
+            return Some(format!(
+                "property {name} has the schema {property}, not an object (document the field)"
+            ));
+        }
+    }
+    schema
+        .get("required")
+        .filter(|required| {
+            !required
+                .as_array()
+                .is_some_and(|names| names.iter().all(Value::is_string))
+        })
+        .map(|required| format!("required is {required}, not a list of names"))
 }
 
 /// Trait implemented by each MCP tool exposed by a server
@@ -389,16 +408,18 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
 
     /// Register a tool handler, keyed by its definition name.
     ///
-    /// A tool whose `outputSchema` can never describe a JSON object — its
-    /// root `type` is `"array"`, `"string"` or another non-object type, as
-    /// schemars generates for a [`Computation`](crate::mcp::computation::Computation)
-    /// whose `Output` is a `Vec` or a scalar — is refused: it is not
-    /// registered, and the refusal is logged at ERROR naming the tool. The
-    /// specification makes both `outputSchema` and `structuredContent`
-    /// objects, so such a tool would advertise a schema no client accepts
-    /// and fail every call; refused here, the mistake surfaces when the
-    /// server starts instead. Wrap a list in
-    /// [`Listed`](crate::mcp::schema::Listed).
+    /// A tool whose `outputSchema` is not the one the specification allows —
+    /// a root whose `type` is not exactly `"object"`, a property whose schema
+    /// is not an object, a `required` that is not a list of names — is
+    /// refused: it is not registered, and the refusal is logged at ERROR
+    /// naming the tool and the defect. A client that validates `tools/list`
+    /// rejects the whole listing over such a tool, so every other tool of
+    /// the server would be lost with it; refused here, the mistake surfaces
+    /// when the server starts instead. schemars derives such a root for a
+    /// [`Computation`](crate::mcp::computation::Computation) whose `Output`
+    /// is not a struct or a map: wrap a list in
+    /// [`Listed`](crate::mcp::schema::Listed), and an `Option`, an enum, a
+    /// newtype or a scalar in a struct with named fields.
     pub fn register(&mut self, tool: Box<dyn McpTool<S>>) {
         self.insert(tool);
     }
@@ -418,15 +439,20 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
 
     /// Key `tool` by its definition name — compiling its schemas when
     /// validation is on — and return the name, or refuse it (logged) when
-    /// its `outputSchema` can never be an object.
+    /// its `outputSchema` is not one the specification allows.
     fn insert(&mut self, tool: Box<dyn McpTool<S>>) -> Option<String> {
         let definition = tool.definition();
-        if let Some(kind) = definition.output_schema.as_ref().and_then(non_object_root) {
+        if let Some(defect) = definition
+            .output_schema
+            .as_ref()
+            .and_then(output_schema_defect)
+        {
             tracing::error!(
                 tool = %definition.name,
-                output_type = %kind,
-                "Tool not registered: its outputSchema root type is {kind}, but \
-                 structuredContent must be a JSON object (wrap a list in schema::Listed)"
+                %defect,
+                "Tool not registered: its outputSchema {defect}. The specification makes \
+                 it an object schema, structuredContent being a JSON object: wrap a list in \
+                 schema::Listed, and an Option, an enum or a scalar in a named struct"
             );
             return None;
         }
@@ -812,13 +838,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_whose_output_can_never_be_an_object_is_not_registered() {
+    fn a_tool_whose_output_schema_is_not_an_object_schema_is_not_registered() {
         for schema in [
             json!({"type": "array", "items": {"type": "number"}}),
             json!({"type": "string"}),
             json!({"type": ["array", "null"]}),
-            json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+            json!({"type": ["object", "null"]}),
+            json!({"$ref": "#/$defs/Row"}),
+            json!({"anyOf": [{"$ref": "#/$defs/Row"}, {"type": "null"}]}),
+            json!({"oneOf": [{"type": "object"}, {"type": "object"}]}),
+            json!({"title": "AnyValue"}),
+            json!(true),
+            json!({"type": "object", "properties": {"raw": true}}),
+            json!({"type": "object", "properties": ["raw"]}),
+            json!({"type": "object", "required": "raw"}),
+            json!({"type": "object", "required": [1]}),
         ] {
+            assert!(output_schema_defect(&schema).is_some(), "{schema}");
             let mut registry = ToolRegistry::<DummyState>::new();
             registry.register_with_category(Box::new(Shaped(schema.clone())), "data");
             assert!(registry.is_empty(), "{schema} is refused");
@@ -827,13 +863,17 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_whose_output_may_be_an_object_is_registered() {
+    fn a_tool_whose_output_schema_is_an_object_schema_is_registered() {
         for schema in [
             json!({"type": "object"}),
-            json!({"type": ["object", "null"]}),
-            json!({"$ref": "#/$defs/Row"}),
-            json!({"oneOf": [{"type": "object"}, {"type": "string"}]}),
-            json!({"anyOf": [{"$ref": "#/$defs/Row"}, {"type": "null"}]}),
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"raw": {"description": "The payload"}, "rows": {"$ref": "#/$defs/Row"}},
+                "required": ["raw"],
+                "$defs": {"Row": {"anyOf": [{"type": "object"}, {"type": "null"}]}},
+            }),
+            json!({"type": "object", "additionalProperties": {"type": "number"}}),
         ] {
             let mut registry = ToolRegistry::<DummyState>::new();
             registry.register(Box::new(Shaped(schema.clone())));

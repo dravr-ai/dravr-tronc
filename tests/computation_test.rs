@@ -7,6 +7,7 @@
 #![cfg(feature = "computation")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use dravr_tronc::error::INVALID_PARAMS;
@@ -180,6 +181,83 @@ async fn an_output_that_is_not_an_object_is_refused_at_registration() {
         matches!(unknown, TestClientError::Rpc(ref error) if error.code == INVALID_PARAMS),
         "{unknown}"
     );
+}
+
+/// A computation over `O`, never run: it is here for the outputSchema
+/// schemars derives for `O`.
+struct OutputOf<O>(PhantomData<O>);
+
+impl<O: Serialize + JsonSchema + Send + Sync> Computation for OutputOf<O> {
+    type Input = Readings;
+    type Output = O;
+    const NAME: &'static str = "output_of";
+    const TITLE: &'static str = "Output of";
+    const DESCRIPTION: &'static str = "Declares the outputSchema derived for its output.";
+
+    fn compute(&self, _input: Readings) -> Result<O, String> {
+        Err("never run".to_owned())
+    }
+}
+
+/// Whether a computation returning `O` is registered.
+fn registers<O: Serialize + JsonSchema + Send + Sync + 'static>() -> bool {
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register(Box::new(OutputOf::<O>(PhantomData)));
+    !registry.is_empty()
+}
+
+/// A struct around a result, which schemars derives as a `$ref`.
+#[derive(Serialize, JsonSchema)]
+struct Wrapped(Warmest);
+
+/// A result told apart by its `kind`, which schemars derives as a `oneOf`.
+#[derive(Serialize, JsonSchema)]
+#[serde(tag = "kind")]
+enum Reading {
+    Warmest { celsius: f32 },
+    Coldest { celsius: f32 },
+}
+
+/// An undocumented `Value` field, which schemars derives as the schema `true`.
+#[derive(Serialize, JsonSchema)]
+struct Undocumented {
+    raw: Value,
+}
+
+/// A documented `Value` field, which schemars derives as an object.
+#[derive(Serialize, JsonSchema)]
+struct Documented {
+    /// The reading as the sensor sent it.
+    raw: Value,
+}
+
+/// Each of these may serialise to an object, yet none derives the
+/// `type: "object"` root the specification requires of an outputSchema, and
+/// a client validating tools/list rejects the whole listing over any of
+/// them; the refusal names a struct wrapper.
+#[test]
+fn an_output_schema_whose_root_is_not_an_object_schema_is_refused_at_registration() {
+    let warmest = Warmest {
+        celsius: 30.0,
+        count: 2,
+    };
+    for value in [
+        serde_json::to_value(Reading::Warmest { celsius: 30.0 }),
+        serde_json::to_value(Reading::Coldest { celsius: -5.0 }),
+        serde_json::to_value(Wrapped(warmest)),
+    ] {
+        assert!(value.unwrap().is_object(), "an object at run time");
+    }
+    assert!(!registers::<Option<Warmest>>(), "anyOf");
+    assert!(!registers::<Wrapped>(), "$ref");
+    assert!(!registers::<Reading>(), "oneOf");
+    assert!(!registers::<Value>(), "untyped");
+    assert!(
+        !registers::<Undocumented>(),
+        "a property schema that is true"
+    );
+    assert!(registers::<Documented>());
+    assert!(registers::<Warmest>());
 }
 
 /// A computation whose result is a list, in the shared wrapper.
