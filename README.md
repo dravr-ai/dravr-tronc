@@ -109,6 +109,26 @@ What `POST /mcp` requires of a client (Streamable HTTP, revision 2026-07-28):
   schema annotates with `x-mcp-header`. A mirror that disagrees with the body is a 400
   `HeaderMismatch` (`-32020`) in any era.
 
+A tool talks to its client while it runs through `ctx.client` (`mcp::client_channel::ClientChannel`):
+`progress` reports on a request that carried a `progressToken`; `log` sends `notifications/message`
+on a server that declares the `logging` capability, at or above the level the client asked for
+(`logging/setLevel` on its session, or the `io.modelcontextprotocol/logLevel` `_meta` key) and
+never when it asked for none; `create_message` and `elicit` (form mode, SEP-1034 defaults, the five
+SEP-1330 enum shapes) ask the client and wait for its answer. A call that sends anything before its
+response is answered with an event stream — each message an event, the response last — and the
+client POSTs its answer to a server request back to `/mcp` (202). A server request goes only to an
+`initialize`-era client that declared the capability, and fails with a typed `ClientRequestError`
+otherwise; revision 2026-07-28 carries none inside a call, so a tool there answers
+`CallToolOutcome::InputRequired`. Over stdio all of this is interleaved on the one connection.
+
+`McpServer::with_http_sessions(ttl)` turns on Streamable HTTP sessions (2025-11-25): `initialize`
+mints an `Mcp-Session-Id`, a request naming a session that is not live — or is another caller's —
+is a 404, `DELETE /mcp` ends one, and one idle for `ttl` expires. They carry what an
+`initialize`-era client declares once (capabilities, log level), which is what lets a tool sample,
+elicit or log to it over HTTP. They are off by default because they live in process memory: turn
+them on only where a client's requests all reach one instance. A request without the header is
+served sessionless either way, and the stateless 2026-07-28 era never uses one.
+
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same
 cursors. A server given `with_protected_resource_metadata` has its RFC 9728 document served at
@@ -143,9 +163,12 @@ once, last. See [Request guard](#request-guard).
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision |
 | `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |
-| `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket) or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `raw`; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
-| `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
-| `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
+| `mcp::client_channel` | `ClientChannel` (`ToolContext::client`) — a running call's progress, log messages, sampling and elicitation; `ClientRequestError` |
+| `mcp::logging` | `LogLevel` (RFC 5424 severities, ordered) and the `notifications/message` params |
+| `mcp::elicitation` | Form-mode `elicitation/create` — `ElicitRequest`, the restricted `ElicitationSchema` with SEP-1034 defaults and SEP-1330 enums, `ElicitResult` |
+| `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket) or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `exchange` (the messages a call streams before its response), `raw`; it keeps the `Mcp-Session-Id`, answers server requests with an `on_server_request` handler, and `end_session`s; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
+| `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout; one connection, one session |
+| `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE` |
 | `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
 | `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
 | `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve, and its 401 challenge |
