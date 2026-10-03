@@ -1,5 +1,70 @@
 # Changelog
 
+## [4.0.0] — 2026-10-03
+
+### Added
+
+- feat(mcp): Listed<T>, the one shape of a list result
+- feat(mcp): TaskOptions::host_swept, for a host with its own sweeper
+- feat(mcp): ToolCall::new, so a tools/call is never a struct literal
+- feat(testkit): drive a host's own router with McpTestClient::over_router
+- feat(mcp): opt-in HTTP sessions, and the client's answers POSTed back
+- feat(mcp): POST /mcp streams what a call sends before its response
+- feat(mcp): ToolContext::client, a running call's channel to its client
+- feat(mcp): logging, elicitation and client-response wire types
+- feat(mcp): Content models every ContentBlock of the specification
+- feat(mcp): mcp_router serves the RFC 9728 protected-resource metadata
+- feat(mcp): tools/list honours params.cursor and pages with nextCursor
+- feat(otel): OtelObserver, MCP semantic-convention spans and metrics
+- feat(mcp): Observer, a passive hook around every MCP dispatch
+- feat(tracing): the W3C trace context crosses every HTTP hop
+- feat(server): a slow request completes with a WARN line
+- feat(testkit): an MCP test client, a port-0 server and assertions
+- feat(mcp): schema-validation checks a call against its tool's schemas
+- feat(mcp)!: ToolContext carries the request's _meta, typed
+- feat(mcp)!: a Computation declares its output and returns it structured
+- feat(mcp): tools/call can answer input_required (SEP-2322)
+
+### Fixed
+
+- fix(mcp): refuse an outputSchema that is not the spec's object schema
+- fix(api): keep ServiceError and TransportFailure exhaustive
+- fix(mcp): refuse at registration a tool whose output is never an object
+- fix(api): mark the public enums that will grow non_exhaustive
+- fix(mcp): a sampled message is a Content block under a spec Role
+- fix(mcp): a call dropped unanswered fires its cancellation token
+- fix(mcp): weigh an Accept type by its most specific range
+- fix(mcp): enter an HTTP session in one step after authentication
+- fix(mcp): stdio exits at end of input without waiting on held contexts
+- fix(mcp): a sessionless caller cancels only calls it can be told to own
+- fix(mcp): serve a missing Accept and answer JSON unless SSE is preferred
+- fix(mcp): bound the HTTP session store and what a session keeps
+- fix(mcp): a cancellation reaches only the requests of its own session
+- fix(mcp): serve a request naming 2025-03-26 or 2025-06-18 on its header
+- fix(mcp): refuse resource contents holding both text and blob
+- fix(testkit): the test client sends the SEP-2243 mirror headers
+- fix(mcp): serve drains requests in flight on SIGTERM before returning
+- fix(mcp): POST /mcp states its body limit and refuses past it with 413
+- fix(mcp): a loopback server refuses a Host it was not named under
+- fix(mcp): enforce SEP-2243 Mcp-Method, Mcp-Name and Mcp-Param headers
+- fix(mcp): era follows the MCP-Protocol-Version header, not body alone
+- fix(mcp): POST /mcp refuses a non-JSON body (415), narrow Accept (406)
+- fix(tracing): init_with_notifications exports spans over OTLP too
+- fix(mcp): notifications/cancelled stops the in-flight request
+- fix(tasks): the manager sweeps expired tasks on its own
+- fix(tasks): tasks/update hands the client's answers to the operation
+- fix(tasks): cancel signals the operation; terminal states are final
+- fix(tasks): the engine mints task ids from the OS CSPRNG
+
+### Other
+
+- docs(readme): a tool's channel to its client, and opt-in HTTP sessions
+- test(conformance): serve the progress, logging and elicitation fixtures
+- test(conformance): serve the audio, embedded-resource and mixed fixtures
+- docs(tasks): register the single-process reach of task input and cancel
+- docs(readme): what POST /mcp requires of a client, and its new knobs
+
+
 ## [3.3.1] — 2026-10-02
 
 ### Fixed
