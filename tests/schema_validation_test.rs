@@ -13,6 +13,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::validation::{SchemaRole, ToolSchemaValidator};
+use dravr_tronc::testkit::assert::{
+    assert_structured_content, assert_tool_error, assert_tool_success, tool_text,
+};
+use dravr_tronc::testkit::McpTestClient;
 use dravr_tronc::{McpServer, McpTool, ToolContext, ToolRegistry};
 use serde_json::{json, Value};
 
@@ -73,21 +77,15 @@ fn tool(response: ToolResponse) -> Fixed {
     }
 }
 
-async fn call(tool: Fixed, arguments: Value) -> (Value, usize) {
+async fn call(tool: Fixed, arguments: Value) -> (ToolResponse, usize) {
     let mut registry = ToolRegistry::new();
     let name = tool.name;
     registry.register(Box::new(tool));
     let state = Arc::new(Calls::default());
     let server = McpServer::new("validation-test", "0", registry, Arc::clone(&state));
-    let request = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": name, "arguments": arguments }
-    });
-    let result = server
-        .handle_raw(&request.to_string())
+    let result = McpTestClient::in_process(Arc::new(server))
+        .call_tool(name, arguments)
         .await
-        .expect("response")
-        .result
         .expect("a tool result, not a protocol error");
     (result, state.0.load(Ordering::SeqCst))
 }
@@ -104,8 +102,7 @@ async fn conforming_arguments_and_result_pass_through() {
     )
     .await;
     assert_eq!(calls, 1);
-    assert_eq!(result["isError"], false);
-    assert_eq!(result["structuredContent"]["pace"], 5.2);
+    assert_structured_content(&result, &json!({ "pace": 5.2 }));
 }
 
 #[tokio::test]
@@ -116,12 +113,9 @@ async fn arguments_that_violate_the_input_schema_never_reach_the_handler() {
     )
     .await;
     assert_eq!(calls, 0);
+    assert!(result.is_error, "a tool error the model can correct");
     assert_eq!(
-        result["isError"], true,
-        "a tool error the model can correct"
-    );
-    assert_eq!(
-        result["content"][0]["text"],
+        tool_text(&result),
         "pace: invalid arguments: /km: -1 is less than the minimum of 0"
     );
 }
@@ -133,7 +127,7 @@ async fn every_violation_is_reported() {
         json!({ "miles": 3 }),
     )
     .await;
-    let text = result["content"][0]["text"].as_str().expect("text");
+    let text = tool_text(&result);
     assert!(text.starts_with("pace: invalid arguments: "), "{text}");
     assert!(text.contains("\"km\" is a required property"), "{text}");
     assert!(
@@ -150,13 +144,13 @@ async fn a_result_that_violates_the_output_schema_is_refused() {
     )
     .await;
     assert_eq!(calls, 1);
-    assert_eq!(result["isError"], true);
+    assert!(result.is_error);
     assert_eq!(
-        result["content"][0]["text"],
+        tool_text(&result),
         "pace: the result does not match the tool's outputSchema: \
          /pace: \"fast\" is not of type \"number\""
     );
-    assert!(result.get("structuredContent").is_none());
+    assert!(result.structured_content.is_none());
 }
 
 #[tokio::test]
@@ -166,9 +160,9 @@ async fn a_success_without_structured_content_is_refused_when_an_output_schema_i
         json!({ "km": 1 }),
     )
     .await;
-    assert_eq!(result["isError"], true);
+    assert!(result.is_error);
     assert_eq!(
-        result["content"][0]["text"],
+        tool_text(&result),
         "pace: the result does not match the tool's outputSchema: \
          the tool declares an outputSchema but returned no structuredContent"
     );
@@ -181,7 +175,7 @@ async fn an_error_result_is_not_checked_against_the_output_schema() {
         json!({ "km": 1 }),
     )
     .await;
-    assert_eq!(result["content"][0]["text"], "no GPS");
+    assert_tool_error(&result, "no GPS");
 }
 
 #[tokio::test]
@@ -189,8 +183,7 @@ async fn a_tool_without_an_output_schema_returns_text_unchecked() {
     let mut text_only = tool(ToolResponse::text("5.2".to_owned()));
     text_only.output_schema = None;
     let (result, _) = call(text_only, json!({ "km": 1 })).await;
-    assert_eq!(result["isError"], false);
-    assert_eq!(result["content"][0]["text"], "5.2");
+    assert_eq!(assert_tool_success(&result), "5.2");
 }
 
 #[tokio::test]
@@ -199,8 +192,8 @@ async fn a_tool_whose_schema_does_not_compile_is_refused_every_call() {
     broken.input_schema = json!({ "type": "object", "minProperties": "two" });
     let (result, calls) = call(broken, json!({})).await;
     assert_eq!(calls, 0);
-    assert_eq!(result["isError"], true);
-    let text = result["content"][0]["text"].as_str().expect("text");
+    assert!(result.is_error);
+    let text = tool_text(&result);
     assert!(
         text.starts_with("pace: its inputSchema is not a usable JSON Schema: "),
         "{text}"

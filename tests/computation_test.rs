@@ -9,6 +9,11 @@
 
 use std::sync::Arc;
 
+use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::testkit::assert::{
+    assert_structured_content, assert_tool_error, assert_tool_success, tool_text,
+};
+use dravr_tronc::testkit::McpTestClient;
 use dravr_tronc::{Computation, McpServer, ToolRegistry};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,64 +53,50 @@ impl Computation for WarmestReading {
     }
 }
 
-fn server() -> McpServer<()> {
+fn client() -> McpTestClient {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(WarmestReading));
-    McpServer::new("computation-test", "0", registry, Arc::new(()))
+    McpTestClient::in_process(Arc::new(McpServer::new(
+        "computation-test",
+        "0",
+        registry,
+        Arc::new(()),
+    )))
 }
 
-async fn rpc(body: Value) -> Value {
-    server()
-        .handle_raw(&body.to_string())
+async fn listed() -> Tool {
+    let mut tools = client().list_tools().await.expect("tools/list");
+    assert_eq!(tools.len(), 1);
+    tools.remove(0)
+}
+
+async fn call(arguments: Value) -> ToolResponse {
+    client()
+        .call_tool("warmest_reading", arguments)
         .await
-        .expect("response")
-        .result
-        .expect("result")
-}
-
-async fn call_result(arguments: Value) -> Value {
-    rpc(json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": "warmest_reading", "arguments": arguments }
-    }))
-    .await
-}
-
-async fn call(arguments: Value) -> (bool, String) {
-    let result = call_result(arguments).await;
-    (
-        result["isError"].as_bool().unwrap_or(false),
-        result["content"][0]["text"]
-            .as_str()
-            .expect("text")
-            .to_owned(),
-    )
+        .expect("a tool result")
 }
 
 #[tokio::test]
 async fn the_definition_is_generated_from_the_input_type() {
-    let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
-    let tool = &listed["tools"][0];
-    assert_eq!(tool["name"], "warmest_reading");
+    let tool = listed().await;
+    assert_eq!(tool.name, "warmest_reading");
+    assert_eq!(tool.description, "The highest of the given temperatures.");
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["required"], json!(["celsius"]));
     assert_eq!(
-        tool["description"],
-        "The highest of the given temperatures."
-    );
-    assert_eq!(tool["inputSchema"]["type"], "object");
-    assert_eq!(tool["inputSchema"]["required"], json!(["celsius"]));
-    assert_eq!(
-        tool["inputSchema"]["properties"]["celsius"]["description"],
+        tool.input_schema["properties"]["celsius"]["description"],
         "Temperatures in °C."
     );
-    assert_eq!(tool["annotations"]["title"], "Warmest reading");
-    assert_eq!(tool["annotations"]["readOnlyHint"], true);
-    assert_eq!(tool["annotations"]["openWorldHint"], false);
+    let annotations = tool.annotations.expect("annotations");
+    assert_eq!(annotations.title.as_deref(), Some("Warmest reading"));
+    assert_eq!(annotations.read_only_hint, Some(true));
+    assert_eq!(annotations.open_world_hint, Some(false));
 }
 
 #[tokio::test]
 async fn the_output_schema_is_generated_from_the_output_type() {
-    let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
-    let output = &listed["tools"][0]["outputSchema"];
+    let output = listed().await.output_schema.expect("an outputSchema");
     assert_eq!(output["type"], "object");
     assert_eq!(output["title"], "Warmest");
     assert_eq!(output["required"], json!(["celsius", "count"]));
@@ -114,28 +105,26 @@ async fn the_output_schema_is_generated_from_the_output_type() {
 
 #[tokio::test]
 async fn the_result_is_structured_content_with_the_same_json_as_text() {
-    let result = call_result(json!({ "celsius": [9.5, 12.8, 11.0] })).await;
-    assert_eq!(
-        result["structuredContent"],
-        json!({ "celsius": 12.8, "count": 3 }),
-        "the structured f32 is 12.8, not its widened f64"
-    );
-    let text = result["content"][0]["text"].as_str().expect("text");
-    let reparsed: Value = serde_json::from_str(text).expect("the text block is JSON");
-    assert_eq!(reparsed, result["structuredContent"]);
+    let result = call(json!({ "celsius": [9.5, 12.8, 11.0] })).await;
+    // The structured f32 is 12.8, not its widened f64.
+    assert_structured_content(&result, &json!({ "celsius": 12.8, "count": 3 }));
+    let reparsed: Value =
+        serde_json::from_str(&tool_text(&result)).expect("the text block is JSON");
+    assert_eq!(Some(reparsed), result.structured_content);
 }
 
 #[tokio::test]
 async fn an_f32_result_is_written_at_its_own_precision() {
-    let (is_error, text) = call(json!({ "celsius": [9.5, 12.8, 11.0] })).await;
-    assert!(!is_error, "{text}");
-    assert_eq!(text, r#"{"celsius":12.8,"count":3}"#);
+    let result = call(json!({ "celsius": [9.5, 12.8, 11.0] })).await;
+    assert_eq!(
+        assert_tool_success(&result),
+        r#"{"celsius":12.8,"count":3}"#
+    );
 }
 
 #[tokio::test]
 async fn malformed_arguments_name_the_tool() {
-    let (is_error, text) = call(json!({ "celsius": "warm" })).await;
-    assert!(is_error);
+    let result = call(json!({ "celsius": "warm" })).await;
     // With schema validation the generated inputSchema refuses the call before
     // serde reads it; without, the parse does. Either way the tool is named.
     let expected = if cfg!(feature = "schema-validation") {
@@ -143,14 +132,14 @@ async fn malformed_arguments_name_the_tool() {
     } else {
         "warmest_reading: invalid arguments: invalid type: string"
     };
-    assert!(text.starts_with(expected), "{text}");
+    assert_tool_error(&result, expected);
 }
 
 #[tokio::test]
 async fn a_computation_error_is_a_tool_error_naming_the_tool() {
-    let (is_error, text) = call(json!({ "celsius": [] })).await;
-    assert!(is_error);
-    assert_eq!(text, "warmest_reading: celsius is empty");
+    let result = call(json!({ "celsius": [] })).await;
+    assert!(result.is_error);
+    assert_eq!(tool_text(&result), "warmest_reading: celsius is empty");
 }
 
 /// A computation whose output is not an object.
@@ -172,22 +161,19 @@ impl Computation for Celsius {
 async fn an_output_that_is_not_an_object_is_a_tool_error_naming_the_tool() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(Celsius));
-    let server = McpServer::new("computation-test", "0", registry, Arc::new(()));
-    let result = server
-        .handle_raw(
-            &json!({
-                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": "celsius", "arguments": { "celsius": [1.0] } }
-            })
-            .to_string(),
-        )
+    let client = McpTestClient::in_process(Arc::new(McpServer::new(
+        "computation-test",
+        "0",
+        registry,
+        Arc::new(()),
+    )));
+    let result = client
+        .call_tool("celsius", json!({ "celsius": [1.0] }))
         .await
-        .expect("response")
-        .result
-        .expect("result");
-    assert_eq!(result["isError"], true);
+        .expect("a tool result");
+    assert!(result.is_error);
     assert_eq!(
-        result["content"][0]["text"],
+        tool_text(&result),
         "celsius: could not render the result: structured content must be a JSON object, \
          but the result is an array"
     );

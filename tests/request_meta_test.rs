@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dravr_tronc::mcp::schema::{ProgressNotification, ProgressToken, Tool, ToolResponse};
+use dravr_tronc::testkit::McpTestClient;
 use dravr_tronc::{McpServer, McpTool, RequestMeta, ToolContext, ToolRegistry};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,18 +64,20 @@ impl McpTool<()> for ReadMeta {
 async fn read(meta: Option<Value>) -> Value {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadMeta));
-    let server = McpServer::new("meta-test", "0", registry, Arc::new(()));
+    let client = McpTestClient::in_process(Arc::new(McpServer::new(
+        "meta-test",
+        "0",
+        registry,
+        Arc::new(()),
+    )));
     let mut params = json!({ "name": "read_meta", "arguments": {} });
     if let Some(meta) = meta {
         params["_meta"] = meta;
     }
-    let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params });
-    let result = server
-        .handle_raw(&request.to_string())
+    let result = client
+        .result("tools/call", Some(params))
         .await
-        .expect("response")
-        .result
-        .expect("result");
+        .expect("a tool result");
     result["structuredContent"].clone()
 }
 

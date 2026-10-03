@@ -1,0 +1,19 @@
+[
+  {
+    "name": "broken",
+    "description": "Always fails",
+    "inputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "whoami",
+    "description": "Who the server thinks is calling",
+    "inputSchema": {
+      "type": "object"
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  }
+]

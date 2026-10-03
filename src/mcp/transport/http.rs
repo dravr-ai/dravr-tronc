@@ -50,6 +50,14 @@ pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) 
         .with_state(server)
 }
 
+/// The router [`serve`] serves: [`mcp_router`] under [`guard_requests`].
+///
+/// Public so a server bound some other way — the testkit's port-0 server, an
+/// in-process test client — answers exactly as the standalone one does.
+pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
+    mcp_router(server).layer(from_fn(guard_requests))
+}
+
 /// Start a standalone HTTP server serving only the `/mcp` endpoint
 ///
 /// Binds to the given host and port, serves until shutdown. Every request goes
@@ -86,7 +94,7 @@ pub async fn serve<S: Send + Sync + ?Sized + 'static>(
         return Err(Box::new(InsecureBindError::new(host)));
     }
 
-    let app = mcp_router(server).layer(from_fn(guard_requests));
+    let app = guarded_mcp_router(server);
     let listener = TcpListener::bind(resolved.as_slice())
         .await
         .map_err(|e| format!("Failed to bind {addr}: {e}"))?;

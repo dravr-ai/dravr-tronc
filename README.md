@@ -120,6 +120,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision |
 | `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |
+| `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket) or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `raw`; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP) |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |

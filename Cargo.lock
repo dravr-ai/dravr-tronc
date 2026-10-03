@@ -474,6 +474,7 @@ dependencies = [
  "bitflags",
  "chrono",
  "clap",
+ "dravr-tronc",
  "futures",
  "getrandom 0.3.4",
  "hex",

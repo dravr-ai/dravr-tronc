@@ -29,6 +29,11 @@ computation = ["dep:schemars"]
 # heaviest thing an MCP server would link for a check its tools may already
 # make by parsing.
 schema-validation = ["dep:jsonschema"]
+# `dravr_tronc::testkit`: an MCP test client over the in-process router or a
+# port-0 bound server, response assertions and a tools/list snapshot. For a
+# consumer's dev-dependencies; it pulls reqwest, tower and http-body-util,
+# which a server binary has no use for.
+testkit = ["http-client", "dep:tower", "dep:http-body-util"]
 # Google Cloud service-to-service auth, both ends of the handshake: an
 # `IdTokenSource` for the caller and a verifying middleware for the callee.
 # Opt-in because it pulls a JWT stack, and a stdio-only MCP server has no use
@@ -86,9 +91,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.32", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 
 [dev-dependencies]
+# The crate's own tests drive it through the testkit, as a consumer would.
+dravr-tronc = { path = ".", features = ["testkit"] }
 # Encodes a test RSA key's modulus the way a JWK set publishes it.
 base64 = "0.22"
 # The key-set tests sign with an openssl PEM key, which only use_pem can read.

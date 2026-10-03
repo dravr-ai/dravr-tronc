@@ -46,6 +46,8 @@ pub mod notify_target;
 pub mod server;
 #[cfg(feature = "service-client")]
 pub mod service_client;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 // Convenience re-exports
 pub use mcp::auth::{AuthError, AuthHook};
