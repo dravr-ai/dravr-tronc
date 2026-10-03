@@ -184,7 +184,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::logging` | `LogLevel` (RFC 5424 severities, ordered) and the `notifications/message` params |
 | `mcp::elicitation` | Form-mode `elicitation/create` — `ElicitRequest`, the restricted `ElicitationSchema` with SEP-1034 defaults and SEP-1330 enums, `ElicitResult` |
 | `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket) or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `exchange` (the messages a call streams before its response), `raw`; it keeps the `Mcp-Session-Id`, answers server requests with an `on_server_request` handler, and `end_session`s; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
-| `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout; one connection, one session |
+| `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout; one connection, one session; on stdin EOF it answers the requests already read (10 s at most), then closes stdout and cancels the connection, so a job holding a tool's context does not hold the process |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE` |
 | `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
 | `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
