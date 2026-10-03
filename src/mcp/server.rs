@@ -715,7 +715,8 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 
     /// Act on a notification. `notifications/cancelled` fires the named
     /// request's token when that request is still being served for the same
-    /// caller; every other notification needs nothing from a stateless server.
+    /// caller, in the same session; every other notification needs nothing
+    /// from a stateless server.
     fn handle_notification(&self, request: &JsonRpcRequest, ctx: &ToolContext) {
         if request.method != NOTIFICATIONS_CANCELLED {
             debug!(method = %request.method, "Received notification, no response");

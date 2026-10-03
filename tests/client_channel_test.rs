@@ -609,3 +609,73 @@ async fn an_answer_counts_only_from_the_caller_the_request_went_to() {
         "Alice's answer is the one used: {rest}"
     );
 }
+
+/// POST `body` to `/mcp` in `session`, as an anonymous client.
+async fn post_in(server: &McpTestServer, session: &str, body: &Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(server.url())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header(MCP_SESSION_ID_HEADER, session)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Read a call's event stream up to its first event, the elicitation it sent.
+async fn first_event(stream: &mut reqwest::Response) -> Value {
+    let mut text = String::new();
+    while !text.contains("\n\n") {
+        text.push_str(&String::from_utf8_lossy(
+            &stream.chunk().await.unwrap().unwrap(),
+        ));
+    }
+    serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_cancellation_reaches_only_the_requests_of_its_own_session() {
+    let server = McpTestServer::start(Arc::new(sessionful())).await.unwrap();
+    let ada = server
+        .client()
+        .with_capabilities(json!({ "elicitation": {} }));
+    ada.initialize().await.unwrap();
+    let hers = ada.session_id().unwrap();
+    let bob = server.client();
+    bob.initialize().await.unwrap();
+    let his = bob.session_id().unwrap();
+
+    // Both anonymous, both counting from 1: Bob's cancellation names the id
+    // of Ada's call, but in his own session.
+    let call = |id: u64| {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "ask", "arguments": {} } })
+    };
+    let cancel = |id: u64| {
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": { "requestId": id } })
+    };
+    let mut stream = post_in(&server, &hers, &call(1)).await;
+    let ask = first_event(&mut stream).await;
+    assert_eq!(ask["method"], "elicitation/create");
+    let ignored = post_in(&server, &his, &cancel(1)).await;
+    assert_eq!(ignored.status(), 202);
+    let answer = json!({ "jsonrpc": "2.0", "id": ask["id"], "result": { "action": "decline" } });
+    assert_eq!(post_in(&server, &hers, &answer).await.status(), 202);
+    let rest = stream.text().await.unwrap();
+    assert!(
+        rest.contains("Decline"),
+        "Ada's call ran to its end: {rest}"
+    );
+
+    // The same notification in her own session does cancel her call.
+    let mut stream = post_in(&server, &hers, &call(2)).await;
+    first_event(&mut stream).await;
+    assert_eq!(post_in(&server, &hers, &cancel(2)).await.status(), 202);
+    let rest = stream.text().await.unwrap();
+    assert!(
+        !rest.contains("\"id\":2"),
+        "a cancelled call is answered with nothing: {rest}"
+    );
+}

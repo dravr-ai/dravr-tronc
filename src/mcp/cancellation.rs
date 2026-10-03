@@ -1,5 +1,5 @@
 // ABOUTME: In-flight request registry that lets notifications/cancelled stop a running request
-// ABOUTME: Keyed by caller identity and JSON-RPC id; each entry owns the request's CancellationToken
+// ABOUTME: Keyed by caller, session and JSON-RPC id; each entry owns the request's CancellationToken
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -16,8 +16,13 @@
 //! token itself.
 //!
 //! JSON-RPC ids are chosen by the client and are unique only per client, so
-//! the key carries the caller identity the auth hook resolved. Callers it
-//! cannot tell apart share a key space, the same boundary [`TaskOwner`]
+//! the key carries the caller identity the auth hook resolved and, over HTTP,
+//! the session the request was sent in: the same [`CallerKey`] a server
+//! request's answer is matched on. A notification reaches only the requests
+//! of its own session, so two clients counting their ids from 0 under one
+//! identity — two anonymous ones, or two sharing an API key — cannot cancel
+//! each other's calls once each holds a session. Sessionless callers the auth
+//! hook cannot tell apart share a key space, the same boundary [`TaskOwner`]
 //! draws for tasks.
 //!
 //! [`TaskOwner`]: crate::mcp::tasks::TaskOwner
@@ -29,25 +34,25 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::mcp::client_channel::CallerKey;
 use crate::mcp::tool::ToolContext;
 
 /// Method name of the client's cancellation notification.
 pub(crate) const NOTIFICATIONS_CANCELLED: &str = "notifications/cancelled";
 
-/// Who sent a request and which id they gave it.
+/// Who sent a request, in which session, and which id they gave it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestKey {
-    user: Option<String>,
-    tenant: Option<String>,
+    caller: CallerKey,
     /// The id's JSON text, so `1` and `"1"` stay distinct as JSON-RPC requires.
     request: String,
 }
 
 impl RequestKey {
     fn new(ctx: &ToolContext, request_id: &Value) -> Self {
+        let session = ctx.client.session().and_then(|session| session.id());
         Self {
-            user: ctx.user_id.clone(),
-            tenant: ctx.tenant_id.clone(),
+            caller: CallerKey::new(ctx, session),
             request: request_id.to_string(),
         }
     }
