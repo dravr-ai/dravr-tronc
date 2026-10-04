@@ -432,9 +432,10 @@ pub enum TaskError {
         reason: String,
     },
     /// The task is visible but no operation in this process is running it,
-    /// so there is nothing to hand client input to. Seen when the operation
-    /// ended without settling the task, or ran on another instance.
-    // LIMITATION(registre#761): Detached — task input and cancel signals reach only an operation in this process
+    /// and the manager has no [`TaskSignalBus`] to reach one elsewhere, so
+    /// there is nothing to hand client input to. Seen when the operation ended
+    /// without settling the task, or ran on another instance of a host that
+    /// installed no bus.
     Detached(TaskId),
     /// The backing store failed.
     Store(String),
@@ -653,6 +654,66 @@ impl TaskOptions {
 /// `inputRequests` they answer.
 pub type InputResponses = Map<String, Value>;
 
+/// A task signal bound for whichever process runs the task's operation.
+///
+/// A manager reaches the operations running in its own process directly. One
+/// running in another instance of the same service is reached through the
+/// host's [`TaskSignalBus`]: the manager that took the request publishes the
+/// signal, and the host hands it to [`TaskManager::deliver`] on every other
+/// instance. Serializable, so a host can put it on any wire as is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "signal", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum TaskSignal {
+    /// The task was cancelled, by `tasks/cancel` or by TTL expiry: fire the
+    /// operation's [`TaskRun::cancellation`] token.
+    #[serde(rename_all = "camelCase")]
+    Cancelled {
+        /// The task in question.
+        task_id: TaskId,
+    },
+    /// The client answered the task's input requests with `tasks/update`,
+    /// already validated and recorded: hand the answers to the operation
+    /// waiting in [`TaskRun::request_input`].
+    #[serde(rename_all = "camelCase")]
+    Input {
+        /// The task in question.
+        task_id: TaskId,
+        /// The client's answers, keyed like the requests they answer.
+        responses: InputResponses,
+    },
+}
+
+impl TaskSignal {
+    /// The task the signal is for.
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        match self {
+            Self::Cancelled { task_id } | Self::Input { task_id, .. } => task_id,
+        }
+    }
+}
+
+/// The host's channel between instances of one service, for task signals.
+///
+/// Optional. Without one, `tasks/cancel` still records `cancelled` in the
+/// shared [`TaskStore`], and an operation running elsewhere learns of it only
+/// by reading the store; `tasks/update` for such an operation is refused with
+/// [`TaskError::Detached`]. The MCP specification does not say how a signal
+/// crosses processes, and the right carrier is the host's own infrastructure
+/// — Postgres `LISTEN/NOTIFY`, Redis pub/sub, a message queue — so the engine
+/// asks only for this seam, as it asks for a [`TaskStore`].
+///
+/// [`Self::publish`] carries a signal to every other instance, where the host
+/// passes it to [`TaskManager::deliver`]. Delivery is at most once and needs
+/// no acknowledgement: the store stays the record of a task's state, and an
+/// instance that runs no operation for the task ignores the signal.
+#[async_trait]
+pub trait TaskSignalBus: Send + Sync {
+    /// Carry `signal` to the other instances of this service.
+    async fn publish(&self, signal: TaskSignal) -> Result<(), TaskError>;
+}
+
 /// What the manager holds for a task whose operation is running in this
 /// process: the signal [`TaskManager::cancel`] fires, and where
 /// [`TaskManager::apply_input`] delivers the client's answers.
@@ -700,11 +761,16 @@ fn validate_input_keys(
 /// [`TaskOptions::sweep_interval`], from the first [`Self::create`]. A host
 /// that runs its own sweeper over the same store builds the manager with
 /// [`TaskOptions::host_swept`], so each instance runs one sweep, not two.
+///
+/// A host running several instances over one store installs a
+/// [`TaskSignalBus`] with [`Self::with_signal_bus`], so a cancel or a client's
+/// input taken by one instance reaches the operation running on another.
 pub struct TaskManager {
     store: Arc<dyn TaskStore>,
     options: TaskOptions,
     runs: Mutex<HashMap<TaskId, LiveRun>>,
     sweeper: OnceLock<AbortHandle>,
+    signals: Option<Arc<dyn TaskSignalBus>>,
 }
 
 impl Debug for TaskManager {
@@ -730,7 +796,50 @@ impl TaskManager {
             options,
             runs: Mutex::new(HashMap::new()),
             sweeper: OnceLock::new(),
+            signals: None,
         }
+    }
+
+    /// This manager, publishing the cancels and client input it takes for an
+    /// operation it does not run to `bus`, for the instance that runs it.
+    ///
+    /// The host's side of the bus hands each signal it receives to
+    /// [`Self::deliver`] on the receiving instance's manager.
+    #[must_use]
+    pub fn with_signal_bus(mut self, bus: Arc<dyn TaskSignalBus>) -> Self {
+        self.signals = Some(bus);
+        self
+    }
+
+    /// Hand a signal from another instance to the operation running the task
+    /// in this process. Returns whether one was running it here.
+    ///
+    /// The publishing instance already checked ownership and recorded the
+    /// change in the store, so this only reaches the operation. Every
+    /// instance receives the signal and all but one find no run, which is
+    /// why `false` is the common answer and no error.
+    pub fn deliver(&self, signal: TaskSignal) -> bool {
+        let runs = self.runs();
+        let Some(run) = runs.get(signal.task_id()) else {
+            return false;
+        };
+        match signal {
+            TaskSignal::Cancelled { .. } => {
+                run.cancel.cancel();
+                true
+            }
+            TaskSignal::Input { responses, .. } => run.inputs.send(responses).is_ok(),
+        }
+    }
+
+    /// Publish `signal` for an operation another instance runs, when the
+    /// host installed a bus. Returns whether it was published.
+    async fn publish(&self, signal: TaskSignal) -> Result<bool, TaskError> {
+        let Some(bus) = &self.signals else {
+            return Ok(false);
+        };
+        bus.publish(signal).await?;
+        Ok(true)
     }
 
     /// The retention and pacing this manager applies.
@@ -894,9 +1003,15 @@ impl TaskManager {
     ///
     /// Rejects a task that is not currently awaiting input, so a stray
     /// `tasks/update` cannot resurrect a settled task, and responses whose keys
-    /// differ from the outstanding requests'. A task no operation in this
-    /// process is running is refused with [`TaskError::Detached`] and left
+    /// differ from the outstanding requests'.
+    ///
+    /// A task no operation in this process is running goes to the instance
+    /// that runs it, as a [`TaskSignal::Input`] on the [`TaskSignalBus`].
+    /// Without a bus it is refused with [`TaskError::Detached`] and left
     /// awaiting input, rather than moved to a `working` nothing will finish.
+    /// With one, the engine cannot see whether any instance still runs the
+    /// operation: input published for one that ended leaves the task
+    /// `working` until its TTL, the same as an operation that never settles.
     pub async fn apply_input(
         &self,
         owner: &TaskOwner,
@@ -906,11 +1021,10 @@ impl TaskManager {
         // Ownership first, so another owner's task reads as absent rather than
         // as detached.
         self.get(owner, id).await?;
-        let inputs = self
-            .runs()
-            .get(id)
-            .map(|run| run.inputs.clone())
-            .ok_or_else(|| TaskError::Detached(id.clone()))?;
+        let inputs = self.runs().get(id).map(|run| run.inputs.clone());
+        if inputs.is_none() && self.signals.is_none() {
+            return Err(TaskError::Detached(id.clone()));
+        }
 
         let working = self
             .store
@@ -928,9 +1042,22 @@ impl TaskManager {
             })
             .await?;
 
-        if inputs.send(responses).is_err() {
-            // The run was dropped between the lookup and the send: the task is
-            // `working` with nobody working it, so settle it as failed.
+        let handed = if let Some(inputs) = inputs {
+            inputs.send(responses).is_ok()
+        } else {
+            let signal = TaskSignal::Input {
+                task_id: id.clone(),
+                responses,
+            };
+            self.publish(signal).await.unwrap_or_else(|e| {
+                warn!(task_id = %id, error = %e, "Publishing task input failed");
+                false
+            })
+        };
+        if !handed {
+            // The run was dropped between the lookup and the send, or the bus
+            // refused the input: the task is `working` with nobody working
+            // it, so settle it as failed.
             let mut error = Map::new();
             error.insert("code".to_owned(), Value::from(INTERNAL_ERROR));
             error.insert(
@@ -944,18 +1071,37 @@ impl TaskManager {
     }
 
     /// Cancel a task: record `cancelled`, then fire the cancellation token of
-    /// the operation running it in this process.
+    /// the operation running it — in this process directly, in another
+    /// through the [`TaskSignalBus`] when the host installed one.
     ///
     /// The state is written first, so once the token fires a late
     /// [`TaskRun::complete`] from the operation is refused rather than
     /// overwriting the cancellation. The operation itself stops cooperatively,
-    /// at its next look at the token.
+    /// at its next look at the token. The cancellation is recorded whether or
+    /// not the signal reaches it, so a bus failure is logged, not returned.
     pub async fn cancel(&self, owner: &TaskOwner, id: &TaskId) -> Result<DetailedTask, TaskError> {
         let cancelled = self.transition(owner, id, TaskPayload::Cancelled).await?;
-        if let Some(run) = self.runs().get(id) {
-            run.cancel.cancel();
-        }
+        self.signal_cancelled(id).await;
         Ok(cancelled)
+    }
+
+    /// Fire the token of the operation running `id`, here or, through the
+    /// bus, elsewhere.
+    async fn signal_cancelled(&self, id: &TaskId) {
+        let local = self.deliver(TaskSignal::Cancelled {
+            task_id: id.clone(),
+        });
+        if local {
+            return;
+        }
+        if let Err(e) = self
+            .publish(TaskSignal::Cancelled {
+                task_id: id.clone(),
+            })
+            .await
+        {
+            warn!(task_id = %id, error = %e, "Publishing task cancellation failed");
+        }
     }
 
     /// Drop tasks whose TTL elapsed, returning how many were removed.
@@ -963,14 +1109,12 @@ impl TaskManager {
     /// The manager runs this every [`TaskOptions::sweep_interval`]; a host
     /// calls it directly only when it turned that off, with
     /// [`TaskOptions::host_swept`]. An expired task's result can no longer
-    /// be retrieved, so the operation still running it is cancelled too.
+    /// be retrieved, so the operation still running it is cancelled too,
+    /// wherever it runs when the host installed a [`TaskSignalBus`].
     pub async fn sweep_expired(&self) -> Result<usize, TaskError> {
         let removed = self.store.sweep_expired().await?;
-        let runs = self.runs();
         for id in &removed {
-            if let Some(run) = runs.get(id) {
-                run.cancel.cancel();
-            }
+            self.signal_cancelled(id).await;
         }
         Ok(removed.len())
     }

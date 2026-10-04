@@ -139,6 +139,16 @@ capabilities as flags, not the object it sent, and `with_http_session_limits(tot
 caps how many are held (10 000, and 1 000 per caller identity, by default). A caller at its limit
 gives up its least recently used idle session; a full server answers `initialize` with 503.
 
+Tasks live in the host's `TaskStore`, so any instance answers `tasks/get`; the operation running a
+task lives in one process. A cancel, an expiry or a client's `tasks/update` taken by another
+instance reaches that operation through a host `TaskSignalBus`
+(`TaskManager::with_signal_bus`): the manager publishes a `TaskSignal` (serializable, for any
+wire), and the host's listener on each instance hands it to `TaskManager::deliver`. The carrier —
+Postgres `LISTEN/NOTIFY`, Redis pub/sub, a queue — is the host's, as the store is; the MCP spec
+does not say how a signal crosses processes. Without a bus, a cancel is still recorded in the
+store for the operation to read, and `tasks/update` for an operation elsewhere is refused as
+`Detached`.
+
 `notifications/cancelled` reaches only the sender's own call: over stdio, the connection's; in a
 session, that session's; sessionless, the call of the same principal presenting the same bearer
 credential, so two clients of one user holding their own tokens are told apart. A sessionless
@@ -184,6 +194,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision; a list result is a `schema::Listed<T>` (`{"items": [...]}`), since `structuredContent` is an object |
 | `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |
+| `mcp::tasks` | The tasks extension — `TaskManager` over a host `TaskStore` (atomic `update`), `TaskRun` (the operation's cancel token and input), `TaskOptions`; `TaskSignalBus`, the optional seam carrying `tasks/cancel`, TTL expiry and `tasks/update` input to an operation on another instance |
 | `mcp::client_channel` | `ClientChannel` (`ToolContext::client`) — a running call's progress, log messages, sampling and elicitation; `ClientRequestError` |
 | `mcp::logging` | `LogLevel` (RFC 5424 severities, ordered) and the `notifications/message` params |
 | `mcp::elicitation` | Form-mode `elicitation/create` — `ElicitRequest`, the restricted `ElicitationSchema` with SEP-1034 defaults and SEP-1330 enums, `ElicitResult` |
