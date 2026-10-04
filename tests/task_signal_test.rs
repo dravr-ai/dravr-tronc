@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dravr_tronc::mcp::tasks::{
-    InMemoryTaskStore, TaskError, TaskManager, TaskOptions, TaskOwner, TaskSignal, TaskSignalBus,
-    TaskStatus, TaskStore,
+    InMemoryTaskStore, TaskError, TaskManager, TaskOptions, TaskOwner, TaskPayload, TaskSignal,
+    TaskSignalBus, TaskStatus, TaskStore,
 };
 use serde_json::{json, Map, Value};
 use tokio::task::yield_now;
@@ -255,11 +255,19 @@ async fn a_failing_bus_fails_the_input_it_could_not_carry() {
     let refused = b.apply_input(&owner(), run.id(), responses).await;
 
     assert!(matches!(refused, Err(TaskError::Detached(_))));
+    let failed = b.get(&owner(), run.id()).await.unwrap();
     assert_eq!(
-        b.get(&owner(), run.id()).await.unwrap().status(),
+        failed.status(),
         TaskStatus::Failed,
         "input that reached no operation must not leave the task working"
     );
+    match &failed.payload {
+        TaskPayload::Failed { error } => assert_eq!(
+            error["message"],
+            "task input could not be carried to the instance running the operation"
+        ),
+        other => panic!("expected a failed payload, got {other:?}"),
+    }
 }
 
 #[test]

@@ -431,11 +431,11 @@ pub enum TaskError {
         /// What is wrong with the responses.
         reason: String,
     },
-    /// The task is visible but no operation in this process is running it,
-    /// and the manager has no [`TaskSignalBus`] to reach one elsewhere, so
-    /// there is nothing to hand client input to. Seen when the operation ended
-    /// without settling the task, or ran on another instance of a host that
-    /// installed no bus.
+    /// Client input reached no operation. Either none in this process runs
+    /// the task and the manager has no [`TaskSignalBus`] to reach one
+    /// elsewhere — the task is left awaiting input — or the input was taken
+    /// and could not be handed over, because the local run ended or the bus
+    /// refused it — the task is failed, since nothing will finish it.
     Detached(TaskId),
     /// The backing store failed.
     Store(String),
@@ -711,6 +711,12 @@ impl TaskSignal {
 #[async_trait]
 pub trait TaskSignalBus: Send + Sync {
     /// Carry `signal` to the other instances of this service.
+    ///
+    /// `Err` means the carrier did not take the signal, and the manager acts
+    /// on that: input it could not publish fails the task. A bus that cannot
+    /// tell whether a signal went out (an acknowledgement that timed out
+    /// after the send) returns `Ok`, since delivery is at most once anyway;
+    /// returning `Err` there would fail a task whose operation got its input.
     async fn publish(&self, signal: TaskSignal) -> Result<(), TaskError>;
 }
 
@@ -1012,6 +1018,8 @@ impl TaskManager {
     /// With one, the engine cannot see whether any instance still runs the
     /// operation: input published for one that ended leaves the task
     /// `working` until its TTL, the same as an operation that never settles.
+    /// Input the bus refuses ([`TaskSignalBus::publish`] returns `Err`) fails
+    /// the task and returns [`TaskError::Detached`].
     pub async fn apply_input(
         &self,
         owner: &TaskOwner,
@@ -1042,6 +1050,7 @@ impl TaskManager {
             })
             .await?;
 
+        let local = inputs.is_some();
         let handed = if let Some(inputs) = inputs {
             inputs.send(responses).is_ok()
         } else {
@@ -1060,10 +1069,12 @@ impl TaskManager {
             // it, so settle it as failed.
             let mut error = Map::new();
             error.insert("code".to_owned(), Value::from(INTERNAL_ERROR));
-            error.insert(
-                "message".to_owned(),
-                Value::String("task operation ended before receiving its input".to_owned()),
-            );
+            let message = if local {
+                "task operation ended before receiving its input"
+            } else {
+                "task input could not be carried to the instance running the operation"
+            };
+            error.insert("message".to_owned(), Value::String(message.to_owned()));
             self.fail(owner, id, error).await?;
             return Err(TaskError::Detached(id.clone()));
         }
