@@ -1,5 +1,16 @@
 # Changelog
 
+## [4.1.0] — 2026-10-04
+
+### Added
+
+- feat(tasks): add TaskSignalBus to reach task runs on other instances
+
+### Fixed
+
+- fix(tasks): pin TaskSignalBus::publish's Err contract and failure text
+
+
 ## [4.0.0] — 2026-10-03
 
 ### Added
