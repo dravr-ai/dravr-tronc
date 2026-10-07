@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.2.0] — 2026-10-07
+
+### Added
+
+- feat(notifications): send_with_receipt returns Resend's message id
+
+
 ## [4.1.0] — 2026-10-04
 
 ### Added
