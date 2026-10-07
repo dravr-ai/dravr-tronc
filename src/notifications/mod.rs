@@ -28,5 +28,5 @@ pub use config::{EmailConfig, NotificationConfig, SlackConfig};
 pub use email::EmailClient;
 pub use error_layer::ErrorNotificationLayer;
 pub use posthog::PostHogClient;
-pub use resend::{ResendBody, ResendClient, ResendEmail, ResendError};
+pub use resend::{ResendBody, ResendClient, ResendEmail, ResendError, ResendReceipt};
 pub use slack::SlackClient;

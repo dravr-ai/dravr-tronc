@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -94,6 +94,22 @@ impl<'a> Payload<'a> {
     }
 }
 
+/// What Resend acknowledged for an accepted send.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ResendReceipt {
+    /// The message id Resend assigned — the key its dashboard and its delivery
+    /// webhooks use for this email. `None` only when a success answer carried
+    /// no readable id; the email was still accepted.
+    pub id: Option<String>,
+}
+
+/// The body of Resend's success answer.
+#[derive(Deserialize)]
+struct Accepted {
+    id: String,
+}
+
 /// Why a send failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -163,6 +179,19 @@ impl ResendClient {
     /// [`ResendError::Transport`] when the request could not be made, and
     /// [`ResendError::Api`] for a non-success answer that retrying did not cure.
     pub async fn send(&self, email: &ResendEmail) -> Result<(), ResendError> {
+        self.send_with_receipt(email).await.map(|_| ())
+    }
+
+    /// [`send`](Self::send), returning what Resend acknowledged — the message
+    /// id a host logs so one send can be found in Resend's dashboard.
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send).
+    pub async fn send_with_receipt(
+        &self,
+        email: &ResendEmail,
+    ) -> Result<ResendReceipt, ResendError> {
         let payload = Payload::of(email);
         send_with_retry(|| {
             self.http
@@ -177,7 +206,7 @@ impl ResendClient {
 
 /// POST through `post` until it succeeds, a non-`429` failure arrives, or the
 /// `429` retry plan gives up.
-async fn send_with_retry<F, Fut>(mut post: F) -> Result<(), ResendError>
+async fn send_with_retry<F, Fut>(mut post: F) -> Result<ResendReceipt, ResendError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Response, reqwest::Error>>,
@@ -189,7 +218,8 @@ where
             .map_err(|e| ResendError::Transport(describe_request_error(e)))?;
         let status = response.status();
         if status.is_success() {
-            return Ok(());
+            let id = response.json::<Accepted>().await.ok().map(|a| a.id);
+            return Ok(ResendReceipt { id });
         }
 
         let retry = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -263,7 +293,7 @@ mod tests {
     }
 
     /// Replays `answers` in order and counts the posts made.
-    async fn replay(answers: Vec<Response>) -> (Result<(), ResendError>, u32) {
+    async fn replay(answers: Vec<Response>) -> (Result<ResendReceipt, ResendError>, u32) {
         let mut answers = VecDeque::from(answers);
         let posts = AtomicU32::new(0);
         let result = send_with_retry(|| -> Ready<Result<Response, reqwest::Error>> {
@@ -283,8 +313,20 @@ mod tests {
             answer(200, &[], r#"{"id":"e-1"}"#),
         ])
         .await;
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(ResendReceipt {
+                id: Some("e-1".to_owned())
+            })
+        );
         assert_eq!(posts, 2);
+    }
+
+    #[tokio::test]
+    async fn a_success_without_a_readable_id_is_still_a_success() {
+        let (result, posts) = replay(vec![answer(200, &[], "not json")]).await;
+        assert_eq!(result, Ok(ResendReceipt { id: None }));
+        assert_eq!(posts, 1);
     }
 
     #[tokio::test]
