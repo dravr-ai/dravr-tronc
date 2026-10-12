@@ -1842,6 +1842,96 @@ mod tests {
         assert!(result.get("resultType").is_none());
     }
 
+    /// Answers with the `client_id` its context carries, or `none`.
+    struct ClientIdEchoTool;
+
+    #[async_trait::async_trait]
+    impl McpTool<TestState> for ClientIdEchoTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "client_id_echo".to_owned(),
+                description: "Returns the client id the call carries".to_owned(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+                execution: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<TestState>,
+            ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text(ctx.client_id.clone().unwrap_or_else(|| "none".to_owned()))
+        }
+    }
+
+    /// Resolves every caller to the one registered client it verified.
+    struct VerifiedClientHook;
+
+    #[async_trait::async_trait]
+    impl AuthHook<TestState> for VerifiedClientHook {
+        async fn authenticate(
+            &self,
+            _request: &JsonRpcRequest,
+            _state: &Arc<TestState>,
+        ) -> Result<ToolContext, AuthError> {
+            Ok(ToolContext::new().with_client_id("mcp_client_registered"))
+        }
+    }
+
+    /// A modern `tools/call` of [`ClientIdEchoTool`] whose `clientInfo`
+    /// claims a client of its own choosing.
+    const SPOOFED_CLIENT_CALL: &str = r#"{
+        "jsonrpc": "2.0",
+        "id": 26,
+        "method": "tools/call",
+        "params": {
+            "name": "client_id_echo",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { "name": "mcp_client_spoofed", "version": "1" },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    }"#;
+
+    fn make_client_echo_server() -> McpServer<TestState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ClientIdEchoTool));
+        McpServer::new("test-server", "0.1.0", registry, Arc::new(TestState))
+    }
+
+    #[tokio::test]
+    async fn a_tool_sees_the_client_the_hook_verified_not_the_one_the_request_names() {
+        let server = make_client_echo_server().with_auth_hook(Arc::new(VerifiedClientHook));
+        let request: JsonRpcRequest = serde_json::from_str(SPOOFED_CLIENT_CALL).expect("parse"); // Safe: test assertion
+
+        let ctx = server.authenticate(&request).await.expect("authenticate"); // Safe: test assertion
+        let resp = server
+            .handle_request_with_context(request, &ctx)
+            .await
+            .expect("response"); // Safe: test assertion
+
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["content"][0]["text"], "mcp_client_registered");
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_call_carries_no_client_whatever_it_names() {
+        let server = make_client_echo_server();
+        let resp = server
+            .handle_raw(SPOOFED_CLIENT_CALL)
+            .await
+            .expect("response"); // Safe: test assertion
+
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["content"][0]["text"], "none");
+    }
+
     #[tokio::test]
     async fn modern_tools_call_is_not_cacheable() {
         // `CallToolResult` does not extend `CacheableResult`; framing it would

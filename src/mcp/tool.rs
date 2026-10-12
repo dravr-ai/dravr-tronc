@@ -186,6 +186,21 @@ pub struct ToolContext {
     /// Deliberately `Vec<String>` and not a typed set: the vocabulary is the
     /// host's, and tronc has no business naming an athlete's scopes.
     pub scopes: Vec<String>,
+    /// The OAuth `client_id` this call came through, as the host verified it
+    /// on the credential: the identifier the authorization server assigned
+    /// at registration and checked when it issued the token (RFC 9068 §2.2).
+    ///
+    /// Never the client's own word for itself. The `clientInfo` a modern
+    /// request carries in [`Self::meta`] (see [`RequestMeta::client_info`])
+    /// and the HTTP `User-Agent` are both chosen by the caller, so neither
+    /// may stand in here: an audit trail that names the client reads this
+    /// field, and a value the caller picked is no evidence of who called.
+    ///
+    /// The engine never sets it; the host's
+    /// [`AuthHook`](crate::mcp::auth::AuthHook) does. `None` when the
+    /// credential was issued to no registered client (an API key, say) or
+    /// the server does not authenticate.
+    pub client_id: Option<String>,
     /// Fired when the client cancels this request with
     /// `notifications/cancelled`, or when the request is dropped before it is
     /// answered (its connection closed).
@@ -251,6 +266,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_request_id(mut self, request_id: Value) -> Self {
         self.request_id = Some(request_id);
+        self
+    }
+
+    /// Set the OAuth `client_id` the host verified on the credential — see
+    /// [`Self::client_id`] for why it is never the request's `clientInfo`.
+    #[must_use]
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
         self
     }
 
@@ -879,6 +902,27 @@ mod tests {
             registry.register(Box::new(Shaped(schema.clone())));
             assert_eq!(registry.len(), 1, "{schema} is registered");
         }
+    }
+
+    #[test]
+    fn client_id_is_set_by_the_host_and_never_read_from_client_info() {
+        assert_eq!(ToolContext::new().client_id, None);
+
+        let verified = ToolContext::new().with_client_id("mcp_client_registered");
+        assert_eq!(verified.client_id.as_deref(), Some("mcp_client_registered"));
+
+        // A request's self-asserted identity lands in `meta`, and stays there.
+        let meta = RequestMeta::from_params(Some(&json!({
+            "_meta": {
+                "io.modelcontextprotocol/clientInfo": { "name": "spoofed", "version": "1" }
+            }
+        })));
+        let ctx = ToolContext::new().with_meta(meta);
+        assert_eq!(
+            ctx.meta.client_info().map(|info| info.name),
+            Some("spoofed".to_owned())
+        );
+        assert_eq!(ctx.client_id, None);
     }
 
     #[test]
