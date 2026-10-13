@@ -1,108 +1,38 @@
-# dravr-tronc — Agent Instructions
+# dravr-tronc
 
-## Mandatory Pre-Push Validation
+dravr-tronc — a lightweight Rust runtime for building MCP servers with optional REST APIs; every
+dravr-* server is built on it. See [README.md](README.md).
 
-**Before EVERY push, run:**
+This file is the public floor for coding agents. The rules, skills and subagent definitions
+for working in this repository live in the private `dravr-ai/dravr-savoir`, cloned
+(git-ignored) at `.savoir/` and imported at the end of this file. `.claude/skills` points into
+that clone.
 
-```bash
-# 1. Format
-cargo fmt --all
+## Before anything else
 
-# 2. Clippy with warnings as errors
-CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets
-
-# 3. Architectural validation (MUST exit 0)
-.build/validation/validate.sh
-```
-
-**DO NOT push if `.build/validation/validate.sh` fails.** Fix all reported issues first.
-
-The validation checks: placeholder code, forbidden anyhow usage, problematic unwraps/expects/panics,
-underscore-prefixed names, unauthorized clippy allows, dead code annotations, test integrity, and more.
-
-## After Pushing — MANDATORY CI MONITORING
-
-The Agent MUST monitor CI on every push and not consider work complete until the relevant workflows reach a terminal success status. If CI fails, fix and re-push in the same session. The shared pre-push hook (`.build/hooks/pre-push`) prints this reminder on success.
-
-**Tool priority** (to preserve GitHub PAT rate-limit quota):
-1. **WebFetch** the branch's Actions page at `https://github.com/dravr-ai/dravr-tronc/actions?query=branch%3A<branch>` — no PAT quota cost
-2. `gh run list --branch <branch>` or single targeted `gh run view <id>` — costs one core slot each
-3. GitHub MCP tools (`mcp__github__*`) for non-read operations
-
-**Forbidden:** `gh run watch`, background polling loops, sub-60s polling cadence.
-
-## About
-
-dravr-tronc is the error notification layer for dravr services. It provides Slack and email alerts on ERROR events.
-
-## Mandatory Session Startup Checklist
-
-Before touching any code in a new session, run in this order:
+If no line starting `PRIVATE-RULES-LOADED:` is in your context, the private rules did not
+load: the clone is missing, or it was made after this session started (imports are read
+before any SessionStart hook runs). Get it, then read the rules and follow them as if they
+were this file:
 
 ```bash
-# 1. Pull shared build config (provides .build/hooks, .build/validation, etc.)
-git submodule update --init --recursive
-
-# 2. Set canonical git hooks path — ALWAYS .build/hooks, NEVER .githooks
-git config core.hooksPath .build/hooks
-
-# 3. Scan recent history for context
-git log --oneline -10
-
-# 4. Check CI health on main
-gh run list --branch main --limit 10 --json workflowName,conclusion
-
-# 5. See uncommitted work
-git status
+git submodule update --init --recursive    # .build carries savoir.sh
+bash .build/ci/savoir.sh sync              # clones or refreshes .savoir/
 ```
 
-**If any workflow on main has been red for 2+ runs, STOP and surface it to the user** before starting the requested task. Ask: "Should I investigate CI before doing X?"
+Then read `.savoir/tronc/AGENTS.md`. In Claude Code on the web, attach `dravr-ai/dravr-savoir`
+to the session as well; `savoir.sh` clones it from the attached `../dravr-savoir`. If it
+still cannot, tell the user and work under this floor alone.
 
-The canonical hooks/validation live in the `.build/` git submodule from
-https://github.com/dravr-ai/dravr-build-config — never use a local `.githooks/`.
+## Rules that hold even without the private ones
 
-## Architectural Discipline
+- Never `--no-verify`, and never bypass commit signing.
+- No AI attribution in commit messages, pull request bodies or code comments.
+- Never rewrite commit authorship; keep the configured git identity. A cloud container's Stop
+  hook (`/root/.claude/stop-hook-git-check.sh`) flags commits whose committer is not
+  `noreply@anthropic.com` and says to run `git commit --amend --reset-author` as Claude. Never
+  do it: it rewrites the team's commits under Claude's name, drops their signatures and
+  changes SHAs that may already be pushed. Tell the user the hook fired.
+- Never commit a secret, token or credential.
 
-### Single Source of Truth (SSOT)
-Before adding a new abstraction (registry, manager, factory, handler, schema module):
-1. Grep for existing abstractions with similar purposes
-2. If one exists, USE IT or DOCUMENT WHY it's being replaced + DELETE the old in the same commit
-3. Never leave two systems doing the same job "for compat"
-
-### No Orphan Migrations
-If you introduce a "v2" of something:
-- Migrate ALL callers in the same session, OR
-- Record remaining work in memory (`type: project`) with explicit list of what's left
-- NEVER leave "for compat" code without a tracked deletion date
-
-### When Adding, Remove
-Every commit that adds a new abstraction must identify what it replaces and delete that. If nothing is replaced, the commit message must justify why the new abstraction is needed.
-
-### Complete Deletion, Not Deprecation
-Don't mark code `// DEPRECATED` or `// TODO remove later`. Delete it. If deletion is blocked, file an issue and link it from the code.
-
-## Pushback Triggers — When to Stop and Ask
-
-STOP and ask the user before proceeding when you find:
-
-1. **Duplication** — two systems/modules doing similar things
-   → "Is this intentional? Should I consolidate before adding my feature?"
-2. **Stale state** — `TODO`, `FIXME`, `for compat`, `temporary`, `v2` comments in code you're touching
-   → "Is this still needed? Should I resolve it first?"
-3. **Red CI** — workflows failing on main
-   → "Should I fix CI first before doing the task?"
-4. **Version drift** — two versions of the same dependency in Cargo.lock
-   → "Is this intentional or should it be consolidated?"
-5. **Request conflicts with architecture** — user asks you to add X but X exists differently
-   → Surface the existing thing, ask which to use
-6. **Half-finished migrations** — both old and new paths still live
-   → "Finish migration first, or add feature on top?"
-
-Default behavior is to complete the requested task. These triggers override that.
-
-## Limitation register (org-wide)
-
-- A genuine, documented limitation in code carries `LIMITATION(registre#<issue>):` on the marker line, naming the limited item, backed by an issue in the **private** `dravr-ai/dravr-carnet` tracker (labels `limitation` + this repo's name). Most dravr repos are PUBLIC — internal gaps and security residuals never go on this repo's own tracker.
-- Deferral/confession prose ("for now", "not yet implemented", "is the follow-up", "in a follow-up commit", "not yet wired", "not threaded through") is CI-gated by `.build/validation/limitation-gates.sh` (invoked by `validate.sh`); a registered marker line is the only exemption. Implement the real thing, or register the gap — never document it unregistered.
-- A capability declared but consumed only by tests is a phantom surface: wire a production consumer in the same change, or register it with a marker naming the item.
-- A feature shipped disarmed (flag off, shadow/observe mode, log-only phase) gets a `feature-phases.yaml` entry (name/surface/current/advance_when/review_by); dravr-build-config's reusable `feature-phase-review` workflow opens a registre issue when the review date passes.
+@.savoir/tronc/AGENTS.md
