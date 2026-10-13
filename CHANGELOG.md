@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.3.0] — 2026-10-13
+
+### Added
+
+- feat(mcp): ToolContext::client_id, the client the host verified
+
+
 ## [4.2.0] — 2026-10-07
 
 ### Added
