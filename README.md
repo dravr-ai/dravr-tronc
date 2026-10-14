@@ -389,7 +389,10 @@ let app = rest_routes
   one from a server that configures itself elsewhere. A handler panic becomes a `500` with
   `{"error":{"type":"handler_panic",…}}` and an ERROR line carrying the panic payload. A request
   dropped before it answered — the client closed the connection mid-request, or the server went
-  down — is logged at WARN with how long it ran.
+  down — is logged at WARN with how long it ran. A `POST` answered with an event stream (an MCP
+  call that reports progress or logs before its result) is still running while its body streams,
+  so its line is written when the stream ends and `latency_ms` covers the whole call; a stream
+  cut before its end is logged at WARN as cut, never as completed.
 - **`enforce_deadline`** answers a `504` with `{"error":{"type":"request_timeout",…}}` when the
   handler is still running at the deadline, and drops the handler. Put it on the router that holds
   one-shot REST routes, sized above the slowest legitimate request and below the caller's own

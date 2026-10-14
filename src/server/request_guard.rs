@@ -14,8 +14,12 @@
 //!   trace a W3C `traceparent` header names
 //!   ([`trace_context`](crate::server::trace_context)). It logs one INFO line per request when the response is ready
 //!   (method, route template, status, latency, id) — a WARN line instead when
-//!   the request ran past the [slow-request threshold](slow_request_threshold)
-//!   — and it turns a handler
+//!   the request ran past the [slow-request threshold](slow_request_threshold).
+//!   A `POST` answered with an event stream — an MCP call that reports
+//!   progress or logs before its result — is still running while its body
+//!   streams, so its line is written when the stream ends, and its latency
+//!   covers the whole call; a stream cut before its end is logged at WARN.
+//!   It turns a handler
 //!   panic into a `500` whose JSON body carries [`HANDLER_PANIC`], logging the
 //!   panic payload at ERROR under the request id. A request whose future is
 //!   dropped before it answered is logged at WARN with how long it ran: hyper
@@ -65,16 +69,20 @@ use std::env;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::{MatchedPath, Request};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::FutureExt;
+use futures::{FutureExt, Stream};
 use tokio::time;
 use tracing::{error, info, info_span, warn, Instrument};
 
@@ -122,6 +130,9 @@ pub const DEFAULT_SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
 /// The concrete path is never logged: it and its query string carry athlete
 /// and session ids.
 const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Media type of a streamed answer ([`is_streamed_answer`]).
+const TEXT_EVENT_STREAM: &str = "text/event-stream";
 
 /// The id one request is logged under, shared with the caller through
 /// [`REQUEST_ID_HEADER`].
@@ -315,6 +326,22 @@ impl InFlight {
             ),
         }
     }
+
+    /// Log a streamed answer whose body was dropped before its end: the
+    /// client closed the connection, or the server stopped, while the call
+    /// was still streaming. The status was sent; the answer was not finished.
+    fn cut(mut self, status: StatusCode) {
+        self.finished = true;
+        warn!(
+            request_id = %self.request_id,
+            method = %self.method,
+            path = %self.path,
+            status = status.as_u16(),
+            elapsed_ms = elapsed_ms(self.started),
+            "streamed response cut before its end: the connection closed or the server \
+             stopped while the call was still streaming"
+        );
+    }
 }
 
 impl Drop for InFlight {
@@ -328,6 +355,73 @@ impl Drop for InFlight {
                 "request dropped before a response: the connection closed or the server \
                  stopped while the handler was running"
             );
+        }
+    }
+}
+
+/// Whether `response` answers a `POST` with an event stream.
+///
+/// That is a streamed MCP call: the transport answers at the call's first
+/// progress or log message, and the call runs on inside the body. A `GET`
+/// event stream is excluded — the MCP notification stream lives as long as
+/// its session, and its lifetime is not a request's latency.
+fn is_streamed_answer(method: &Method, response: &Response) -> bool {
+    method == Method::POST
+        && response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .trim_start()
+                    .get(..TEXT_EVENT_STREAM.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TEXT_EVENT_STREAM))
+            })
+}
+
+/// The body of a streamed answer, which writes the request's completion line
+/// when the stream ends instead of when its headers were ready.
+///
+/// Dropped before its end, the request is logged as cut
+/// ([`InFlight::cut`]), never as completed.
+struct StreamedAnswer {
+    data: BodyDataStream,
+    in_flight: Option<InFlight>,
+    status: StatusCode,
+}
+
+impl StreamedAnswer {
+    /// `response` with its body wrapped so `in_flight` finishes when the body
+    /// ends.
+    fn wrap(response: Response, in_flight: InFlight) -> Response {
+        let (parts, body) = response.into_parts();
+        let streamed = Self {
+            data: body.into_data_stream(),
+            in_flight: Some(in_flight),
+            status: parts.status,
+        };
+        Response::from_parts(parts, Body::from_stream(streamed))
+    }
+}
+
+impl Stream for StreamedAnswer {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = Pin::new(&mut self.data).poll_next(cx);
+        if matches!(polled, Poll::Ready(None)) {
+            if let Some(in_flight) = self.in_flight.take() {
+                in_flight.finish(self.status);
+            }
+        }
+        polled
+    }
+}
+
+impl Drop for StreamedAnswer {
+    fn drop(&mut self) {
+        if let Some(in_flight) = self.in_flight.take() {
+            in_flight.cut(self.status);
         }
     }
 }
@@ -397,7 +491,11 @@ pub async fn guard_requests_with_threshold(
             )
         }
     };
-    in_flight.finish(response.status());
+    if is_streamed_answer(&in_flight.method, &response) {
+        response = StreamedAnswer::wrap(response, in_flight);
+    } else {
+        in_flight.finish(response.status());
+    }
 
     if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);

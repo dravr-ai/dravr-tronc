@@ -1,5 +1,5 @@
 // ABOUTME: Tests the request guard: a panic answers a JSON 500 over a real socket, a deadline a JSON 504
-// ABOUTME: Pins the request-id echo, the completion and dropped-request log lines, and the MCP exemption
+// ABOUTME: Pins the request-id echo, the completion, dropped and streamed-call log lines, and the MCP exemption
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -36,6 +36,7 @@ use dravr_tronc::server::request_guard::{
     RequestId, DEFAULT_SLOW_REQUEST_THRESHOLD, HANDLER_PANIC, MAX_REQUEST_ID_LEN,
     REQUEST_ID_HEADER, REQUEST_TIMEOUT,
 };
+use futures::stream;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -601,6 +602,178 @@ async fn a_request_past_the_slow_threshold_completes_at_warn() {
         1,
         "one completion line per request: {logs}"
     );
+}
+
+/// Reports progress at once, then works on: the transport answers with an
+/// event stream at the progress message, and the call runs inside the body.
+struct ProgressThenWork;
+
+#[async_trait]
+impl McpTool<()> for ProgressThenWork {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "progress_then_work".to_owned(),
+            description: "Reports progress, then works for 300 ms".to_owned(),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            annotations: None,
+            execution: None,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _state: &Arc<()>,
+        ctx: &ToolContext,
+        _arguments: Value,
+    ) -> ToolResponse {
+        ctx.client.progress(1.0, Some(2.0), None);
+        time::sleep(Duration::from_millis(300)).await;
+        ToolResponse::text("worked".to_owned())
+    }
+}
+
+/// The MCP route serving [`ProgressThenWork`], guarded under `threshold`.
+fn streaming_app(threshold: Option<Duration>) -> Router {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ProgressThenWork));
+    let server = Arc::new(McpServer::new("test", "0.1.0", registry, Arc::new(())));
+    mcp_router(server).layer(from_fn(move |req, next| {
+        guard_requests_with_threshold(threshold, req, next)
+    }))
+}
+
+fn streamed_call() -> Request<Body> {
+    Request::post("/mcp")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header(REQUEST_ID_HEADER, "streamed-1")
+        .body(Body::from(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "progress_then_work", "arguments": {},
+                              "_meta": {"progressToken": "p-1"}}})
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// The `latency_ms` a completion line records.
+fn logged_latency_ms(line: &str) -> u64 {
+    let digits: String = line
+        .split_once("latency_ms=")
+        .unwrap_or_else(|| panic!("no latency_ms in {line}"))
+        .1
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap()
+}
+
+/// A call that streams progress before its result is still running when its
+/// headers are out. Its completion line waits for the end of the stream, so
+/// its latency is the whole call's and a slow call is flagged as slow.
+#[tokio::test]
+async fn a_streamed_call_completes_when_its_stream_ends() {
+    let (logs, _subscriber) = capture_logs();
+
+    let response = streaming_app(Some(Duration::from_millis(100)))
+        .oneshot(streamed_call())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    assert!(
+        !logs.text().contains("request completed"),
+        "the call is still running when its headers are out: {}",
+        logs.text()
+    );
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("notifications/progress"), "{body}");
+    assert!(body.contains("worked"), "{body}");
+
+    let logs = logs.text();
+    let completions: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("request completed"))
+        .collect();
+    assert_eq!(
+        completions.len(),
+        1,
+        "one completion line per request: {logs}"
+    );
+    let completion = completions[0];
+    assert!(
+        completion.contains(" WARN ") && completion.contains("slow request completed"),
+        "a 300 ms call is past a 100 ms threshold: {completion}"
+    );
+    assert!(completion.contains("request_id=streamed-1"), "{completion}");
+    assert!(completion.contains("status=200"), "{completion}");
+    assert!(
+        logged_latency_ms(completion) >= 300,
+        "the latency covers the whole call, not the first event: {completion}"
+    );
+}
+
+/// A streamed answer dropped before its end — the client went away while the
+/// call ran — is logged as cut, never as completed.
+#[tokio::test]
+async fn a_streamed_call_cut_before_its_end_is_logged_as_cut() {
+    let (logs, _subscriber) = capture_logs();
+
+    let response = streaming_app(None).oneshot(streamed_call()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let logs = logs.text();
+    let cut = logs
+        .lines()
+        .find(|line| line.contains("streamed response cut before its end"))
+        .unwrap_or_else(|| panic!("the cut stream is logged: {logs}"));
+    assert!(cut.contains(" WARN "), "{cut}");
+    assert!(cut.contains("request_id=streamed-1"), "{cut}");
+    assert!(cut.contains("status=200"), "{cut}");
+    assert!(
+        !logs.contains("request completed"),
+        "a stream that never ended is not logged as completed: {logs}"
+    );
+}
+
+/// A `GET` event stream (the MCP notification stream) lives as long as its
+/// session, so it completes at its headers as every other response does.
+#[tokio::test]
+async fn a_get_event_stream_completes_at_its_headers() {
+    let (logs, _subscriber) = capture_logs();
+    let app = Router::new()
+        .route(
+            "/api/events",
+            get(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(stream::pending::<Result<String, io::Error>>()),
+                )
+            }),
+        )
+        .layer(from_fn(guard_requests));
+
+    let response = app
+        .oneshot(Request::get("/api/events").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let logs = logs.text();
+    let completion = logs
+        .lines()
+        .find(|line| line.contains("request completed"))
+        .unwrap_or_else(|| panic!("the GET stream completes at its headers: {logs}"));
+    assert!(completion.contains("path=/api/events"), "{completion}");
+    drop(response);
 }
 
 /// Under the threshold, or with the warning off, the completion stays INFO.
