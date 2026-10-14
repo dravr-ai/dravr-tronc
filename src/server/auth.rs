@@ -13,7 +13,7 @@
 //! for the common case, a service gated by one shared key, with the posture
 //! logged: every satellite used to carry its own copy of those ten lines.
 //!
-//! **Which mechanism?** This crate ships five, and the choice is made by what
+//! **Which mechanism?** This crate ships six, and the choice is made by what
 //! the caller can present, per route — not by which one has no feature flag.
 //! The table is in the crate README under "Choosing an auth mechanism"; read it
 //! before reaching for a shared bearer key, which is the wrong answer whenever

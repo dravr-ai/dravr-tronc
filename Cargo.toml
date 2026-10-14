@@ -33,9 +33,13 @@ schema-validation = ["dep:jsonschema"]
 # port-0 bound server, response assertions and a tools/list snapshot. For a
 # consumer's dev-dependencies; it pulls reqwest, tower and http-body-util,
 # which a server binary has no use for.
-testkit = ["http-client", "dep:tower", "dep:http-body-util"]
+# With google-iam it also brings `testkit::TestIssuer`, which signs test tokens
+# from an openssl PEM key — hence jsonwebtoken's use_pem.
+testkit = ["http-client", "dep:tower", "dep:http-body-util", "jsonwebtoken?/use_pem"]
 # Google Cloud service-to-service auth, both ends of the handshake: an
 # `IdTokenSource` for the caller and a verifying middleware for the callee.
+# Also `mcp::caller`: the verified caller identity a platform-minted JWT
+# carries (`CallerTokenVerifier`, `CallerAuthHook`), on the same key-set cache.
 # Opt-in because it pulls a JWT stack, and a stdio-only MCP server has no use
 # for it — the platform also holds an 80MB binary budget.
 google-iam = ["http-client", "dep:jsonwebtoken"]

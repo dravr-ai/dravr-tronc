@@ -19,6 +19,10 @@
 //!   answers the requests a tool sends its client mid-call.
 //! - [`McpTestServer`] binds a server to `127.0.0.1:0` and hands out clients
 //!   for whichever port the system chose, for a test that needs a real socket.
+//! - `TestIssuer` (with `google-iam` too) stands in for the platform's
+//!   authorization server: a fresh RSA key, its JWK set served on loopback,
+//!   and a minter of caller tokens, so a server gated by
+//!   `mcp::caller::CallerAuthHook` is tested end to end.
 //! - [`assert`] holds assertions on tool results and JSON-RPC responses, and
 //!   [`assert::assert_tools_snapshot`], which pins a server's whole
 //!   `tools/list` to a committed file.
@@ -33,10 +37,14 @@
 
 pub mod assert;
 mod client;
+#[cfg(feature = "google-iam")]
+mod issuer;
 mod server;
 
 pub use client::{
     Exchange, McpTestClient, RawResponse, ServerRequestHandler, TestClientError,
     TESTKIT_CLIENT_NAME,
 };
+#[cfg(feature = "google-iam")]
+pub use issuer::{TestClaims, TestIssuer};
 pub use server::McpTestServer;

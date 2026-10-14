@@ -5,6 +5,8 @@
 // Copyright (c) 2026 dravr.ai
 
 pub mod auth;
+#[cfg(feature = "google-iam")]
+pub mod caller;
 pub(crate) mod cancellation;
 pub mod client_channel;
 #[cfg(feature = "computation")]

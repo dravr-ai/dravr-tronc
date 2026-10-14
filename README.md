@@ -190,7 +190,7 @@ once, last. See [Request guard](#request-guard).
 |--------|---------|
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
-| `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools (one whose `outputSchema` root is not `type: "object"`, or has a property schema that is not an object, is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
+| `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `execute` refuses `ADMIN_ONLY` to a non-admin, `REQUIRES_AUTH`/`REQUIRES_TENANT` to a context without a caller/tenant, and a tool's `required_scopes` to a grant missing one (one whose `outputSchema` root is not `type: "object"`, or has a property schema that is not an object, is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision; a list result is a `schema::Listed<T>` (`{"items": [...]}`), since `structuredContent` is an object |
 | `mcp::validation` *(feature `schema-validation`)* | `ToolSchemaValidator` — a tool's `inputSchema`/`outputSchema` compiled once (2020-12 by default, no remote `$ref`); `ToolRegistry::execute` refuses arguments and structured results that violate them with a tool error |
@@ -198,13 +198,14 @@ once, last. See [Request guard](#request-guard).
 | `mcp::client_channel` | `ClientChannel` (`ToolContext::client`) — a running call's progress, log messages, sampling and elicitation; `ClientRequestError` |
 | `mcp::logging` | `LogLevel` (RFC 5424 severities, ordered) and the `notifications/message` params |
 | `mcp::elicitation` | Form-mode `elicitation/create` — `ElicitRequest`, the restricted `ElicitationSchema` with SEP-1034 defaults and SEP-1330 enums, `ElicitResult` |
-| `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket), the host's own router with its auth/CORS layers (`over_router`), or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `exchange` (the messages a call streams before its response), `raw`; it keeps the `Mcp-Session-Id`, answers server requests with an `on_server_request` handler, and `end_session`s; `McpTestServer` — a server on `127.0.0.1:0`; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
+| `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket), the host's own router with its auth/CORS layers (`over_router`), or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `exchange` (the messages a call streams before its response), `raw`; it keeps the `Mcp-Session-Id`, answers server requests with an `on_server_request` handler, and `end_session`s; `McpTestServer` — a server on `127.0.0.1:0`; `TestIssuer` (with `google-iam`) — a stand-in authorization server minting caller tokens; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout; one connection, one session; on stdin EOF it answers the requests already read (10 s at most), then closes stdout and cancels the connection, so a job holding a tool's context does not hold the process |
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE` |
 | `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
 | `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
 | `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve, and its 401 challenge |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
+| `mcp::caller` *(feature `google-iam`)* | Verified caller identity — `CallerTokenVerifier` checks a platform-minted RS256 JWT (JWKS signature, `iss`, per-server `aud`, `exp`/`nbf`) and reads `sub`/tenant/`scope`/`client_id`; `CallerAuthHook` makes it the call's `ToolContext`, optionally beside the shared key or anonymous loopback (both identity-free); `CallerTokenConfig::from_env` |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called; `GoogleKeySet`, the cache of Google's signing keys for one key-set URL, refetching for an unknown `kid` at most every 30s |
@@ -221,10 +222,10 @@ once, last. See [Request guard](#request-guard).
 
 ## Choosing an auth mechanism
 
-There are five, and picking between them is the decision agents get wrong here — usually by
+There are six, and picking between them is the decision agents get wrong here — usually by
 reaching for the shared bearer key because it is the one with no feature flag. **Pick by what
 the caller can present, and pick per route.** A deployment changes; a caller's credential does
-not. Two of the five are behind cargo features, and `default = []`, so out of the box you have
+not. Three of the six are behind cargo features, and `default = []`, so out of the box you have
 `server::auth::require_auth` and the `mcp::auth::AuthHook` seam and nothing else — that
 availability is not an argument for using them.
 
@@ -232,6 +233,7 @@ availability is not an argument for using them.
 |---|---|---|
 | another dravr workload on Google infrastructure | `iam::require_google_id_token` (callee) / `iam::IdTokenSource` (caller) | `google-iam` |
 | a human, through a browser or an app | the host's own session auth; `mcp::auth::AuthHook` for MCP routes | — |
+| a user, through a client the platform's authorization server issued a token to — on MCP routes of a server that holds no users of its own | `mcp::caller::CallerAuthHook` over a `CallerTokenVerifier` | `google-iam` |
 | a third-party webhook | that vendor's signature — e.g. `notifications::slack::SlackClient::verify_signature` — never a bearer | `notifications` |
 | our own binary, over the wire, with nowhere to put a Google identity | `server::auth::require_auth` for REST routes, `mcp::auth::ApiKeyAuthHook` for MCP routes | — |
 | on stdio, or a linked crate in the same process | nothing | — |
@@ -307,6 +309,56 @@ A name is still only a name when it is bound, because the system resolver answer
 with `127.0.0.1`, `::1` or both, and on a misconfigured machine with anything. So the text check is
 a judgement made before any socket exists, and `http::serve` goes further: it judges every address
 the host resolves to before binding.
+
+### Verified caller identity: tools over one user's rows
+
+A shared key says the caller holds the key, and nothing about which user or tenant is calling. A
+tool that reads or writes one user's rows in one tenant needs that identity on the credential, and
+must never take it as an argument — any key holder would then name any tenant.
+
+`mcp::caller` (feature `google-iam`) verifies an RS256 JWT the platform's authorization server
+minted for this server: signature against the issuer's JWK set (cached by `iam::GoogleKeySet`),
+`iss`, `aud` equal to this server's own resource identifier (RFC 8707), `exp`, and `nbf` when
+present. `sub` becomes `ToolContext::user_id`, the tenant claim (`active_tenant_id` by default)
+`tenant_id`, the space-delimited `scope` claim `scopes`, and `client_id` `client_id`. Any failed
+check is a `401` carrying the challenge you configure — the reason goes to the log only — and a key
+set that cannot be fetched is a `500`, because that outage says nothing about the token.
+
+```rust
+use dravr_tronc::mcp::auth::ApiKeyAuthHook;
+use dravr_tronc::mcp::caller::{CallerAuthHook, CallerTokenConfig};
+use dravr_tronc::server::auth::{api_key_configured, resolve_startup_auth, AuthMode};
+
+// MY_RESOURCE_URL, MY_CALLER_ISSUER, MY_CALLER_JWKS_URL, MY_AUTHORIZATION_SERVER: all or none.
+let caller = CallerTokenConfig::from_env("MY")?;
+let keyed = api_key_configured("MY_API_KEY");
+let mode = resolve_startup_auth(&args.host, keyed || caller.is_some())?;
+
+if let Some(config) = caller {
+    let metadata = config.resource_metadata()?;
+    let mut hook = CallerAuthHook::new(Arc::new(config.verifier(http)), metadata.www_authenticate());
+    if keyed {
+        hook = hook.with_shared_key(ApiKeyAuthHook::new("MY_API_KEY", "my-service"));
+    } else if mode == AuthMode::LoopbackDev {
+        hook = hook.allowing_anonymous();
+    }
+    server = server.with_protected_resource_metadata(metadata).with_auth_hook(Arc::new(hook));
+}
+```
+
+The tool states what it needs, and `ToolRegistry::execute` enforces it, so no tool stays closed by
+its own discipline:
+
+- `ToolCapabilities::REQUIRES_AUTH` — refused unless the context carries a `user_id`.
+- `ToolCapabilities::REQUIRES_TENANT` — refused unless it carries a `user_id` and a `tenant_id`.
+- `McpTool::required_scopes` — refused unless the grant holds every scope named, in the vocabulary
+  of the authorization server that issues the tokens.
+
+The shared key (`with_shared_key`) and an anonymous loopback request (`allowing_anonymous`) are
+admitted with no identity, so they keep reaching the tools that touch no tenant's data and never one
+that does. A request presenting a credential that fails is refused even when anonymous is allowed.
+`testkit::TestIssuer` stands in for the authorization server in tests: a fresh key, its JWK set on
+loopback, and a minter.
 
 ## Request guard
 

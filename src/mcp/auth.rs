@@ -14,7 +14,7 @@
 //! `WWW-Authenticate` challenge (RFC 9728), `403`, `429` with `Retry-After`, or
 //! `500`.
 //!
-//! **Which mechanism?** This crate ships five, and the choice is made by what
+//! **Which mechanism?** This crate ships six, and the choice is made by what
 //! the caller can present, per route — not by which one has no feature flag.
 //! The table is in the crate README under "Choosing an auth mechanism"; read it
 //! before reaching for a shared bearer key, which is the wrong answer whenever
@@ -184,6 +184,27 @@ fn quote_escape(value: &str) -> String {
     escaped
 }
 
+impl ApiKeyAuthHook {
+    /// The context of `request` when `presented` is the key, or `None`.
+    ///
+    /// The admitted caller holds the key and nothing more: no user, no
+    /// tenant, never admin. Shared with `mcp::caller::CallerAuthHook`
+    /// (feature `google-iam`), which opens the same door beside a verified
+    /// caller token.
+    pub(crate) fn admit(&self, presented: &str, request: &JsonRpcRequest) -> Option<ToolContext> {
+        let expected = env::var(&self.env_var).unwrap_or_default();
+        // `ct_eq` on slices of different lengths is false without comparing
+        // bytes; the length of a key is not a secret.
+        let admitted =
+            !expected.is_empty() && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()));
+        admitted.then(|| {
+            let mut ctx = ToolContext::new().with_auth_method(API_KEY_AUTH_METHOD);
+            ctx.request_id.clone_from(&request.id);
+            ctx
+        })
+    }
+}
+
 #[async_trait]
 impl<S: Send + Sync + ?Sized> AuthHook<S> for ApiKeyAuthHook {
     async fn authenticate(
@@ -191,21 +212,10 @@ impl<S: Send + Sync + ?Sized> AuthHook<S> for ApiKeyAuthHook {
         request: &JsonRpcRequest,
         _state: &Arc<S>,
     ) -> Result<ToolContext, AuthError> {
-        let expected = env::var(&self.env_var).unwrap_or_default();
         let presented = request.auth_token.as_deref().unwrap_or_default();
-        // `ct_eq` on slices of different lengths is false without comparing
-        // bytes; the length of a key is not a secret.
-        let admitted =
-            !expected.is_empty() && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()));
-
-        if admitted {
-            let mut ctx = ToolContext::new().with_auth_method(API_KEY_AUTH_METHOD);
-            ctx.request_id.clone_from(&request.id);
-            Ok(ctx)
-        } else {
-            Err(AuthError::Unauthorized {
+        self.admit(presented, request)
+            .ok_or_else(|| AuthError::Unauthorized {
                 www_authenticate: self.challenge.clone(),
             })
-        }
     }
 }

@@ -58,7 +58,7 @@
 //!
 //! ## Which mechanism?
 //!
-//! This crate ships five, and the choice is made by what the caller can
+//! This crate ships six, and the choice is made by what the caller can
 //! present, per route — not by which one has no feature flag. The table is in
 //! the crate README under "Choosing an auth mechanism". These two functions are
 //! the right answer for exactly one row of it: a caller that is another dravr
