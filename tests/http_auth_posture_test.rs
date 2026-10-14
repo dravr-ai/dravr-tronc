@@ -1,4 +1,4 @@
-// ABOUTME: Tests http::serve refusing a reachable bind with no auth hook, ApiKeyAuthHook's 401/200,
+// ABOUTME: Tests http::serve's typed refusals (no auth hook, port in use), ApiKeyAuthHook's 401/200,
 // ABOUTME: and the Origin/bearer header helpers a host's own route shares with POST /mcp
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -12,6 +12,8 @@
 )]
 
 use std::env;
+use std::error::Error;
+use std::io;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,7 @@ use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
 use dravr_tronc::mcp::transport::http::{bearer_token, mcp_router, origin_allowed, serve};
+use dravr_tronc::mcp::transport::TransportError;
 use dravr_tronc::server::auth::{api_key_configured, InsecureBindError};
 use http::header::{HeaderName, AUTHORIZATION, ORIGIN};
 use http::{HeaderMap, HeaderValue, Request};
@@ -121,9 +124,10 @@ async fn refused(server: McpServer<State>, host: &str) -> InsecureBindError {
     let outcome = timeout(Duration::from_secs(5), serve(Arc::new(server), host, 0))
         .await
         .unwrap_or_else(|_| panic!("serve({host:?}) with no hook started serving"));
-    let err = outcome.expect_err("a reachable bind with no hook must be refused");
-    *err.downcast::<InsecureBindError>()
-        .unwrap_or_else(|other| panic!("expected InsecureBindError, got {other}"))
+    match outcome.expect_err("a reachable bind with no hook must be refused") {
+        TransportError::InsecureBind(refused) => refused,
+        other => panic!("expected TransportError::InsecureBind, got {other:?}"),
+    }
 }
 
 // ---- http::serve: no hook, no reachable bind ----
@@ -140,6 +144,41 @@ async fn serve_refuses_the_ipv4_wildcard_without_an_auth_hook() {
 async fn serve_refuses_the_ipv6_wildcard_without_an_auth_hook() {
     let err = refused(server(), "[::]").await;
     assert_eq!(err.host, "[::]");
+}
+
+/// A port another listener holds is a bind failure the caller can act on —
+/// retry elsewhere on `AddrInUse` — not a string to parse.
+#[tokio::test]
+async fn serve_reports_a_port_in_use_as_a_typed_bind_error() {
+    let held = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
+    let port = held.local_addr().expect("local addr").port();
+
+    let outcome = timeout(
+        Duration::from_secs(5),
+        serve(Arc::new(server()), "127.0.0.1", port),
+    )
+    .await
+    .expect("a failed bind returns at once");
+    drop(held);
+
+    let err = outcome.expect_err("the port is held by another listener");
+    let message = err.to_string();
+    let source_kind = err
+        .source()
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .map(io::Error::kind);
+    match err {
+        TransportError::Bind { addr, source } => {
+            assert_eq!(addr, format!("127.0.0.1:{port}"));
+            assert_eq!(source.kind(), io::ErrorKind::AddrInUse);
+        }
+        other => panic!("expected TransportError::Bind, got {other:?}"),
+    }
+    assert!(
+        message.starts_with(&format!("failed to bind 127.0.0.1:{port}: ")),
+        "message was {message:?}"
+    );
+    assert_eq!(source_kind, Some(io::ErrorKind::AddrInUse));
 }
 
 #[tokio::test]

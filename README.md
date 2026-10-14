@@ -75,7 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = Arc::new(McpServer::new("my-mcp-server", "0.1.0", registry, state));
 
     // Serve over stdin/stdout (for Claude Desktop, Cursor, etc.)
-    dravr_tronc::mcp::transport::stdio::run(server).await
+    dravr_tronc::mcp::transport::stdio::run(server).await?;
+    Ok(())
 }
 ```
 
@@ -88,14 +89,18 @@ dravr_tronc::mcp::transport::http::serve(server, "127.0.0.1", 3000).await?;
 
 `serve` serves only `/mcp`, so the server's `AuthHook` is the only thing that can authenticate a
 request there. **With no hook it serves loopback only**: it resolves the host first and refuses —
-with an `InsecureBindError`, before any socket opens — unless every address the host resolves to
-is loopback. To serve a reachable interface, attach a hook; for a shared key that is
+with `TransportError::InsecureBind`, before any socket opens — unless every address the host
+resolves to is loopback. To serve a reachable interface, attach a hook; for a shared key that is
 `mcp::auth::ApiKeyAuthHook` (see [Startup posture](#startup-posture-refuse-a-reachable-bind-nothing-gates)).
 
 A loopback bind also serves a loopback `Host` only (DNS-rebinding protection the `Origin` gate
 cannot give alone); name other authorities with `McpServer::with_allowed_hosts`. `serve` shuts down
 gracefully on SIGINT or SIGTERM, answering every request in flight first;
 `serve_with_shutdown` takes the trigger from the caller.
+
+`serve`, `serve_with_shutdown` and `stdio::run` return `mcp::transport::TransportError`, so a
+binary can act on the cause — a `Bind` whose source is `AddrInUse`, a refused `InsecureBind` —
+instead of parsing a message. A `main` that only reports it `?`s it into `Box<dyn Error>`.
 
 What `POST /mcp` requires of a client (Streamable HTTP, revision 2026-07-28):
 

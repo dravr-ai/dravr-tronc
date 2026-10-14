@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::error::Error;
 use std::future::{pending, Future};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -47,6 +46,7 @@ use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTEC
 use crate::mcp::server::McpServer;
 use crate::mcp::session::{Session, SessionRefusal, SessionStore, SessionUse};
 use crate::mcp::tool::ToolContext;
+use crate::mcp::transport::error::TransportError;
 use crate::mcp::transport::mirror::{check_response_headers, check_standard_headers};
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
@@ -154,13 +154,14 @@ pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServ
 ///
 /// # Errors
 ///
-/// An [`InsecureBindError`] for a reachable bind with no hook; otherwise a
-/// resolution, bind or serve failure.
+/// [`TransportError::InsecureBind`] for a reachable bind with no hook;
+/// otherwise [`TransportError::Resolve`], [`TransportError::Bind`] or
+/// [`TransportError::Serve`].
 pub async fn serve<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
     host: &str,
     port: u16,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), TransportError> {
     serve_with_shutdown(server, host, port, shutdown_signal()).await
 }
 
@@ -180,19 +181,24 @@ pub async fn serve_with_shutdown<S, F>(
     host: &str,
     port: u16,
     shutdown: F,
-) -> Result<(), Box<dyn Error + Send + Sync>>
+) -> Result<(), TransportError>
 where
     S: Send + Sync + ?Sized + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let authenticated = server.has_auth_hook();
     let addr = format!("{host}:{port}");
-    let resolved: Vec<SocketAddr> = lookup_host(&addr)
-        .await
-        .map_err(|e| format!("Failed to resolve {addr}: {e}"))?
-        .collect();
+    let resolved: Vec<SocketAddr> = match lookup_host(&addr).await {
+        Ok(resolved) => resolved.collect(),
+        Err(source) => {
+            return Err(TransportError::Resolve {
+                addr: addr.clone(),
+                source,
+            })
+        }
+    };
     if !authenticated && !resolved.iter().all(|a| a.ip().is_loopback()) {
-        return Err(Box::new(InsecureBindError::new(host)));
+        return Err(InsecureBindError::new(host).into());
     }
 
     // A loopback bind is the one DNS rebinding reaches, so unless the host
@@ -204,9 +210,10 @@ where
         app = app.layer(from_fn(require_loopback_host));
     }
     let app = app.layer(from_fn(guard_requests));
-    let listener = TcpListener::bind(resolved.as_slice())
-        .await
-        .map_err(|e| format!("Failed to bind {addr}: {e}"))?;
+    let listener = match TcpListener::bind(resolved.as_slice()).await {
+        Ok(listener) => listener,
+        Err(source) => return Err(TransportError::Bind { addr, source }),
+    };
 
     info!(
         address = %addr,
@@ -218,7 +225,7 @@ where
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
-        .map_err(|e| format!("HTTP server error: {e}"))?;
+        .map_err(TransportError::Serve)?;
 
     info!(address = %addr, "HTTP MCP transport stopped");
     Ok(())

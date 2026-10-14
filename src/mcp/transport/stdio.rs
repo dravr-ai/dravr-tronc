@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +19,7 @@ use crate::mcp::protocol::{JsonRpcMessage, PROTOCOL_VERSION};
 use crate::mcp::server::McpServer;
 use crate::mcp::session::Session;
 use crate::mcp::tool::ToolContext;
+use crate::mcp::transport::error::TransportError;
 
 /// How long [`run`] waits, once stdin closes, for the requests it already
 /// read to be answered.
@@ -50,9 +50,14 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// takes nothing more, and the connection's cancellation fires: a job a tool
 /// left running with a clone of its context sees it on
 /// [`ToolContext::cancellation`], and holds the transport open no longer.
+///
+/// # Errors
+///
+/// [`TransportError::Stdio`] when reading stdin or writing stdout fails, and
+/// [`TransportError::Encode`] when a message cannot be serialized.
 pub async fn run<S: Send + Sync + ?Sized + 'static>(
     server: Arc<McpServer<S>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), TransportError> {
     debug!(
         protocol_version = PROTOCOL_VERSION,
         "Stdio transport ready, waiting for JSON-RPC messages on stdin"
@@ -73,7 +78,7 @@ pub(crate) async fn serve_lines<S, R, W>(
     reader: R,
     writer: W,
     drain: Duration,
-) -> Result<(), Box<dyn Error + Send + Sync>>
+) -> Result<(), TransportError>
 where
     S: Send + Sync + ?Sized + 'static,
     R: AsyncBufRead + Unpin,
@@ -159,7 +164,7 @@ where
             }
             Err(e) => {
                 error!(error = %e, "Stdin read error, shutting down stdio transport");
-                break Err(format!("stdin read error: {e}"));
+                break Err(TransportError::Stdio(e));
             }
         }
     };
@@ -194,7 +199,7 @@ async fn write_lines<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut outbox: mpsc::UnboundedReceiver<JsonRpcMessage>,
     stop: CancellationToken,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), TransportError> {
     loop {
         let message = tokio::select! {
             biased;
@@ -213,37 +218,24 @@ async fn write_lines<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// The stdout writer's outcome, with a panic or abort reported as an error.
-fn finish(
-    written: Result<Result<(), Box<dyn Error + Send + Sync>>, JoinError>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    written.map_err(|e| format!("stdout writer failed: {e}"))?
+/// The stdout writer's outcome, with a panic or abort reported as a
+/// [`TransportError::Stdio`] (tokio reads a failed task as an I/O error).
+fn finish(written: Result<Result<(), TransportError>, JoinError>) -> Result<(), TransportError> {
+    written.map_err(|e| TransportError::Stdio(e.into()))?
 }
 
 /// Serialize and write a JSON-RPC message as a single line
 async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &JsonRpcMessage,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let json =
-        serde_json::to_string(message).map_err(|e| format!("JSON serialization failed: {e}"))?;
-
+) -> Result<(), TransportError> {
+    let mut line = serde_json::to_vec(message).map_err(TransportError::Encode)?;
+    line.push(b'\n');
     writer
-        .write_all(json.as_bytes())
+        .write_all(&line)
         .await
-        .map_err(|e| format!("stdout write failed: {e}"))?;
-
-    writer
-        .write_all(b"\n")
-        .await
-        .map_err(|e| format!("stdout newline write failed: {e}"))?;
-
-    writer
-        .flush()
-        .await
-        .map_err(|e| format!("stdout flush failed: {e}"))?;
-
-    Ok(())
+        .map_err(TransportError::Stdio)?;
+    writer.flush().await.map_err(TransportError::Stdio)
 }
 
 #[cfg(test)]
@@ -348,7 +340,7 @@ mod tests {
     }
 
     /// The transport's outcome.
-    type Served = JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>;
+    type Served = JoinHandle<Result<(), TransportError>>;
 
     /// The client's ends of a stdio connection served on a task.
     struct Client {
@@ -657,5 +649,34 @@ mod tests {
             .await;
         client.close().await;
         assert_eq!(client.next_line().await, None, "never answered");
+    }
+
+    /// A stdout nobody reads any more ends the transport with the I/O error,
+    /// typed, so a caller can tell it from an encoding failure.
+    #[tokio::test]
+    async fn a_closed_stdout_ends_the_transport_with_a_typed_stdio_error() {
+        let (mut to_server, server_in) = duplex(64 * 1024);
+        let (server_out, from_server) = duplex(64 * 1024);
+        drop(from_server);
+        let served = tokio::spawn(serve_lines(
+            server(),
+            BufReader::new(server_in),
+            server_out,
+            DRAIN_TIMEOUT,
+        ));
+
+        to_server
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .expect("stdin write"); // Safe: test assertion
+        let outcome = timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the transport stops on the write failure") // Safe: test assertion
+            .expect("the transport task did not panic"); // Safe: test assertion
+
+        match outcome {
+            Err(TransportError::Stdio(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("expected TransportError::Stdio, got {other:?}"),
+        }
     }
 }

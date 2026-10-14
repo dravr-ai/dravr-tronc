@@ -554,5 +554,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .with_capabilities(capabilities)
     .with_http_sessions(DEFAULT_SESSION_TTL);
-    serve(Arc::new(server), "127.0.0.1", port()?).await
+    serve(Arc::new(server), "127.0.0.1", port()?).await?;
+    Ok(())
 }
