@@ -11,6 +11,10 @@ readme = "README.md"
 repository = "https://github.com/dravr-ai/dravr-tronc"
 keywords = ["mcp", "json-rpc", "axum", "server"]
 categories = ["web-programming::http-server", "network-programming"]
+# Agent tooling, not crate content: .claude/skills links into the git-ignored
+# .savoir clone, which a CI checkout never has, and a dangling link fails
+# `cargo package`.
+exclude = [".claude"]
 
 [features]
 default = []
