@@ -1,5 +1,17 @@
 # Changelog
 
+## [4.4.0] — 2026-10-14
+
+### Added
+
+- feat(mcp): CallerAuthHook, a verified platform token as the caller
+- feat(mcp): the registry refuses identity tools to a context without one
+
+### Other
+
+- docs(agents): move the agent knowledge into the private dravr-savoir
+
+
 ## [4.3.0] — 2026-10-13
 
 ### Added
