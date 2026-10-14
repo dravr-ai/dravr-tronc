@@ -9,7 +9,52 @@
 #     review_by: YYYY-MM-DD
 #
 # The weekly "Monitor: Feature Phase Review" workflow opens an issue in the
-# register when a review_by date passes. Nothing is dark-launched here yet —
-# an empty list is valid, and this file exists so the next one has a home.
+# register when a review_by date passes. Keep values free of ": " and " #" so
+# the unquoted scalars stay parseable.
+#
+# A tronc surface is armed when a fleet service consumes it in production (a
+# test consumer counts only for the testkit, which exists for tests). Until
+# then it is a phantom surface and is ledgered here (carnet#957). Advancing an
+# entry means wiring the consumer and deleting the entry in the same change.
 
-features: []
+features:
+  - name: mcp-dispatch-observer
+    surface: src/mcp/observe/mod.rs (Observer, OperationInfo, OperationOutcome, PayloadCapturePolicy, PayloadRedactor, McpServer with_observer and with_payload_capture)
+    current: McpServer carries no observer unless a host installs one, and payload capture is off by default. No fleet server calls with_observer or with_payload_capture, so dispatch is unobserved everywhere and only tronc's own tests exercise the hook
+    advance_when: a deployed fleet MCP server installs an Observer (the OtelObserver once it exports traces, or its own audit observer) with a test of its own asserting the outcome the observer records for a tools/call, and any payload capture it enables names a redactor for the arguments it carries
+    review_by: 2026-12-15
+  - name: otel-export
+    surface: Cargo.toml feature otel (src/mcp/observe/otel.rs OtelObserver, src/server/tracing_init.rs OTLP export and TelemetryGuard, W3C trace-context joining in src/server/request_guard.rs and src/service_client)
+    current: no fleet Cargo.toml enables the otel feature, so no service exports spans or metrics over OTLP and no trace context is joined or propagated; tracing_init logs only
+    advance_when: a deployed service enables dravr-tronc feature otel, sets OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_SERVICE_NAME in its deployment config, holds the TelemetryGuard in main until its server stops, and a request's spans are visible end to end in the trace backend
+    review_by: 2026-12-15
+  - name: mcp-http-sessions
+    surface: src/mcp/session.rs (McpServer with_http_sessions and with_http_session_limits, the Mcp-Session-Id header and DELETE /mcp)
+    current: every fleet MCP server is sessionless, the default; no host calls with_http_sessions, so no Mcp-Session-Id is minted and DELETE /mcp is not routed anywhere in production
+    advance_when: a fleet MCP server needs state across the requests of one client (its initialize capabilities, a logging/setLevel, a client answering a server request over POST) and opts in with with_http_sessions, with a test of its own driving initialize, a call in the session and DELETE
+    review_by: 2026-12-15
+  - name: mcp-protected-resource-metadata
+    surface: src/mcp/resource_metadata.rs (ProtectedResourceMetadata, McpServer with_protected_resource_metadata, the RFC 9728 well-known route mcp_router adds)
+    current: no fleet server publishes its metadata through tronc; dravr-platform serves its own hand-rolled RFC 9728 document beside the tronc router
+    advance_when: dravr-platform serves /.well-known/oauth-protected-resource through McpServer with_protected_resource_metadata and deletes its hand-rolled route, with a test asserting the document's resource equals the configured MCP_RESOURCE_URL (owner decision on carnet#957, the wiring is a platform follow-up)
+    review_by: 2026-11-16
+  - name: mcp-schema-validation
+    surface: Cargo.toml feature schema-validation (src/mcp/validation.rs ToolSchemaValidator, the argument and structuredContent checks in ToolRegistry execute)
+    current: no fleet Cargo.toml enables schema-validation, so call arguments and structured results are checked only by each tool's own parsing
+    advance_when: a fleet MCP server enables schema-validation and a test of its own shows a call whose arguments break the tool's inputSchema refused as invalid params before the tool runs
+    review_by: 2026-12-15
+  - name: mcp-client-channel
+    surface: src/mcp/client_channel.rs and src/mcp/elicitation.rs (ToolContext client — progress, log notifications, sampling create_message, elicitation elicit — and the streamed answer of POST /mcp)
+    current: no fleet tool calls ctx.client, so every call answers with a single response and nothing streams before it; the request guard already logs a streamed call when its stream ends (carnet#963)
+    advance_when: a deployed fleet tool reports progress or asks its client (sampling or elicitation) in production, with a test of its own driving the call over the HTTP transport and asserting the events it streams before its result
+    review_by: 2026-12-15
+  - name: mcp-input-required
+    surface: src/mcp/schema.rs and src/mcp/host.rs (SEP-2322 InputRequiredResult and CallToolOutcome InputRequired)
+    current: no fleet host answers a call with an input_required result; the variant is served to modern-revision clients only and is exercised only by tronc's own tests
+    advance_when: a fleet host returns CallToolOutcome InputRequired for a call that needs more from its client (or sheds load with retry_with_state), authenticates the requestState it round-trips, and tests the client's retry carrying inputResponses
+    review_by: 2026-12-15
+  - name: tronc-testkit
+    surface: Cargo.toml feature testkit (src/testkit — McpTestClient, McpTestServer, testkit assert, TestIssuer)
+    current: tronc's own tests drive the testkit; dravr-platform's MCP e2e tests use a hand-rolled McpTestClient of their own, and no fleet crate on main enables the testkit feature
+    advance_when: dravr-platform's MCP e2e tests use dravr_tronc testkit (dev-dependency feature testkit) in place of their own client, asserting the tools/list count and names through McpTestClient (owner decision on carnet#957, the wiring is a platform follow-up)
+    review_by: 2026-11-16
