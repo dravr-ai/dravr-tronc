@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.4.1] — 2026-10-14
+
+### Fixed
+
+- fix(package): keep the dangling .claude link out of the crate
+
+
 ## [4.4.0] — 2026-10-14
 
 ### Added
