@@ -100,15 +100,21 @@ fn auth_error(message: &str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
 
-/// The API key `env_var` holds, or `None` when it is unset or blank after
-/// trimming whitespace.
+/// The API key `env_var` holds with surrounding whitespace trimmed, or `None`
+/// when it is unset or blank.
 ///
-/// A blank value (`" "`, or a lone newline from a secret written with `echo`)
-/// is not a secret, so it counts as no key at all. [`require_auth`] and
-/// [`api_key_configured`] both read the key through here, so a server cannot
-/// boot believing it is enforced under a key the middleware treats otherwise.
-fn configured_key(env_var: &str) -> Option<String> {
-    env::var(env_var).ok().filter(|key| !key.trim().is_empty())
+/// A blank value (`" "`, or a lone newline) is not a secret, so it counts as
+/// no key at all. A key written with `echo` arrives as `"secret\n"`, and the
+/// newline is not part of it: a header can never carry one, so comparing the
+/// untrimmed value would refuse every caller of a server that booted
+/// enforced. [`require_auth`], [`api_key_configured`] and
+/// [`ApiKeyAuthHook`](crate::mcp::auth::ApiKeyAuthHook) all read the key
+/// through here, so a server cannot boot believing it is enforced under a key
+/// its gate reads otherwise.
+pub(crate) fn configured_key(env_var: &str) -> Option<String> {
+    let key = env::var(env_var).ok()?;
+    let trimmed = key.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Whether `env_var` holds a usable API key.
@@ -367,6 +373,31 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert!(!api_key_configured(ENV));
         env::remove_var(ENV);
+    }
+
+    /// A key written with `echo` carries a trailing newline that no header
+    /// can. The server boots enforced under it, so the middleware must
+    /// compare the key without it, or every caller is locked out.
+    #[tokio::test]
+    async fn a_key_with_a_trailing_newline_is_compared_trimmed() {
+        const ENV: &str = "TRONC_AUTH_TEST_TRAILING_NEWLINE";
+        env::set_var(ENV, "abc\n");
+        assert!(api_key_configured(ENV));
+        assert_eq!(configured_key(ENV).as_deref(), Some("abc"));
+
+        let mut statuses = Vec::new();
+        for token in ["abc", "abd"] {
+            let req = HttpRequest::builder()
+                .uri("/test")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"); // Safe: test assertion
+            let resp = make_app(ENV).oneshot(req).await.expect("response"); // Safe: test assertion
+            statuses.push(resp.status().as_u16());
+        }
+        env::remove_var(ENV);
+
+        assert_eq!(statuses, [200, 401]);
     }
 
     #[tokio::test]

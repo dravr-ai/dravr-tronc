@@ -23,7 +23,7 @@ use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
 use dravr_tronc::mcp::transport::http::{bearer_token, mcp_router, origin_allowed, serve};
-use dravr_tronc::server::auth::InsecureBindError;
+use dravr_tronc::server::auth::{api_key_configured, InsecureBindError};
 use http::header::{HeaderName, AUTHORIZATION, ORIGIN};
 use http::{HeaderMap, HeaderValue, Request};
 use http_body_util::BodyExt;
@@ -335,6 +335,66 @@ async fn the_hook_fails_closed_when_its_key_is_unset_or_empty() {
     env::remove_var(ENV);
 
     assert!(refused.is_err(), "an empty key admits nobody");
+}
+
+/// A blank key is no key: the hook admits nobody, whatever they present,
+/// and the startup posture agrees that nothing is configured.
+#[tokio::test]
+async fn the_hook_refuses_every_token_when_its_key_is_blank() {
+    const ENV: &str = "TRONC_POSTURE_TEST_HOOK_BLANK";
+    env::set_var(ENV, "  ");
+    let hook = ApiKeyAuthHook::new(ENV, "posture-test");
+
+    let mut outcomes = Vec::new();
+    for presented in ["", " ", "  ", "anything"] {
+        let mut request = JsonRpcRequest::new("tools/list", None);
+        request.auth_token = Some(presented.to_owned());
+        let outcome = AuthHook::<State>::authenticate(&hook, &request, &Arc::new(State)).await;
+        outcomes.push((presented, outcome.is_ok()));
+    }
+    let configured = api_key_configured(ENV);
+    let (status, challenge, _) = call(ENV, Some("  ")).await;
+    env::remove_var(ENV);
+
+    assert_eq!(
+        outcomes,
+        [
+            ("", false),
+            (" ", false),
+            ("  ", false),
+            ("anything", false)
+        ]
+    );
+    assert!(!configured, "a blank key must not read as configured");
+    assert_eq!(status, 401);
+    assert_eq!(challenge.as_deref(), Some("Bearer realm=\"posture-test\""));
+}
+
+/// A key written with `echo` ends in a newline that a bearer header cannot
+/// carry; the hook compares the key without it, as `require_auth` does.
+#[tokio::test]
+async fn the_hook_admits_a_key_set_with_a_trailing_newline() {
+    const ENV: &str = "TRONC_POSTURE_TEST_HOOK_NEWLINE";
+    env::set_var(ENV, "abc\n");
+    let hook = ApiKeyAuthHook::new(ENV, "posture-test");
+
+    let mut request = JsonRpcRequest::new("tools/list", None);
+    request.auth_token = Some("abc".to_owned());
+    let admitted = AuthHook::<State>::authenticate(&hook, &request, &Arc::new(State)).await;
+    request.auth_token = Some("abc\n".to_owned());
+    let with_newline = AuthHook::<State>::authenticate(&hook, &request, &Arc::new(State)).await;
+    let (status, _, body) = call(ENV, Some("abc")).await;
+    env::remove_var(ENV);
+
+    let ctx = admitted.expect("the trimmed key is the key");
+    assert_eq!(ctx.auth_method.as_deref(), Some(API_KEY_AUTH_METHOD));
+    assert!(!ctx.is_admin);
+    assert!(with_newline.is_err(), "the newline is not part of the key");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["result"]["content"][0]["text"],
+        "method=api_key admin=false user=none"
+    );
 }
 
 #[test]

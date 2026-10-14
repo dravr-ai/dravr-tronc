@@ -23,7 +23,6 @@
 //! When a shared key *is* the answer — our own binary calling over the wire —
 //! [`ApiKeyAuthHook`] is that hook, so no service writes its own.
 
-use std::env;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +30,7 @@ use subtle::ConstantTimeEq;
 
 use crate::mcp::protocol::JsonRpcRequest;
 use crate::mcp::tool::ToolContext;
+use crate::server::auth::configured_key;
 
 /// Why an [`AuthHook`] rejected a request. The HTTP transport maps each variant
 /// to its status code.
@@ -132,8 +132,8 @@ pub const API_KEY_AUTH_METHOD: &str = "api_key";
 /// [`require_auth`](crate::server::auth::require_auth), and it differs in the
 /// two ways an MCP route needs:
 ///
-/// - **It fails closed.** With the variable unset or empty it admits nobody,
-///   where `require_auth` admits everybody. Attach it only when the key is set
+/// - **It fails closed.** With the variable unset, empty or blank it admits
+///   nobody, where `require_auth` admits everybody. Attach it only when the key is set
 ///   — [`startup_auth`](crate::server::auth::startup_auth) answering
 ///   [`AuthMode::Enforced`](crate::server::auth::AuthMode::Enforced) — so an
 ///   absent key is decided once, at startup, and never becomes an open door.
@@ -141,8 +141,9 @@ pub const API_KEY_AUTH_METHOD: &str = "api_key";
 ///   challenge (`Bearer realm="…"`) and a JSON-RPC error body, rendered by the
 ///   HTTP transport, instead of `require_auth`'s REST error.
 ///
-/// The key is read on every request, so rotating it needs no restart, and it
-/// is compared in constant time. An admitted request runs as a caller that
+/// The key is read on every request, so rotating it needs no restart, by the
+/// rule `require_auth` and `startup_auth` share (surrounding whitespace
+/// trimmed, blank means unset), and it is compared in constant time. An admitted request runs as a caller that
 /// holds the key and nothing more: no user, no tenant, never admin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeyAuthHook {
@@ -192,11 +193,13 @@ impl ApiKeyAuthHook {
     /// (feature `google-iam`), which opens the same door beside a verified
     /// caller token.
     pub(crate) fn admit(&self, presented: &str, request: &JsonRpcRequest) -> Option<ToolContext> {
-        let expected = env::var(&self.env_var).unwrap_or_default();
+        // Read by the rule `require_auth` and `startup_auth` apply: a blank
+        // value is no key (so it admits nobody), and the key is compared with
+        // its surrounding whitespace trimmed.
+        let expected = configured_key(&self.env_var)?;
         // `ct_eq` on slices of different lengths is false without comparing
         // bytes; the length of a key is not a secret.
-        let admitted =
-            !expected.is_empty() && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()));
+        let admitted = bool::from(expected.as_bytes().ct_eq(presented.as_bytes()));
         admitted.then(|| {
             let mut ctx = ToolContext::new().with_auth_method(API_KEY_AUTH_METHOD);
             ctx.request_id.clone_from(&request.id);
