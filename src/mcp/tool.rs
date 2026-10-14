@@ -28,9 +28,15 @@ bitflags! {
     /// registry's string categories, not here.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ToolCapabilities: u16 {
-        /// The tool requires an authenticated caller.
+        /// The tool requires an identified caller: a context whose host
+        /// [`AuthHook`](crate::mcp::auth::AuthHook) resolved a
+        /// [`ToolContext::user_id`]. [`ToolRegistry::execute`] refuses the
+        /// call otherwise — a shared key or an anonymous request never
+        /// reaches the tool.
         const REQUIRES_AUTH = 0b0000_0001;
-        /// The tool requires a resolved tenant context.
+        /// The tool requires a resolved tenant: a context carrying both
+        /// [`ToolContext::user_id`] and [`ToolContext::tenant_id`].
+        /// [`ToolRegistry::execute`] refuses the call otherwise.
         const REQUIRES_TENANT = 0b0000_0010;
         /// The tool requires a connected upstream provider.
         const REQUIRES_PROVIDER = 0b0000_0100;
@@ -392,8 +398,54 @@ pub trait McpTool<S: Send + Sync + ?Sized>: Send + Sync {
         ToolCapabilities::empty()
     }
 
+    /// The scopes a caller's grant ([`ToolContext::scopes`]) must hold for
+    /// [`ToolRegistry::execute`] to run the tool, in the vocabulary of the
+    /// authorization server that issues the host's credentials.
+    ///
+    /// Defaults to none. A tool that names one is refused to every context
+    /// whose grant lacks it — including a context with no grant at all.
+    fn required_scopes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Execute the tool against the shared server state and per-call context
     async fn execute(&self, state: &Arc<S>, ctx: &ToolContext, arguments: Value) -> ToolResponse;
+}
+
+/// Why `ctx` may not run a tool declaring `caps` and `scopes`, or `None` when
+/// it may.
+///
+/// The registry's one gate, so every way a call reaches a registered tool is
+/// held to the same rule: an `ADMIN_ONLY` tool needs an admin, a tool
+/// requiring a caller or a tenant needs a context the host's auth hook
+/// resolved them on, and a tool naming scopes needs a grant holding each.
+fn refusal(
+    name: &str,
+    caps: ToolCapabilities,
+    scopes: &[&str],
+    ctx: &ToolContext,
+) -> Option<String> {
+    if caps.contains(ToolCapabilities::ADMIN_ONLY) && !ctx.is_admin {
+        return Some(format!("Tool '{name}' requires admin privileges"));
+    }
+    let identified = ctx.user_id.as_deref().is_some_and(|id| !id.is_empty());
+    if caps.intersects(ToolCapabilities::REQUIRES_AUTH | ToolCapabilities::REQUIRES_TENANT)
+        && !identified
+    {
+        return Some(format!(
+            "Tool '{name}' requires a verified caller; this request carries no caller identity"
+        ));
+    }
+    let tenanted = ctx.tenant_id.as_deref().is_some_and(|id| !id.is_empty());
+    if caps.contains(ToolCapabilities::REQUIRES_TENANT) && !tenanted {
+        return Some(format!(
+            "Tool '{name}' requires a tenant; this caller's credential names none"
+        ));
+    }
+    scopes
+        .iter()
+        .find(|scope| !ctx.scopes.iter().any(|granted| granted == *scope))
+        .map(|missing| format!("Tool '{name}' requires the '{missing}' scope"))
 }
 
 /// Registry mapping tool names to their handler implementations
@@ -542,9 +594,13 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
 
     /// Dispatch a `tools/call` to the named tool handler
     ///
-    /// Gates `ADMIN_ONLY` tools on `ctx.is_admin` before dispatching. Returns
-    /// `None` when no tool is registered under `name`: that is a protocol
-    /// error in MCP, not a tool result, so it is the caller's to frame.
+    /// Before dispatching, refuses with a tool error: an `ADMIN_ONLY` tool to
+    /// a non-admin; a `REQUIRES_AUTH` or `REQUIRES_TENANT` tool to a context
+    /// with no [`ToolContext::user_id`]; a `REQUIRES_TENANT` tool to one with
+    /// no [`ToolContext::tenant_id`]; and a tool naming
+    /// [`McpTool::required_scopes`] to a grant missing one. Returns `None`
+    /// when no tool is registered under `name`: that is a protocol error in
+    /// MCP, not a tool result, so it is the caller's to frame.
     pub async fn execute(
         &self,
         name: &str,
@@ -553,10 +609,8 @@ impl<S: Send + Sync + ?Sized> ToolRegistry<S> {
         arguments: Value,
     ) -> Option<ToolResponse> {
         let tool = self.tools.get(name)?;
-        if tool.capabilities().contains(ToolCapabilities::ADMIN_ONLY) && !ctx.is_admin {
-            return Some(ToolResponse::error(format!(
-                "Tool '{name}' requires admin privileges"
-            )));
+        if let Some(reason) = refusal(name, tool.capabilities(), tool.required_scopes(), ctx) {
+            return Some(ToolResponse::error(reason));
         }
         #[cfg(feature = "schema-validation")]
         let validator = match self.validators.get(name) {
@@ -832,6 +886,125 @@ mod tests {
             .expect("registered tool"); // Safe: test assertion
         assert!(!allowed.is_error);
         assert_eq!(allowed.content[0].as_text(), Some("reset"));
+    }
+
+    /// A tool over one caller's rows in one tenant: it answers with the
+    /// identity it read off its context, never off its arguments.
+    struct TenantRowsTool;
+
+    #[async_trait]
+    impl McpTool<DummyState> for TenantRowsTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "my_rows".to_owned(),
+                description: "The caller's rows".to_owned(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+                execution: None,
+            }
+        }
+
+        fn capabilities(&self) -> ToolCapabilities {
+            ToolCapabilities::REQUIRES_AUTH
+                | ToolCapabilities::REQUIRES_TENANT
+                | ToolCapabilities::READS_DATA
+        }
+
+        fn required_scopes(&self) -> &'static [&'static str] {
+            &["rows:read"]
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<DummyState>,
+            ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text(format!(
+                "{}@{}",
+                ctx.user_id.as_deref().unwrap_or_default(),
+                ctx.tenant_id.as_deref().unwrap_or_default()
+            ))
+        }
+    }
+
+    async fn call_rows(ctx: &ToolContext) -> ToolResponse {
+        let mut registry = ToolRegistry::<DummyState>::new();
+        registry.register(Box::new(TenantRowsTool));
+        registry
+            .execute("my_rows", &make_state(), ctx, json!({}))
+            .await
+            .expect("registered tool") // Safe: test assertion
+    }
+
+    fn refusal_text(response: &ToolResponse) -> String {
+        assert!(response.is_error, "expected a refusal");
+        response.content[0]
+            .as_text()
+            .expect("text") // Safe: test assertion
+            .to_owned()
+    }
+
+    fn granted(ctx: ToolContext, scopes: &[&str]) -> ToolContext {
+        let mut ctx = ctx;
+        ctx.scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_tool_requiring_a_caller_is_refused_without_one() {
+        // A shared-key or anonymous context: no user, whatever else it says.
+        let keyholder = granted(
+            ToolContext::new()
+                .with_auth_method("api_key")
+                .with_tenant("tenant-a"),
+            &["rows:read"],
+        );
+        assert!(refusal_text(&call_rows(&keyholder).await).contains("verified caller"));
+
+        let empty_user = granted(
+            ToolContext::new().with_user("").with_tenant("tenant-a"),
+            &["rows:read"],
+        );
+        assert!(refusal_text(&call_rows(&empty_user).await).contains("verified caller"));
+    }
+
+    #[tokio::test]
+    async fn a_tenant_tool_is_refused_to_a_caller_with_no_tenant() {
+        let caller = granted(ToolContext::new().with_user("user-1"), &["rows:read"]);
+        assert!(refusal_text(&call_rows(&caller).await).contains("requires a tenant"));
+    }
+
+    #[tokio::test]
+    async fn a_tool_naming_a_scope_is_refused_to_a_grant_without_it() {
+        let narrow = granted(
+            ToolContext::new()
+                .with_user("user-1")
+                .with_tenant("tenant-a"),
+            &["rows:write"],
+        );
+        assert_eq!(
+            refusal_text(&call_rows(&narrow).await),
+            "Tool 'my_rows' requires the 'rows:read' scope"
+        );
+        let ungranted = ToolContext::new()
+            .with_user("user-1")
+            .with_tenant("tenant-a");
+        assert!(refusal_text(&call_rows(&ungranted).await).contains("'rows:read' scope"));
+    }
+
+    #[tokio::test]
+    async fn an_identified_tenant_caller_with_the_grant_reaches_the_tool() {
+        let caller = granted(
+            ToolContext::new()
+                .with_user("user-1")
+                .with_tenant("tenant-a"),
+            &["rows:write", "rows:read"],
+        );
+        let answered = call_rows(&caller).await;
+        assert!(!answered.is_error);
+        assert_eq!(answered.content[0].as_text(), Some("user-1@tenant-a"));
     }
 
     /// A tool declaring `output_schema`, for the registration check.
