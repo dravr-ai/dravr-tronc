@@ -64,7 +64,8 @@ impl McpTool<AppState> for GreetTool {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    dravr_tronc::server::tracing_init::init("stdio");
+    // Held to the end of main: dropping it flushes OTLP export (feature `otel`).
+    let _telemetry_guard = dravr_tronc::server::tracing_init::init("stdio");
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(GreetTool));
@@ -222,7 +223,7 @@ once, last. See [Request guard](#request-guard).
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |
 | `server::trace_context` | W3C `traceparent` / `tracestate`, read from HTTP headers and MCP `params._meta`; joined and propagated with feature `otel` |
-| `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP |
+| `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
 
 ## Choosing an auth mechanism
@@ -470,7 +471,10 @@ code), `NotificationAccepted`, or `Cancelled` when the dispatch was dropped unan
 is installed by default, and an unobserved server does none of this work.
 
 With the `otel` feature, `OtelObserver` records the OpenTelemetry MCP semantic conventions, and
-`tracing_init` exports its spans and metrics to `OTEL_EXPORTER_OTLP_ENDPOINT`:
+`tracing_init` exports its spans and metrics to `OTEL_EXPORTER_OTLP_ENDPOINT`. An exporter that
+fails to build is logged at WARN once the subscriber is up, naming which one failed. `init` returns
+a `TelemetryGuard`: hold it in `main` until the server has stopped, and its drop exports the last
+batch of spans and the last metric period before the process exits.
 
 ```rust
 use dravr_tronc::mcp::observe::{OtelObserver, PayloadCapturePolicy, PayloadKind, PayloadSite};
