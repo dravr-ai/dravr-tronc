@@ -1,5 +1,22 @@
 # Changelog
 
+## [5.0.0] — 2026-10-15
+
+### Added
+
+- feat(mcp)!: transport entry points return a typed TransportError
+
+### Fixed
+
+- fix(tracing)!: OTLP init failures reach the log; a guard flushes export
+- fix(server): a streamed MCP call completes when its stream ends
+- fix(auth): every API-key check reads one trimmed key
+
+### Other
+
+- chore(phases): ledger every opt-in MCP surface no service consumes
+
+
 ## [4.4.1] — 2026-10-14
 
 ### Fixed
