@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.1.0] — 2026-10-16
+
+### Added
+
+- feat(notify): NotifyActions attaches buttons to an immediate post
+
+
 ## [5.0.0] — 2026-10-15
 
 ### Added
