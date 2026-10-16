@@ -18,7 +18,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use super::provider::{AnalyticsProvider, NotifyEnricher, RoutingProvider};
+use super::provider::{AnalyticsProvider, NotifyActions, NotifyEnricher, RoutingProvider};
 use super::rule::RoutingRule;
 use super::state::{
     build_dedup_key, BatchBuffer, BatchBuffers, BatchedLine, DedupMap, SharedBatchBuffers,
@@ -87,6 +87,9 @@ struct LayerInner<R: RoutingProvider> {
     /// Per-event field enrichment applied before both sinks. `None` = no
     /// enrichment; events render with exactly the fields the call sites carry.
     enricher: Option<Arc<dyn NotifyEnricher>>,
+    /// Interactive elements appended to an immediate post. `None` = every
+    /// event posts as text only.
+    actions: Option<Arc<dyn NotifyActions>>,
     provider: Arc<R>,
     environment: String,
     default_rule: Option<RoutingRule>,
@@ -125,6 +128,7 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             analytics_provider: None,
             posthog: None,
             enricher: None,
+            actions: None,
         }
     }
 
@@ -215,8 +219,29 @@ impl<R: RoutingProvider> NotifyLayer<R> {
     }
 
     fn post_immediate(&self, channel: &str, event_name: &str, fields: &HashMap<String, String>) {
-        let blocks = event_blocks(event_name, fields);
+        let blocks = self.immediate_blocks(event_name, fields);
         self.inner.slack.post_message(channel, &blocks);
+    }
+
+    /// The Block Kit body of an immediate post: the event's section and
+    /// context, then an `actions` block when the host's [`NotifyActions`]
+    /// supplies elements for this event.
+    fn immediate_blocks(&self, event_name: &str, fields: &HashMap<String, String>) -> Value {
+        let mut blocks = event_blocks(event_name, fields);
+        let elements = self
+            .inner
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.actions_for(event_name, fields))
+            .filter(|elements| !elements.is_empty());
+        if let (Some(elements), Value::Array(list)) = (elements, &mut blocks) {
+            list.push(serde_json::json!({
+                "type": "actions",
+                "block_id": format!("notify-actions-{event_name}"),
+                "elements": elements,
+            }));
+        }
+        blocks
     }
 
     /// Fan one notify event out to the `PostHog` analytics sink when both an
@@ -247,6 +272,7 @@ pub struct NotifyLayerBuilder<R: RoutingProvider> {
     analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
     posthog: Option<Arc<PostHogClient>>,
     enricher: Option<Arc<dyn NotifyEnricher>>,
+    actions: Option<Arc<dyn NotifyActions>>,
 }
 
 impl<R: RoutingProvider> NotifyLayerBuilder<R> {
@@ -289,6 +315,15 @@ impl<R: RoutingProvider> NotifyLayerBuilder<R> {
         self
     }
 
+    /// Attach a [`NotifyActions`] that supplies buttons for the events that
+    /// ask a person to act. Their elements post under the event as one
+    /// `actions` block; batched events never carry them. Without this, every
+    /// event posts as text only.
+    pub fn with_actions(mut self, actions: Arc<dyn NotifyActions>) -> Self {
+        self.actions = Some(actions);
+        self
+    }
+
     /// Finalise the layer and spawn the background batch flusher.
     pub fn build(self) -> NotifyLayer<R> {
         let inner = Arc::new(LayerInner {
@@ -296,6 +331,7 @@ impl<R: RoutingProvider> NotifyLayerBuilder<R> {
             analytics_provider: self.analytics_provider,
             posthog: self.posthog,
             enricher: self.enricher,
+            actions: self.actions,
             provider: self.provider,
             environment: self.environment,
             default_rule: self.default_rule,
@@ -1044,6 +1080,68 @@ mod tests {
             section,
             "*embacle.call_completed*\nlatency_ms=2m, model=claude-opus"
         );
+    }
+
+    /// Offers an Approve button on `user.pending_approval` only, built from the
+    /// event's `user_id`, and an empty list for `user.empty`.
+    struct ApproveButton;
+
+    impl NotifyActions for ApproveButton {
+        fn actions_for(&self, event: &str, fields: &HashMap<String, String>) -> Option<Vec<Value>> {
+            match event {
+                "user.pending_approval" => Some(vec![serde_json::json!({
+                    "type": "button",
+                    "action_id": format!("approve_user:{}", fields.get("user_id")?),
+                    "text": { "type": "plain_text", "text": "Approve" },
+                })]),
+                "user.empty" => Some(Vec::new()),
+                _ => None,
+            }
+        }
+    }
+
+    fn layer_with_actions() -> NotifyLayer<StaticRoutingProvider> {
+        NotifyLayer::builder(
+            dummy_slack(),
+            Arc::new(StaticRoutingProvider::new()),
+            "dev".into(),
+        )
+        .with_actions(Arc::new(ApproveButton))
+        .build()
+    }
+
+    #[tokio::test]
+    async fn immediate_blocks_append_the_hosts_actions_last() {
+        let layer = layer_with_actions();
+        let mut fields = HashMap::new();
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        let blocks = layer.immediate_blocks("user.pending_approval", &fields);
+        let arr = blocks.as_array().expect("blocks is an array"); // Safe: test asserts Slack block shape
+        let last = arr.last().expect("at least one block"); // Safe: test asserts Slack block shape
+        assert_eq!(last["type"], "actions");
+        assert_eq!(last["block_id"], "notify-actions-user.pending_approval");
+        assert_eq!(last["elements"][0]["action_id"], "approve_user:u1");
+        assert_eq!(arr[0]["type"], "section", "the event still leads the post");
+    }
+
+    #[tokio::test]
+    async fn immediate_blocks_post_no_actions_block_when_none_or_empty() {
+        let layer = layer_with_actions();
+        let mut fields = HashMap::new();
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        for event in ["user.login", "user.empty"] {
+            let blocks = layer.immediate_blocks(event, &fields);
+            assert_eq!(blocks, event_blocks(event, &fields), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_blocks_without_actions_seam_match_event_blocks() {
+        let layer = build_layer(StaticRoutingProvider::new(), "dev");
+        let mut fields = HashMap::new();
+        fields.insert("user_id".to_owned(), "u1".to_owned());
+        let blocks = layer.immediate_blocks("user.pending_approval", &fields);
+        assert_eq!(blocks, event_blocks("user.pending_approval", &fields));
     }
 
     /// Shared log of `(event, fields)` the enricher observed, for assertions.

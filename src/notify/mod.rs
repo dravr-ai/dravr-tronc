@@ -63,6 +63,7 @@ pub use layer::{NotifyLayer, NotifyLayerBuilder};
 // an emitter must reach it without the `notifications` feature.
 pub use crate::notify_target::NOTIFY_TARGET;
 pub use provider::{
-    AnalyticsCapture, AnalyticsProvider, NotifyEnricher, RoutingProvider, StaticRoutingProvider,
+    AnalyticsCapture, AnalyticsProvider, NotifyActions, NotifyEnricher, RoutingProvider,
+    StaticRoutingProvider,
 };
 pub use rule::{BatchRule, DedupRule, RoutingRule};

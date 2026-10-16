@@ -123,6 +123,25 @@ pub trait NotifyEnricher: Send + Sync + 'static {
     fn enrich(&self, event: &str, fields: &mut HashMap<String, String>);
 }
 
+/// Supplies the interactive elements of a notify event's Slack post.
+///
+/// The host implements this when an event asks a person to act on it — an
+/// account waiting for approval gets Approve and Reject buttons, whose
+/// `action_id`s the host's own Slack interactivity endpoint then receives.
+/// `NotifyLayer` appends the returned elements under the post as one Block Kit
+/// `actions` block. `None`, or an empty list, posts the event without one.
+///
+/// Only an immediate post carries them: a batched digest folds many events
+/// into one line each, and a button there could not say which event it acts
+/// on. Like the other provider seams, `NotifyLayer` calls
+/// [`actions_for`](Self::actions_for) synchronously on the tracing thread, so
+/// implementations must be cheap, non-blocking and thread-safe.
+pub trait NotifyActions: Send + Sync + 'static {
+    /// The Block Kit elements (buttons, menus) of the `actions` block posted
+    /// under `event`, given its enriched `fields`.
+    fn actions_for(&self, event: &str, fields: &HashMap<String, String>) -> Option<Vec<Value>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
