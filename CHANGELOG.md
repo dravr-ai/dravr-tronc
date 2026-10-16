@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.1.1] — 2026-10-16
+
+### Fixed
+
+- fix(notify): escape mrkdwn in every value a notify post renders
+
+
 ## [5.1.0] — 2026-10-16
 
 ### Added
