@@ -495,7 +495,8 @@ fn headline(event_name: &str, fields: &HashMap<String, String>) -> String {
     let message = fields
         .get("message")
         .map(String::as_str)
-        .filter(|m| !m.is_empty());
+        .filter(|m| !m.is_empty())
+        .map(escape_mrkdwn);
     match (emoji, message) {
         (Some(e), Some(m)) => format!("{e} *{event_name}* — {m}"),
         (Some(e), None) => format!("{e} *{event_name}*"),
@@ -513,7 +514,20 @@ fn format_value(key: &str, value: &str) -> String {
             return format_duration_ms(ms);
         }
     }
-    value.to_owned()
+    escape_mrkdwn(value)
+}
+
+/// Escape the three characters Slack's `mrkdwn` gives control meaning to.
+///
+/// Field values and the message body carry data a person can choose, such as
+/// a sign-up's address or a display name. Unescaped, `<!channel>` pings every
+/// member of the room and `<https://x|text>` renders a disguised link, so
+/// every value the layer renders goes through here. Slack documents exactly
+/// these three escapes; anything else renders as typed.
+fn escape_mrkdwn(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn format_duration_ms(ms: u64) -> String {
@@ -629,7 +643,7 @@ fn event_blocks(event_name: &str, fields: &HashMap<String, String>) -> Value {
     if !ids.is_empty() {
         let id_text = ids
             .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| format!("{k}={}", escape_mrkdwn(v)))
             .collect::<Vec<_>>()
             .join("  ·  ");
         blocks.push(serde_json::json!({
@@ -936,6 +950,35 @@ mod tests {
         fields.insert("alpha".to_owned(), "a".to_owned());
         let line = format_line("evt", &fields);
         assert_eq!(line, "*evt*\nalpha=a, zeta=z");
+    }
+
+    #[test]
+    fn every_rendered_value_is_escaped_for_mrkdwn() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "user_email".to_owned(),
+            "<!channel> <https://evil.example|open>@x.co".to_owned(),
+        );
+        fields.insert("user_id".to_owned(), "<@U1>".to_owned());
+        fields.insert("message".to_owned(), "a & b <!here>".to_owned());
+
+        let line = format_line("user.pending_approval", &fields);
+        assert_eq!(
+            line,
+            "*user.pending_approval* — a &amp; b &lt;!here&gt;\n\
+             user_email=&lt;!channel&gt; &lt;https://evil.example|open&gt;@x.co, \
+             user_id=&lt;@U1&gt;"
+        );
+
+        let blocks = event_blocks("user.pending_approval", &fields);
+        let rendered = blocks.to_string();
+        assert!(!rendered.contains("<!"), "{rendered}");
+        assert!(!rendered.contains("<http"), "{rendered}");
+        assert!(!rendered.contains("<@"), "{rendered}");
+        assert_eq!(
+            blocks[1]["elements"][0]["text"], "user_id=&lt;@U1&gt;",
+            "identifiers are escaped too"
+        );
     }
 
     #[test]
