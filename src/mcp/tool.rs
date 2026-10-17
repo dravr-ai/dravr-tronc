@@ -790,7 +790,7 @@ mod tests {
         let mut in_data = registry.tools_in_category("data");
         in_data.sort_unstable();
         assert_eq!(in_data, vec!["counter", "echo"]);
-        assert!(registry.tools_in_category("missing").is_empty());
+        assert_eq!(registry.tools_in_category("missing"), Vec::<&str>::new());
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
             let mut registry = ToolRegistry::<DummyState>::new();
             registry.register_with_category(Box::new(Shaped(schema.clone())), "data");
             assert!(registry.is_empty(), "{schema} is refused");
-            assert!(registry.tools_in_category("data").is_empty());
+            assert_eq!(registry.tools_in_category("data"), Vec::<&str>::new());
         }
     }
 
@@ -1102,8 +1102,8 @@ mod tests {
     fn tool_definitions_have_required_fields() {
         let tool = EchoTool;
         let def = tool.definition();
-        assert!(!def.name.is_empty());
-        assert!(!def.description.is_empty());
+        assert_ne!(def.name, "");
+        assert_ne!(def.description, "");
         assert!(def.input_schema.is_object());
     }
 }
