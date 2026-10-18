@@ -36,11 +36,14 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 #[cfg(not(feature = "otel"))]
 use tracing_subscriber::layer::Identity;
+use tracing_subscriber::layer::Layered;
 use tracing_subscriber::layer::SubscriberExt;
 #[cfg(feature = "otel")]
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Registry};
+
+use crate::server::log_ceiling::{LevelCeilings, TargetCeiling};
 
 /// `service.name` of a process that does not set `OTEL_SERVICE_NAME`.
 #[cfg(feature = "otel")]
@@ -93,7 +96,30 @@ pub struct TelemetryGuard {
 /// Hold the returned [`TelemetryGuard`] until the process exits; dropping it
 /// flushes what is still buffered.
 pub fn init(transport: &str) -> TelemetryGuard {
-    init_writing_to(log_writer(transport))
+    init_with_ceilings(transport, &[])
+}
+
+/// [`init`], with every span and event above its target's ceiling dropped
+/// whatever `RUST_LOG` says.
+///
+/// The ceilings are a [`LevelCeilings`] filter AND-ed with the `RUST_LOG`
+/// filter, in front of every sink: the log output, the OTLP export, and the
+/// error notifier of `init_with_notifications_and_ceilings`. A service whose
+/// dependency logs secrets at TRACE caps that dependency here, so an operator
+/// raising `RUST_LOG` to `trace` while debugging cannot ship them to the log
+/// backend.
+///
+/// ```rust,no_run
+/// use dravr_tronc::server::log_ceiling::TargetCeiling;
+/// use dravr_tronc::server::tracing_init;
+/// use tracing_subscriber::filter::LevelFilter;
+///
+/// const CEILINGS: &[TargetCeiling] = &[TargetCeiling::new("chromiumoxide", LevelFilter::DEBUG)];
+///
+/// let _telemetry_guard = tracing_init::init_with_ceilings("http", CEILINGS);
+/// ```
+pub fn init_with_ceilings(transport: &str, ceilings: &'static [TargetCeiling]) -> TelemetryGuard {
+    init_writing_to(log_writer(transport), ceilings)
 }
 
 /// Where the log lines of `transport` go: stderr for stdio, whose stdout
@@ -111,11 +137,21 @@ fn log_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
-/// [`init`] with the log lines written to `writer`.
-fn init_writing_to(writer: BoxMakeWriter) -> TelemetryGuard {
-    let (export, pending) = export_layer();
+/// The registry under `filter` and `ceilings`, both global filters: every
+/// layer added on top of it sees only what both admit.
+fn filtered_registry(
+    filter: EnvFilter,
+    ceilings: &'static [TargetCeiling],
+) -> Layered<LevelCeilings, Layered<EnvFilter, Registry>> {
     tracing_subscriber::registry()
-        .with(log_filter())
+        .with(filter)
+        .with(LevelCeilings::new(ceilings))
+}
+
+/// [`init_with_ceilings`] with the log lines written to `writer`.
+fn init_writing_to(writer: BoxMakeWriter, ceilings: &'static [TargetCeiling]) -> TelemetryGuard {
+    let (export, pending) = export_layer();
+    filtered_registry(log_filter(), ceilings)
         .with(fmt::layer().with_writer(writer))
         .with(export)
         .init();
@@ -373,6 +409,19 @@ impl OtelPipeline {
 /// [`ErrorNotificationLayer`]: crate::notifications::ErrorNotificationLayer
 #[cfg(feature = "notifications")]
 pub fn init_with_notifications(transport: &str) -> TelemetryGuard {
+    init_with_notifications_and_ceilings(transport, &[])
+}
+
+/// [`init_with_notifications`] under per-target level ceilings.
+///
+/// Every span and event above its target's ceiling is dropped whatever
+/// `RUST_LOG` says — before the log output, the OTLP export and the error
+/// notifier alike. See [`init_with_ceilings`].
+#[cfg(feature = "notifications")]
+pub fn init_with_notifications_and_ceilings(
+    transport: &str,
+    ceilings: &'static [TargetCeiling],
+) -> TelemetryGuard {
     use crate::notifications::{
         EmailClient, ErrorNotificationLayer, NotificationConfig, SlackClient,
     };
@@ -388,8 +437,7 @@ pub fn init_with_notifications(transport: &str) -> TelemetryGuard {
     let error_layer = has_channels.then(|| ErrorNotificationLayer::new(config, slack, email));
 
     let (export, pending) = export_layer();
-    tracing_subscriber::registry()
-        .with(log_filter())
+    filtered_registry(log_filter(), ceilings)
         .with(fmt::layer().with_writer(log_writer(transport)))
         .with(export)
         .with(error_layer)
@@ -398,16 +446,22 @@ pub fn init_with_notifications(transport: &str) -> TelemetryGuard {
 }
 
 #[cfg(test)]
-#[cfg(feature = "otel")]
 mod tests {
     use super::*;
+    #[cfg(feature = "otel")]
     use std::future::{ready, Future};
     use std::io::Write;
     use std::sync::{Arc, Mutex, PoisonError};
 
+    #[cfg(feature = "otel")]
     use opentelemetry::trace::Tracer as _;
+    #[cfg(feature = "otel")]
     use opentelemetry_sdk::error::OTelSdkResult;
+    #[cfg(feature = "otel")]
     use opentelemetry_sdk::trace::{SpanData, SpanExporter as SdkSpanExporter};
+    use tracing::subscriber::with_default;
+    use tracing::{debug, info, trace, trace_span};
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::MakeWriter;
 
     /// Bytes a writer collected, shared with the test that reads them.
@@ -449,9 +503,11 @@ mod tests {
 
     /// The names of the spans exported to it. Unlike the SDK's in-memory
     /// exporter it keeps them through shutdown, which is the point here.
+    #[cfg(feature = "otel")]
     #[derive(Debug, Clone, Default)]
     struct Recorded(Arc<Mutex<Vec<String>>>);
 
+    #[cfg(feature = "otel")]
     impl Recorded {
         fn names(&self) -> Vec<String> {
             self.0
@@ -461,6 +517,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "otel")]
     impl SdkSpanExporter for Recorded {
         fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
             self.0
@@ -471,6 +528,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "otel")]
     fn config(endpoint: &str) -> OtelConfig {
         OtelConfig {
             endpoint: endpoint.to_owned(),
@@ -478,6 +536,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "otel")]
     #[test]
     fn an_endpoint_that_is_no_uri_fails_the_span_exporter_by_name() {
         let failure = OtelPipeline::build(&config("not a uri"))
@@ -506,6 +565,7 @@ mod tests {
     ///
     /// The only test in this crate's unit tests that installs the global
     /// subscriber, which a process does once.
+    #[cfg(feature = "otel")]
     #[test]
     fn an_exporter_failure_is_logged_through_the_installed_subscriber() {
         const ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
@@ -513,7 +573,7 @@ mod tests {
         env::set_var(ENDPOINT, "not a uri");
         let logs = Buffer::default();
 
-        let guard = init_writing_to(BoxMakeWriter::new(logs.clone()));
+        let guard = init_writing_to(BoxMakeWriter::new(logs.clone()), &[]);
         match previous {
             Some(value) => env::set_var(ENDPOINT, value),
             None => env::remove_var(ENDPOINT),
@@ -539,6 +599,7 @@ mod tests {
 
     /// A span recorded before the guard drops is exported by the drop, not
     /// lost with the batch still waiting for its schedule.
+    #[cfg(feature = "otel")]
     #[test]
     fn dropping_the_guard_exports_the_last_batch() {
         let recorded = Recorded::default();
@@ -559,5 +620,74 @@ mod tests {
         });
 
         assert_eq!(recorded.names(), ["before-exit"]);
+    }
+
+    const CEILINGS: &[TargetCeiling] = &[TargetCeiling::new("chromiumoxide", LevelFilter::DEBUG)];
+
+    /// What the log output of `filtered_registry(filter, ceilings)` reads
+    /// after `emit` runs under it.
+    fn logged(filter: &str, ceilings: &'static [TargetCeiling], emit: impl FnOnce()) -> String {
+        let logs = Buffer::default();
+        let subscriber = filtered_registry(EnvFilter::new(filter), ceilings)
+            .with(fmt::layer().with_writer(logs.clone()).with_ansi(false));
+        with_default(subscriber, emit);
+        logs.text()
+    }
+
+    fn chromiumoxide_traffic() {
+        trace!(target: "chromiumoxide::conn", "Sending trace-marker");
+        debug!(target: "chromiumoxide::conn", "debug-marker");
+        trace!(target: "chromiumoxide_cdp::cdp", "sibling-crate-marker");
+        info!(target: "dravr_service", "info-marker");
+    }
+
+    /// Both init paths build on `filtered_registry`, so its sinks never see
+    /// a capped TRACE line, however `RUST_LOG` raises the target.
+    #[test]
+    fn the_log_output_holds_the_ceilings_whatever_the_env_filter_says() {
+        for filter in [
+            "trace",
+            "chromiumoxide=trace,info",
+            "info,chromiumoxide::conn=trace",
+        ] {
+            let text = logged(filter, CEILINGS, chromiumoxide_traffic);
+
+            assert!(!text.contains("trace-marker"), "{filter}: {text}");
+            assert!(text.contains("debug-marker"), "{filter}: {text}");
+            assert!(text.contains("info-marker"), "{filter}: {text}");
+        }
+        let text = logged("trace", CEILINGS, chromiumoxide_traffic);
+        assert!(
+            text.contains("sibling-crate-marker"),
+            "chromiumoxide_cdp is another crate, not under the chromiumoxide ceiling: {text}"
+        );
+    }
+
+    /// A capped span is never created, so its fields cannot ride along on an
+    /// uncapped event recorded inside it.
+    #[test]
+    fn a_capped_span_does_not_reach_the_log_output() {
+        let text = logged("trace", CEILINGS, || {
+            let span = trace_span!(target: "chromiumoxide::conn", "cdp", cookie = "span-marker");
+            let _entered = span.enter();
+            info!(target: "dravr_service", "inside-marker");
+        });
+
+        assert!(text.contains("inside-marker"), "{text}");
+        assert!(!text.contains("span-marker"), "{text}");
+        assert!(!text.contains("cdp{"), "{text}");
+    }
+
+    /// `init` and `init_with_notifications` pass no ceilings: the log output
+    /// is what `RUST_LOG` alone selects, as before.
+    #[test]
+    fn no_ceilings_leave_the_env_filter_alone() {
+        let text = logged("trace", &[], chromiumoxide_traffic);
+        assert!(text.contains("trace-marker"), "{text}");
+        assert!(text.contains("sibling-crate-marker"), "{text}");
+
+        let text = logged("info", &[], chromiumoxide_traffic);
+        assert!(!text.contains("debug-marker"), "{text}");
+        assert!(text.contains("info-marker"), "{text}");
     }
 }

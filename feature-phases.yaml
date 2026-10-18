@@ -58,3 +58,8 @@ features:
     current: tronc's own tests drive the testkit; dravr-platform's MCP e2e tests use a hand-rolled McpTestClient of their own, and no fleet crate on main enables the testkit feature
     advance_when: dravr-platform's MCP e2e tests use dravr_tronc testkit (dev-dependency feature testkit) in place of their own client, asserting the tools/list count and names through McpTestClient (owner decision on carnet#957, the wiring is a platform follow-up)
     review_by: 2026-11-16
+  - name: log-target-ceilings
+    surface: src/server/log_ceiling.rs (TargetCeiling, LevelCeilings) and src/server/tracing_init.rs (init_with_ceilings, init_with_notifications_and_ceilings)
+    current: no fleet binary passes ceilings, so a RUST_LOG of trace still lets chromiumoxide log every CDP command and message, typed passwords and session cookies included, in dravr-sciotte (carnet#1068)
+    advance_when: dravr-sciotte's server and MCP binaries initialise tracing through the ceilings variants with chromiumoxide capped below TRACE, with a test of its own showing a TRACE line at chromiumoxide conn dropped under RUST_LOG trace
+    review_by: 2026-11-16

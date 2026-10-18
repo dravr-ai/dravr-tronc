@@ -223,7 +223,8 @@ once, last. See [Request guard](#request-guard).
 | `server::health` | `HealthResponse` builder with HTTP status codes |
 | `server::cli` | `ServerArgs` / `McpArgs` — clap structs for `#[command(flatten)]` |
 | `server::trace_context` | W3C `traceparent` / `tracestate`, read from HTTP headers and MCP `params._meta`; joined and propagated with feature `otel` |
-| `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop |
+| `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop; `init_with_ceilings` holds per-target level ceilings over `RUST_LOG` |
+| `server::log_ceiling` | `TargetCeiling` / `LevelCeilings` — a filter AND-ed with `EnvFilter` that drops a target's spans and events above its ceiling, for a dependency whose TRACE output carries secrets |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
 
 ## Choosing an auth mechanism
