@@ -1,5 +1,16 @@
 # Changelog
 
+## [5.2.0] — 2026-10-18
+
+### Added
+
+- feat(tracing): per-target level ceilings no RUST_LOG can raise
+
+### Other
+
+- chore(phases): notify-actions has its consumer
+
+
 ## [5.1.1] — 2026-10-16
 
 ### Fixed
