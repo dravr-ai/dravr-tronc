@@ -1,5 +1,17 @@
 # Changelog
 
+## [6.0.0] — 2026-10-19
+
+### Added
+
+- feat(mcp)!: RFC 9728 metadata chosen per request, and its challenges
+- feat(tracing)!: otel on OpenTelemetry 0.32, a reqwest client-span layer
+
+### Other
+
+- chore(toolchain): bump Rust 1.98.1 to 1.99.1
+
+
 ## [5.2.0] — 2026-10-18
 
 ### Added
