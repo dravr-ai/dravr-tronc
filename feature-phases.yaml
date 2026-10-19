@@ -38,6 +38,11 @@ features:
     current: no fleet server publishes its metadata through tronc; dravr-platform serves its own hand-rolled RFC 9728 document beside the tronc router
     advance_when: dravr-platform serves /.well-known/oauth-protected-resource through McpServer with_protected_resource_metadata and deletes its hand-rolled route, with a test asserting the document's resource equals the configured MCP_RESOURCE_URL (owner decision on carnet#957, the wiring is a platform follow-up)
     review_by: 2026-11-16
+  - name: otel-http-client
+    surface: Cargo.toml feature otel-http-client (src/http_client/trace.rs TracePropagationMiddleware) and server trace_context inject_context
+    current: no fleet crate enables otel-http-client; dravr-platform wraps its shared reqwest clients in a hand-rolled TracePropagationMiddleware of its own (pierre-core trace_propagation)
+    advance_when: dravr-platform's shared reqwest-middleware clients use dravr_tronc http_client TracePropagationMiddleware and pierre-core trace_propagation is deleted, with a test of its own showing an outbound request carrying the traceparent of its CLIENT span (carnet#958)
+    review_by: 2026-11-16
   - name: mcp-schema-validation
     surface: Cargo.toml feature schema-validation (src/mcp/validation.rs ToolSchemaValidator, the argument and structuredContent checks in ToolRegistry execute)
     current: no fleet Cargo.toml enables schema-validation, so call arguments and structured results are checked only by each tool's own parsing

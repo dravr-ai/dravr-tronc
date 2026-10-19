@@ -12,9 +12,19 @@
 //! the bot token in the path, `OpenWeatherMap` puts its `appid` key in the
 //! query — so formatting the error as it comes writes the credential into
 //! every error message and log line built from it.
+//!
+//! With the `otel-http-client` feature, [`TracePropagationMiddleware`] is the
+//! `reqwest-middleware` layer that puts every outbound request of a client in
+//! the caller's trace.
 
 use std::error::Error;
 use std::iter;
+
+#[cfg(feature = "otel-http-client")]
+mod trace;
+
+#[cfg(feature = "otel-http-client")]
+pub use trace::TracePropagationMiddleware;
 
 /// Describe a failed request without the URL it was sent to.
 ///

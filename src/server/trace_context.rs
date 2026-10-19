@@ -18,7 +18,10 @@
 //!   reads them.
 //! - **An outbound call.** `ServiceClient` (feature `service-client`) writes the current span's context on every attempt with
 //!   [`inject_current_context`], so the called service's spans land in the
-//!   caller's trace.
+//!   caller's trace. Any other `reqwest` client does the same through
+//!   `http_client::TracePropagationMiddleware` (feature `otel-http-client`),
+//!   which opens a client span per request and injects that span's context
+//!   with [`inject_context`].
 //!
 //! Without the `otel` feature there is no trace to join: the values are still
 //! read and validated, and nothing is exported or propagated.
@@ -219,9 +222,21 @@ pub fn join_trace(span: &Span, context: &TraceContext) -> bool {
 /// exported trace, and leaves any `traceparent` the caller set in that case.
 #[cfg(feature = "otel")]
 pub fn inject_current_context(headers: &mut HeaderMap) {
-    let context = Span::current().context();
+    inject_context(&Span::current().context(), headers);
+}
+
+/// Write the trace context `context` names into an outbound request's headers,
+/// through the global propagator.
+///
+/// What [`inject_current_context`] does for the current span, for a caller
+/// that opened a span of its own for the request, as
+/// `http_client::TracePropagationMiddleware` (feature `otel-http-client`)
+/// does. Writes nothing for a context that names
+/// no valid span.
+#[cfg(feature = "otel")]
+pub fn inject_context(context: &Context, headers: &mut HeaderMap) {
     global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&context, &mut HeaderInjector(headers));
+        propagator.inject_context(context, &mut HeaderInjector(headers));
     });
 }
 

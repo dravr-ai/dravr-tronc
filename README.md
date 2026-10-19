@@ -213,7 +213,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
 | `mcp::caller` *(feature `google-iam`)* | Verified caller identity — `CallerTokenVerifier` checks a platform-minted RS256 JWT (JWKS signature, `iss`, per-server `aud`, `exp`/`nbf`) and reads `sub`/tenant/`scope`/`client_id`; `CallerAuthHook` makes it the call's `ToolContext`, optionally beside the shared key or anonymous loopback (both identity-free); `CallerTokenConfig::from_env` |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
-| `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential |
+| `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential; `TracePropagationMiddleware` *(feature `otel-http-client`)* — the `reqwest-middleware` 0.3 layer opening a CLIENT span per outbound request and sending its `traceparent` |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called; `GoogleKeySet`, the cache of Google's signing keys for one key-set URL, refetching for an unknown `kid` at most every 30s |
 | `service_client` *(feature `service-client`)* | `ServiceClient` — the client half of `server::request_guard`: ID-token auth (none on loopback), a fresh `x-request-id` per attempt, one re-send of a GET whose connection closed, shed and could-not-finish answers as typed errors |
 | `notifications::slack` *(feature `notifications`)* | Slack request-signature verification |
@@ -501,7 +501,11 @@ let server = McpServer::new("my-server", "0.1.0", registry, state)
 - **Histogram** `mcp.server.operation.duration` (seconds), on the low-cardinality attributes only.
 - **Trace context.** A valid `params._meta.traceparent` parents the span; otherwise it is a child of
   the HTTP `request` span, which continues the `traceparent` header. `ServiceClient` writes the
-  current context on every outbound call. See `server::trace_context`.
+  current context on every outbound call; any other `reqwest` client built with
+  `reqwest-middleware` does it through `http_client::TracePropagationMiddleware` (feature
+  `otel-http-client`), which opens an `http.client.request` CLIENT span per request (method and
+  host only, never the URL), injects that span's context and records the response status. See
+  `server::trace_context`.
 - **Payloads** (`gen_ai.tool.call.arguments` / `.result`) are captured only when a
   `PayloadCapturePolicy` asks for them. The host's `PayloadRedactor` runs on the JSON value first —
   returning `None` keeps nothing — and the text is cut to `max_bytes` (default 4096) on a UTF-8

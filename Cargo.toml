@@ -66,6 +66,12 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# `http_client::TracePropagationMiddleware`: the reqwest-middleware layer that
+# opens a CLIENT span per outbound request and injects its traceparent, for a
+# service whose reqwest clients are built with reqwest-middleware. Opt-in
+# apart from `otel` because it pulls reqwest-middleware, which a service that
+# only receives traced requests has no use for.
+otel-http-client = ["otel", "http-client", "dep:reqwest-middleware"]
 
 [dependencies]
 async-trait = "0.1"
@@ -91,10 +97,13 @@ hex = { version = "0.4", optional = true }
 # Must be the hyper reqwest 0.12 links (1.x): the closed-connection check
 # downcasts to hyper::Error, and a second hyper would never match.
 hyper = { version = "1", default-features = false, optional = true }
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics"], optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"], optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+# The 0.3 line, which wraps reqwest 0.12: a host plugs the trace layer into its
+# own reqwest-middleware client, and only the same major's Middleware trait fits.
+reqwest-middleware = { version = "0.3", optional = true }
 ring = { version = "0.17", optional = true }
 schemars = { version = "1.2", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -104,7 +113,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # CancellationToken: the signal a task's operation and an in-flight request watch.
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
-tracing-opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
@@ -116,7 +125,7 @@ dravr-tronc = { path = ".", features = ["testkit"] }
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 # The otel tests export spans and metrics to memory, which only the testing
 # feature builds.
-opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 serial_test = "3"
 http = "1"
 http-body-util = "0.1"
