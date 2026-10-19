@@ -185,7 +185,7 @@ async fn notification_is_silently_ignored() {
         .await
         .expect("an answer");
     assert_eq!(accepted.status, 202);
-    assert!(accepted.body.is_empty());
+    assert_eq!(accepted.body, "");
 }
 
 #[tokio::test]

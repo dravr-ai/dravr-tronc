@@ -445,7 +445,7 @@ async fn an_unmatched_request_is_logged_without_its_path() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(!echoed_id(&response).is_empty());
+    assert_ne!(echoed_id(&response), "");
     let logs = logs.text();
     assert!(logs.contains("path=<unmatched>"), "{logs}");
     assert!(logs.contains("status=404"), "{logs}");

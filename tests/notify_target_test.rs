@@ -39,7 +39,7 @@ fn notify_target_is_reachable_from_the_crate_root() {
     // The import above is the assertion: an emitter reaches the constant as
     // `dravr_tronc::NOTIFY_TARGET`, with no feature and no module path into the
     // gated sender machinery.
-    assert!(!NOTIFY_TARGET.is_empty());
+    assert_ne!(NOTIFY_TARGET, "");
 }
 
 #[cfg(feature = "notifications")]

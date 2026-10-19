@@ -240,7 +240,7 @@ async fn progress_streams_before_the_response_and_needs_a_token() {
         .exchange("tools/call", Some(call_params("progress", &json!({}))))
         .await
         .unwrap();
-    assert!(quiet.messages.is_empty());
+    assert_eq!(quiet.messages, Vec::<Value>::new());
 }
 
 #[tokio::test]
@@ -380,7 +380,7 @@ async fn a_modern_call_logs_at_its_meta_level_and_never_sends_a_request() {
         .exchange("tools/call", Some(call_params("sample", &json!({}))))
         .await
         .unwrap();
-    assert!(sampled.server_requests().is_empty());
+    assert_eq!(sampled.server_requests(), Vec::<&Value>::new());
     let result: ToolResponse = serde_json::from_value(sampled.response.result.unwrap()).unwrap();
     assert_tool_error(&result, "input-required");
     assert_eq!(client.session_id(), None, "the modern era has no sessions");
@@ -455,7 +455,7 @@ async fn a_response_post_carries_no_mirror_and_is_accepted() {
         .await
         .unwrap();
     assert_eq!(accepted.status, 202, "{}", accepted.body);
-    assert!(accepted.body.is_empty());
+    assert_eq!(accepted.body, "");
 
     let mirrored = client
         .with_header("mcp-method", "tools/call")

@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn event_visitor_starts_empty() {
         let visitor = EventVisitor::new();
-        assert!(visitor.message.is_empty());
+        assert_eq!(visitor.message, "");
         assert!(visitor.fields.is_empty());
     }
 
