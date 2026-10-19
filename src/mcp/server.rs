@@ -34,7 +34,7 @@ use crate::mcp::pagination::{cursor_param, paginate};
 use crate::mcp::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION,
 };
-use crate::mcp::resource_metadata::ProtectedResourceMetadata;
+use crate::mcp::resource_metadata::{ProtectedResourceMetadata, ResourceMetadataSource};
 use crate::mcp::schema::{
     InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
 };
@@ -143,7 +143,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     allowed_hosts: Option<Vec<String>>,
     max_request_bytes: usize,
     list_page_size: Option<NonZeroUsize>,
-    resource_metadata: Option<Arc<ProtectedResourceMetadata>>,
+    resource_metadata: Option<Arc<dyn ResourceMetadataSource>>,
     tool_dispatcher: Option<Arc<dyn ToolDispatcher<S>>>,
     method_handler: Option<Arc<dyn MethodHandler<S>>>,
     task_manager: Option<Arc<TaskManager>>,
@@ -329,16 +329,34 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// `/.well-known/oauth-protected-resource` an MCP client falls back to —
     /// so the host no longer mounts the route itself. The host's
     /// [`AuthHook`] still writes the 401 challenge; it builds one pointing
-    /// here with [`ProtectedResourceMetadata::www_authenticate`].
+    /// here with [`ProtectedResourceMetadata::challenge`].
     #[must_use]
-    pub fn with_protected_resource_metadata(mut self, metadata: ProtectedResourceMetadata) -> Self {
-        self.resource_metadata = Some(Arc::new(metadata));
+    pub fn with_protected_resource_metadata(self, metadata: ProtectedResourceMetadata) -> Self {
+        self.with_protected_resource_metadata_source(Arc::new(metadata))
+    }
+
+    /// Publish RFC 9728 protected-resource metadata chosen per request.
+    ///
+    /// The router answers `GET` at every one of the source's
+    /// [`metadata_paths`](ResourceMetadataSource::metadata_paths) with the
+    /// document [`metadata_for`](ResourceMetadataSource::metadata_for) picks:
+    /// a [`ProtectedResourceMetadataSet`](crate::mcp::resource_metadata::ProtectedResourceMetadataSet)
+    /// for a server known by several origins, or a closure of the host's own.
+    /// A host that mounts the well-known route itself must not also set one,
+    /// or merging the two routers panics on the overlapping route.
+    #[must_use]
+    pub fn with_protected_resource_metadata_source(
+        mut self,
+        source: impl ResourceMetadataSource + 'static,
+    ) -> Self {
+        self.resource_metadata = Some(Arc::new(source));
         self
     }
 
-    /// The protected-resource metadata the router publishes, if any.
+    /// Where the router reads the protected-resource metadata it publishes,
+    /// if it publishes any.
     #[must_use]
-    pub fn protected_resource_metadata(&self) -> Option<&Arc<ProtectedResourceMetadata>> {
+    pub fn protected_resource_metadata(&self) -> Option<&Arc<dyn ResourceMetadataSource>> {
         self.resource_metadata.as_ref()
     }
 

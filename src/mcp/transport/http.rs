@@ -42,7 +42,7 @@ use crate::mcp::modern::{
 use crate::mcp::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION, PROTOCOL_VERSION,
 };
-use crate::mcp::resource_metadata::{ProtectedResourceMetadata, WELL_KNOWN_PROTECTED_RESOURCE};
+use crate::mcp::resource_metadata::{MetadataRequest, ResourceMetadataSource};
 use crate::mcp::server::McpServer;
 use crate::mcp::session::{Session, SessionRefusal, SessionStore, SessionUse};
 use crate::mcp::tool::ToolContext;
@@ -71,10 +71,12 @@ pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// is buffered whole; the limit is set on the route itself, so it holds
 /// whatever the merging application layers on top.
 ///
-/// When the server publishes [`ProtectedResourceMetadata`] (see
-/// [`McpServer::with_protected_resource_metadata`]), the router also answers
-/// `GET` with it at the document's well-known path, and at the bare
-/// `/.well-known/oauth-protected-resource` an MCP client falls back to. When
+/// When the server publishes protected-resource metadata (see
+/// [`McpServer::with_protected_resource_metadata`] and
+/// [`McpServer::with_protected_resource_metadata_source`]), the router also
+/// answers `GET` with it at the document's well-known path, and at the bare
+/// `/.well-known/oauth-protected-resource` an MCP client falls back to; see
+/// [`resource_metadata_router`]. When
 /// it keeps sessions ([`McpServer::with_http_sessions`]), `/mcp` also answers
 /// `DELETE`, which ends one.
 pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) -> Router {
@@ -86,35 +88,55 @@ pub fn mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServer<S>>) 
     }
     let router = Router::new().route("/mcp", endpoint).with_state(server);
     match metadata {
-        Some(metadata) => router.merge(resource_metadata_router(metadata)),
+        Some(metadata) => router.merge(metadata_routes(metadata)),
         None => router,
     }
 }
 
-/// The routes publishing `metadata`: its RFC 9728 well-known path and, when
-/// that carries the resource's path, the bare one too.
-fn resource_metadata_router(metadata: Arc<ProtectedResourceMetadata>) -> Router {
-    let path = metadata.metadata_path();
-    let serve_metadata = get(serve_resource_metadata).with_state(metadata);
-    let router = Router::new().route(&path, serve_metadata.clone());
-    if path == WELL_KNOWN_PROTECTED_RESOURCE {
-        router
-    } else {
-        router.route(WELL_KNOWN_PROTECTED_RESOURCE, serve_metadata)
-    }
+/// The routes publishing the protected-resource metadata `source` picks: a
+/// `GET` at each of its [`metadata_paths`](ResourceMetadataSource::metadata_paths).
+///
+/// [`mcp_router`] mounts it for a server that publishes metadata. Public for a
+/// host that serves the document from a router of its own (beside its OAuth
+/// authorization-server routes, say) instead of setting it on the
+/// [`McpServer`]: the two must not both mount it, or merging them panics on the
+/// overlapping route.
+///
+/// The document is public by design — a client reads it before it holds any
+/// credential, often from a browser — so it carries
+/// `Access-Control-Allow-Origin: *` and passes no Origin or Host gate. A
+/// request the source answers with no document is a 404.
+pub fn resource_metadata_router(source: impl ResourceMetadataSource + 'static) -> Router {
+    metadata_routes(Arc::new(source))
 }
 
-/// Answer the metadata document. It is public by design — a client reads it
-/// before it holds any credential, often from a browser — so it carries
-/// `Access-Control-Allow-Origin: *` and passes no Origin or Host gate.
+/// The routes of [`resource_metadata_router`], over a source already shared.
+fn metadata_routes(source: Arc<dyn ResourceMetadataSource>) -> Router {
+    let paths = source.metadata_paths();
+    let serve_metadata = get(serve_resource_metadata).with_state(source);
+    paths.iter().fold(Router::new(), |router, path| {
+        router.route(path, serve_metadata.clone())
+    })
+}
+
+/// Answer the metadata document `source` picks for the request.
 async fn serve_resource_metadata(
-    State(metadata): State<Arc<ProtectedResourceMetadata>>,
+    State(source): State<Arc<dyn ResourceMetadataSource>>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Response {
-    (
-        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-        Json(metadata.as_ref()),
-    )
-        .into_response()
+    source
+        .metadata_for(&MetadataRequest::new(uri.path(), &headers))
+        .map_or_else(
+            || StatusCode::NOT_FOUND.into_response(),
+            |metadata| {
+                (
+                    [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+                    Json(metadata.as_ref()),
+                )
+                    .into_response()
+            },
+        )
 }
 
 /// [`mcp_router`] under [`guard_requests`]: the router [`serve`] serves, less
@@ -1428,6 +1450,9 @@ mod tests {
     use super::*;
     use crate::error::{INVALID_PARAMS, PARSE_ERROR};
     use crate::mcp::auth::AuthHook;
+    use crate::mcp::resource_metadata::{
+        ProtectedResourceMetadata, ProtectedResourceMetadataSet, WELL_KNOWN_PROTECTED_RESOURCE,
+    };
     use crate::mcp::schema::{Tool, ToolResponse};
     use crate::mcp::server::DEFAULT_MAX_REQUEST_BYTES;
     use crate::mcp::tool::{McpTool, ToolCapabilities, ToolContext, ToolRegistry};
@@ -1886,6 +1911,115 @@ mod tests {
             StatusCode::NOT_FOUND,
             "nothing is published unasked"
         );
+    }
+
+    /// GET `path` on `app` as a client that dialed `host`.
+    async fn get_dialed(app: Router, path: &str, host: &str) -> (StatusCode, Option<Value>) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", "backend.internal")
+            .header("x-forwarded-host", host)
+            .body(Body::empty())
+            .expect("request"); // Safe: test fixture
+        let response = app.oneshot(request).await.expect("response"); // Safe: test assertion
+        let status = response.status();
+        let body = if status == StatusCode::OK {
+            Some(json_body(response).await)
+        } else {
+            None
+        };
+        (status, body)
+    }
+
+    /// A server known by several origins answers each the document naming
+    /// the origin it dialed, so RFC 9728 §3.3's comparison holds for every
+    /// client; one that dialed none of them gets the canonical document.
+    #[tokio::test]
+    async fn a_metadata_set_answers_the_document_of_the_dialed_host() {
+        let doc = |resource: &str| {
+            ProtectedResourceMetadata::new(resource, vec!["https://auth.example.test".to_owned()])
+                .expect("valid resource") // Safe: test fixture
+                .with_jwks_uri("https://auth.example.test/.well-known/jwks.json")
+        };
+        let set = ProtectedResourceMetadataSet::new(doc("https://mcp.example.test"))
+            .with_alias(doc("https://app.example.test"));
+        let server = Arc::new(
+            McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                .with_protected_resource_metadata_source(set),
+        );
+        for (host, resource) in [
+            ("app.example.test", "https://app.example.test"),
+            ("mcp.example.test", "https://mcp.example.test"),
+            ("elsewhere.test", "https://mcp.example.test"),
+        ] {
+            let (status, body) = get_dialed(
+                mcp_router(Arc::clone(&server)),
+                WELL_KNOWN_PROTECTED_RESOURCE,
+                host,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+            let body = body.expect("a document"); // Safe: test assertion
+            assert_eq!(body["resource"], resource, "{host}");
+            assert_eq!(
+                body["jwks_uri"], "https://auth.example.test/.well-known/jwks.json",
+                "{host}"
+            );
+        }
+    }
+
+    /// A closure picks the document per request, and one that picks none is
+    /// a 404.
+    #[tokio::test]
+    async fn a_closure_source_decides_per_request() {
+        let known = Arc::new(
+            ProtectedResourceMetadata::new("https://mcp.example.test", vec![])
+                .expect("valid resource"), // Safe: test fixture
+        );
+        let source = move |request: &MetadataRequest<'_>| {
+            (request.dialed_host() == Some("mcp.example.test")).then(|| Arc::clone(&known))
+        };
+        let app = || {
+            mcp_router(Arc::new(
+                McpServer::new("test", "0.1.0", ToolRegistry::new(), Arc::new(TestState))
+                    .with_protected_resource_metadata_source(source.clone()),
+            ))
+        };
+        let (status, body) =
+            get_dialed(app(), WELL_KNOWN_PROTECTED_RESOURCE, "mcp.example.test").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.expect("a document")["resource"], // Safe: test assertion
+            "https://mcp.example.test"
+        );
+        let (status, _) = get_dialed(app(), WELL_KNOWN_PROTECTED_RESOURCE, "other.test").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A host that serves the document itself sets nothing on the server, and
+    /// the router then claims no well-known route its own can collide with;
+    /// the same document mounts on the host's router through
+    /// [`resource_metadata_router`].
+    #[tokio::test]
+    async fn a_host_can_mount_the_metadata_beside_the_router() {
+        async fn hosts_own() -> &'static str {
+            "host-owned"
+        }
+        let app =
+            make_app().merge(Router::new().route(WELL_KNOWN_PROTECTED_RESOURCE, get(hosts_own)));
+        let (status, _, body) = get_path(app, WELL_KNOWN_PROTECTED_RESOURCE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "host-owned");
+
+        let metadata = ProtectedResourceMetadata::new("https://mcp.example.test", vec![])
+            .expect("valid resource"); // Safe: test fixture
+        let app = make_app().merge(resource_metadata_router(Arc::new(metadata)));
+        let (status, cors, body) = get_path(app, WELL_KNOWN_PROTECTED_RESOURCE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cors.as_deref(), Some("*"));
+        let json: Value = serde_json::from_str(&body).expect("json"); // Safe: test assertion
+        assert_eq!(json["resource"], "https://mcp.example.test");
     }
 
     /// Loopback authorities always pass; a listed `host` admits any port,

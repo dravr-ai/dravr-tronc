@@ -169,7 +169,32 @@ credential.
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same
 cursors. A server given `with_protected_resource_metadata` has its RFC 9728 document served at
-`/.well-known/oauth-protected-resource[/<resource path>]`.
+`/.well-known/oauth-protected-resource[/<resource path>]`. A server known by several origins passes
+`with_protected_resource_metadata_source` a `ProtectedResourceMetadataSet` — one document per
+origin, the one a request dialed (`X-Forwarded-Host`, else `Host`) answered, the canonical one
+otherwise — or a closure choosing per request. Its auth hook challenges from the same document:
+
+```rust
+use dravr_tronc::mcp::resource_metadata::{ProtectedResourceMetadata, ProtectedResourceMetadataSet, SchemePolicy};
+
+let policy = if require_https { SchemePolicy::RequireHttps } else { SchemePolicy::AllowHttp };
+let doc = |origin: &str| -> Result<_, _> {
+    Ok(ProtectedResourceMetadata::with_scheme_policy(origin, vec![issuer.clone()], policy)?
+        .with_jwks_uri(format!("{issuer}/.well-known/jwks.json"))
+        .with_scopes(scopes.clone()))
+};
+let set = ProtectedResourceMetadataSet::new(doc(&mcp_resource_url)?).with_alias(doc(&base_url)?);
+server = server.with_protected_resource_metadata_source(set.clone());
+
+// In the AuthHook: the challenge of the document the client fetched.
+let challenge = set.for_host(request.dialed_host()).challenge();
+let refused = challenge.clone().invalid_token().to_string();   // …, error="invalid_token"
+let short = challenge.insufficient_scope("fitness:read").to_string(); // …, scope="fitness:read"
+```
+
+The router mounts the well-known route only when metadata is set, so a host that keeps serving the
+document from a router of its own (or mounts `transport::http::resource_metadata_router`) sets none
+on the server: both at once is an overlapping route, which panics when the routers merge.
 
 ### 4. Merge into an existing Axum app
 
@@ -209,7 +234,7 @@ once, last. See [Request guard](#request-guard).
 | `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE` |
 | `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
 | `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
-| `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve, and its 401 challenge |
+| `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve (`jwks_uri` optional, `SchemePolicy` for plain `http`); `ProtectedResourceMetadataSet` / `ResourceMetadataSource` — the document chosen per request, by dialed host; `BearerChallenge` — the 401/403 challenge with RFC 6750 `error` and `scope` |
 | `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
 | `mcp::caller` *(feature `google-iam`)* | Verified caller identity — `CallerTokenVerifier` checks a platform-minted RS256 JWT (JWKS signature, `iss`, per-server `aud`, `exp`/`nbf`) and reads `sub`/tenant/`scope`/`client_id`; `CallerAuthHook` makes it the call's `ToolContext`, optionally beside the shared key or anonymous loopback (both identity-free); `CallerTokenConfig::from_env` |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |

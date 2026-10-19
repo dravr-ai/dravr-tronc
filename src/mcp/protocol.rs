@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::error::{INVALID_REQUEST, PARSE_ERROR};
+use crate::mcp::resource_metadata::DIALED_HOST_HEADERS;
 
 /// JSON-RPC 2.0 version string.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -237,6 +238,22 @@ fn invalid_request(reason: &str) -> Box<JsonRpcResponse> {
 }
 
 impl JsonRpcRequest {
+    /// The authority the client dialed, from the headers the transport
+    /// forwarded: the first of
+    /// [`DIALED_HOST_HEADERS`]
+    /// present, as
+    /// [`dialed_host`](crate::mcp::resource_metadata::dialed_host) reads it off
+    /// an HTTP request. What an [`AuthHook`](crate::mcp::auth::AuthHook) hands
+    /// [`ProtectedResourceMetadataSet::for_host`](crate::mcp::resource_metadata::ProtectedResourceMetadataSet::for_host)
+    /// to challenge with the document the client fetched.
+    #[must_use]
+    pub fn dialed_host(&self) -> Option<&str> {
+        let headers = self.headers.as_ref()?;
+        DIALED_HOST_HEADERS
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(Value::as_str))
+    }
+
     /// Read one JSON-RPC 2.0 request or notification from a message body.
     ///
     /// [`JsonRpcMessage::parse`], refusing a response with an Invalid Request
@@ -649,4 +666,22 @@ mod tests {
     }
 
     const INTERNAL_ERR: i32 = -32_603;
+
+    #[test]
+    fn the_dialed_host_reads_the_forwarded_headers() {
+        let mut request = JsonRpcRequest::new("tools/list", None);
+        assert_eq!(request.dialed_host(), None);
+        request.headers = Some(HashMap::from([(
+            "host".to_owned(),
+            Value::from("backend.internal"),
+        )]));
+        assert_eq!(request.dialed_host(), Some("backend.internal"));
+        if let Some(headers) = request.headers.as_mut() {
+            headers.insert(
+                "x-forwarded-host".to_owned(),
+                Value::from("mcp.example.com"),
+            );
+        }
+        assert_eq!(request.dialed_host(), Some("mcp.example.com"));
+    }
 }

@@ -34,9 +34,9 @@ features:
     advance_when: a fleet MCP server needs state across the requests of one client (its initialize capabilities, a logging/setLevel, a client answering a server request over POST) and opts in with with_http_sessions, with a test of its own driving initialize, a call in the session and DELETE
     review_by: 2026-12-15
   - name: mcp-protected-resource-metadata
-    surface: src/mcp/resource_metadata.rs (ProtectedResourceMetadata, McpServer with_protected_resource_metadata, the RFC 9728 well-known route mcp_router adds)
-    current: no fleet server publishes its metadata through tronc; dravr-platform serves its own hand-rolled RFC 9728 document beside the tronc router
-    advance_when: dravr-platform serves /.well-known/oauth-protected-resource through McpServer with_protected_resource_metadata and deletes its hand-rolled route, with a test asserting the document's resource equals the configured MCP_RESOURCE_URL (owner decision on carnet#957, the wiring is a platform follow-up)
+    surface: src/mcp/resource_metadata (ProtectedResourceMetadata with jwks_uri and SchemePolicy, ProtectedResourceMetadataSet, ResourceMetadataSource, BearerChallenge, McpServer with_protected_resource_metadata and with_protected_resource_metadata_source, JsonRpcRequest dialed_host, the RFC 9728 well-known route mcp_router and resource_metadata_router add)
+    current: no fleet server publishes its metadata through tronc; dravr-platform serves its own hand-rolled RFC 9728 document per dialed host (pierre-routes-identity oauth2 well_known) and writes its own challenges (pierre-server host_seams auth_challenge)
+    advance_when: dravr-platform serves /.well-known/oauth-protected-resource through McpServer with_protected_resource_metadata_source over a ProtectedResourceMetadataSet, builds its 401 and 403 challenges with BearerChallenge, and deletes its hand-rolled route and challenge builders, with its multi-host tests passing unchanged and its challenge strings byte-equal (carnet#957, carnet#958)
     review_by: 2026-11-16
   - name: otel-http-client
     surface: Cargo.toml feature otel-http-client (src/http_client/trace.rs TracePropagationMiddleware) and server trace_context inject_context
