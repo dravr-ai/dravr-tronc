@@ -76,7 +76,9 @@ pub struct JsonRpcRequest {
     pub metadata: HashMap<String, String>,
 }
 
-// Custom Debug that redacts the bearer token so it never reaches logs.
+// Custom Debug that redacts the bearer token so it never reaches logs: no
+// character of it is printed, only its length in chars, so a log line still
+// tells an empty or truncated credential from a full one.
 impl fmt::Debug for JsonRpcRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonRpcRequest")
@@ -86,20 +88,10 @@ impl fmt::Debug for JsonRpcRequest {
             .field("id", &self.id)
             .field(
                 "auth_token",
-                &self.auth_token.as_ref().map(|token| {
-                    // Show first 10 + last 8 characters, or "[REDACTED]" if short.
-                    // Count and slice by chars (not bytes): a byte slice at index
-                    // 10 / len-8 panics when it lands mid-codepoint on a multibyte
-                    // token.
-                    let char_count = token.chars().count();
-                    if char_count > 20 {
-                        let first: String = token.chars().take(10).collect();
-                        let last: String = token.chars().skip(char_count - 8).collect();
-                        format!("{first}...{last}")
-                    } else {
-                        "[REDACTED]".to_owned()
-                    }
-                }),
+                &self
+                    .auth_token
+                    .as_ref()
+                    .map(|token| format!("[REDACTED len={}]", token.chars().count())),
             )
             .field("headers", &self.headers)
             .field("metadata", &self.metadata)
@@ -616,26 +608,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn debug_redacts_long_auth_token() {
+    /// Every window of `token` that the Debug output of a request carrying it
+    /// contains: none, whatever the token's length or encoding.
+    fn leaked_windows(token: &str) -> Vec<String> {
         let mut req = JsonRpcRequest::new("ping", None);
-        req.auth_token = Some("abcdefghij_secret_middle_part_klmnopqr".to_owned());
+        req.auth_token = Some(token.to_owned());
         let debug = format!("{req:?}");
-        assert!(!debug.contains("secret_middle_part"));
-        assert!(debug.contains("..."));
+        let chars: Vec<char> = token.chars().collect();
+        chars
+            .windows(4)
+            .map(|window| window.iter().collect::<String>())
+            .filter(|window| debug.contains(window.as_str()))
+            .collect()
     }
 
     #[test]
-    fn debug_redacts_multibyte_auth_token_without_panic() {
-        // Regression: 24 multibyte chars. The old byte-slicing impl panicked
-        // because byte index 10 (and len-8) land mid-codepoint; char-safe
-        // slicing must elide the middle without panicking.
+    fn debug_prints_no_character_of_the_auth_token() {
+        // No four-char window of it occurs in the rest of the output, so any
+        // window found there came from the token.
+        let token = "zQxWvKbPfGhJyUzQxWvKbPfGhJyU";
+        assert_eq!(leaked_windows(token), Vec::<String>::new());
+
+        let mut req = JsonRpcRequest::new("ping", None);
+        req.auth_token = Some(token.to_owned());
+        let debug = format!("{req:?}");
+        assert!(debug.contains("[REDACTED len=28]"), "{debug}");
+        // The shape the old impl printed: the first 10 and last 8 chars.
+        assert!(!debug.contains(&token[..10]), "{debug}");
+        assert!(!debug.contains(&token[token.len() - 8..]), "{debug}");
+    }
+
+    #[test]
+    fn debug_redacts_a_short_and_a_multibyte_auth_token() {
+        // A short token, and one of 24 multibyte chars: the old prefix/suffix
+        // impl panicked on the latter when it sliced by byte.
+        assert_eq!(leaked_windows("zQxWvK"), Vec::<String>::new());
+        assert_eq!(leaked_windows(&"あ".repeat(24)), Vec::<String>::new());
+
         let mut req = JsonRpcRequest::new("ping", None);
         req.auth_token = Some("あ".repeat(24));
         let debug = format!("{req:?}");
-        assert!(debug.contains("..."));
-        // The full token must never appear — only the first 10 + last 8 chars.
-        assert!(!debug.contains(&"あ".repeat(24)));
+        assert!(!debug.contains('あ'), "{debug}");
+        assert!(debug.contains("[REDACTED len=24]"), "{debug}");
     }
 
     #[test]

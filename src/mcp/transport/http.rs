@@ -47,7 +47,9 @@ use crate::mcp::server::McpServer;
 use crate::mcp::session::{Session, SessionRefusal, SessionStore, SessionUse};
 use crate::mcp::tool::ToolContext;
 use crate::mcp::transport::error::TransportError;
-use crate::mcp::transport::mirror::{check_response_headers, check_standard_headers};
+use crate::mcp::transport::mirror::{
+    check_response_headers, check_standard_headers, is_param_header,
+};
 use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
 use crate::server::request_guard::guard_requests;
 
@@ -1395,19 +1397,46 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Headers a transport never forwards in [`JsonRpcRequest::headers`]: the
-/// bearer already travels as [`JsonRpcRequest::auth_token`], and a cookie or a
-/// proxy credential is nothing a JSON-RPC handler should hold.
-const WITHHELD_HEADERS: [header::HeaderName; 3] = [
+/// bearer already travels as [`JsonRpcRequest::auth_token`], and a cookie, a
+/// proxy credential or an API key is nothing a JSON-RPC handler should hold.
+const WITHHELD_HEADERS: [header::HeaderName; 4] = [
     header::AUTHORIZATION,
     header::COOKIE,
     header::PROXY_AUTHORIZATION,
+    header::HeaderName::from_static("x-api-key"),
 ];
+
+/// Fragments of a header name that mark it as carrying a credential
+/// (`x-auth-token`, `x-client-secret`, `x-goog-api-key`, ...), withheld
+/// whatever header carries them.
+const CREDENTIAL_NAME_FRAGMENTS: [&str; 3] = ["token", "secret", "api-key"];
+
+/// Whether a header never reaches [`JsonRpcRequest::headers`].
+///
+/// `name` is a [`header::HeaderName`]'s text, which the http crate always
+/// lower-cases, so the fragment match is case-insensitive whatever the client
+/// sent. An `Mcp-Param-*` header is exempt from the fragment match: it mirrors
+/// a `tools/call` argument the body already carries (SEP-2243), and the
+/// mirror check refuses a modern call whose annotated argument arrives
+/// without its header.
+fn is_withheld(name: &header::HeaderName) -> bool {
+    if WITHHELD_HEADERS.contains(name) {
+        return true;
+    }
+    let name = name.as_str();
+    !is_param_header(name)
+        && CREDENTIAL_NAME_FRAGMENTS
+            .iter()
+            .any(|fragment| name.contains(fragment))
+}
 
 /// The request's HTTP headers as [`JsonRpcRequest::headers`] carries them.
 ///
 /// The [`AuthHook`](crate::mcp::auth::AuthHook) reads them under lower-case
-/// names, as strings, credentials withheld. A value that is not visible ASCII
-/// is dropped, and a repeated header keeps its last value. `None` when nothing
+/// names, as strings, credentials withheld: `Authorization`, `Cookie`,
+/// `Proxy-Authorization`, `X-Api-Key`, and any header whose name contains
+/// `token`, `secret` or `api-key`. A value that is not visible ASCII is
+/// dropped, and a repeated header keeps its last value. `None` when nothing
 /// is left.
 ///
 /// Public so a host serving another route over the same catalog hands its
@@ -1416,7 +1445,7 @@ const WITHHELD_HEADERS: [header::HeaderName; 3] = [
 pub fn forwarded_headers(headers: &HeaderMap) -> Option<HashMap<String, Value>> {
     let forwarded: HashMap<String, Value> = headers
         .iter()
-        .filter(|(name, _)| !WITHHELD_HEADERS.contains(name))
+        .filter(|(name, _)| !is_withheld(name))
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -2721,6 +2750,36 @@ mod tests {
         let mut only_credentials = HeaderMap::new();
         only_credentials.insert(header::COOKIE, "a=b".parse().expect("value")); // Safe: test fixture
         assert_eq!(forwarded_headers(&only_credentials), None);
+    }
+
+    /// An API key, and any header named for a token, a secret or an API key,
+    /// is withheld whatever case the client wrote it in; a mirrored
+    /// `Mcp-Param-*` header is not, since its value is a body argument.
+    #[test]
+    fn forwarded_headers_withholds_credential_named_headers() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "X-Api-Key",
+            "X-Goog-API-Key",
+            "X-Auth-Token",
+            "x-csrf-token",
+            "X-Client-Secret",
+            "Webhook-SECRET",
+        ] {
+            let name = header::HeaderName::from_bytes(name.as_bytes()).expect("name"); // Safe: test fixture
+            headers.insert(name, "credential".parse().expect("value")); // Safe: test fixture
+        }
+        headers.insert("X-Request-Id", "req-1".parse().expect("value")); // Safe: test fixture
+        headers.insert("Mcp-Param-Token", "page-2".parse().expect("value")); // Safe: test fixture
+
+        let forwarded = forwarded_headers(&headers).expect("two headers remain"); // Safe: test fixture
+        let mut names: Vec<&str> = forwarded.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["mcp-param-token", "x-request-id"]);
+        assert!(
+            !forwarded.values().any(|value| value == "credential"),
+            "{forwarded:?}"
+        );
     }
 
     /// A hook that refuses every request with the one [`AuthError`] it holds.

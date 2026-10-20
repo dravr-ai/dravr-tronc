@@ -61,7 +61,7 @@ pub fn mirrored_name_field(method: &str) -> Option<&'static str> {
 
 /// Whether `name` is an `Mcp-Param-*` header (header names are matched
 /// case-insensitively; `HeaderName` is already lower-case).
-fn is_param_header(name: &str) -> bool {
+pub(crate) fn is_param_header(name: &str) -> bool {
     name.get(..MCP_PARAM_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MCP_PARAM_PREFIX))
 }
