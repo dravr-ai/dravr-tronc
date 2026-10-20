@@ -18,7 +18,7 @@
 //! masked by shape: whatever follows `Bearer `, and any JWT.
 //!
 //! [`register_env`] seeds the registry from every environment variable whose
-//! name ends like a credential (see [`SECRET_NAME_SUFFIXES`]); the
+//! name carries a credential word (see [`is_secret_name`]); the
 //! `tracing_init` entry points call it, so a service that keeps its secrets in
 //! the environment needs nothing more. A secret read from elsewhere (Secret
 //! Manager, a file, a database row) is added with [`register`].
@@ -49,7 +49,8 @@ pub const MASK: &str = "[REDACTED]";
 /// the text without protecting anything.
 pub const MIN_SECRET_LEN: usize = 8;
 
-/// Environment variable name endings [`register_env`] treats as credentials.
+/// The credential words [`is_secret_name`] looks for, each as a whole
+/// `_`-delimited segment of an environment variable name.
 pub const SECRET_NAME_SUFFIXES: &[&str] = &[
     "_TOKEN",
     "_SECRET",
@@ -59,6 +60,15 @@ pub const SECRET_NAME_SUFFIXES: &[&str] = &[
     "_PAT",
     "_CREDENTIALS",
     "_DSN",
+];
+
+/// Segments that, after a credential word, make the variable describe the
+/// credential rather than hold it: `TOKEN_TTL`, `RSA_KEY_SIZE`,
+/// `PASSWORD_STEP_TIMEOUT`, `ACCESS_KEY_ID`.
+pub const NON_SECRET_QUALIFIERS: &[&str] = &[
+    "COUNT", "DAYS", "DIR", "ENABLED", "EXPIRY", "FILE", "HEADER", "HOURS", "ID", "LEN", "LENGTH",
+    "LIFETIME", "LIMIT", "MAX", "MIN", "MINUTES", "MS", "NAME", "PATH", "PREFIX", "SECS",
+    "SECONDS", "SIZE", "STEP", "TIMEOUT", "TTL", "URL",
 ];
 
 /// The registered values, longest first, so a secret that contains another
@@ -80,8 +90,8 @@ pub fn register(value: &str) {
     secrets.sort_by_key(|known| Reverse(known.len()));
 }
 
-/// Register the value of every environment variable whose name ends with one
-/// of [`SECRET_NAME_SUFFIXES`], and return how many names matched.
+/// Register the value of every environment variable [`is_secret_name`]
+/// accepts, and return how many names matched.
 pub fn register_env() -> usize {
     let mut matched = 0;
     for (name, value) in env::vars_os() {
@@ -97,12 +107,28 @@ pub fn register_env() -> usize {
 }
 
 /// Whether an environment variable named `name` holds a credential.
+///
+/// One of its `_`-delimited segments is a credential word ([`SECRET_NAME_SUFFIXES`])
+/// and no later segment is a [`NON_SECRET_QUALIFIERS`] word. A trailing tag
+/// still counts, so the numbered members of a pool (`API_KEY_2`) and a tagged
+/// copy (`ACCESS_TOKEN_CI`) are credentials too.
 #[must_use]
 pub fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    SECRET_NAME_SUFFIXES
-        .iter()
-        .any(|suffix| upper.ends_with(suffix))
+    let segments: Vec<&str> = upper.split('_').collect();
+    // `API_KEY` is one word of the list but two segments; try every start.
+    SECRET_NAME_SUFFIXES.iter().any(|suffix| {
+        let word: Vec<&str> = suffix.trim_start_matches('_').split('_').collect();
+        segments
+            .windows(word.len())
+            .enumerate()
+            .any(|(at, window)| {
+                window == word.as_slice()
+                    && !segments[at + word.len()..]
+                        .iter()
+                        .any(|later| NON_SECRET_QUALIFIERS.contains(later))
+            })
+    })
 }
 
 /// `text` with every registered secret, every `Bearer` credential and every
@@ -129,12 +155,16 @@ const BEARER: &str = "Bearer ";
 /// Every JWT starts with the base64url of `{"`.
 const JWT_HEAD: &str = "eyJ";
 
+/// What precedes a URL's authority, whose userinfo may carry a password.
+const SCHEME_END: &str = "://";
+
 /// Mask the credentials no registry can hold because they are minted per
-/// user or per session: what follows `Bearer `, and a JWT (`eyJ…` then two
-/// more dot-separated base64url segments). A looser shape, such as any
+/// user or per session, or sit inside a larger configured value: what follows
+/// `Bearer `, a JWT (`eyJ…` then two more dot-separated base64url segments),
+/// and the password of a URL's userinfo (`postgres://user:password@host`). A looser shape, such as any
 /// `a.b.c`, would also mask hostnames, module paths and version numbers.
 fn mask_token_shapes(text: &str) -> Cow<'_, str> {
-    if !text.contains(BEARER) && !text.contains(JWT_HEAD) {
+    if !text.contains(BEARER) && !text.contains(JWT_HEAD) && !text.contains(SCHEME_END) {
         return Cow::Borrowed(text);
     }
     let bytes = text.as_bytes();
@@ -149,6 +179,10 @@ fn mask_token_shapes(text: &str) -> Cow<'_, str> {
             (end > start).then_some((start, end))
         } else if rest.starts_with(JWT_HEAD) && (at == 0 || !is_base64url_byte(bytes[at - 1])) {
             jwt_len(&bytes[at..]).map(|len| (at, at + len))
+        } else if rest.starts_with(SCHEME_END) {
+            let authority = at + SCHEME_END.len();
+            userinfo_password(&bytes[authority..])
+                .map(|(start, end)| (authority + start, authority + end))
         } else {
             None
         };
@@ -183,6 +217,23 @@ fn jwt_len(bytes: &[u8]) -> Option<usize> {
     }
     let signature = span(&bytes[signature_dot + 1..], is_base64url_byte);
     (signature > 0).then_some(signature_dot + 1 + signature)
+}
+
+/// Where the password of the userinfo `authority` starts with lies, if it
+/// has one: `user:password@`, with no `/` or whitespace before the `@`.
+fn userinfo_password(authority: &[u8]) -> Option<(usize, usize)> {
+    let user = span(authority, |byte| {
+        !matches!(byte, b':' | b'@' | b'/') && !byte.is_ascii_whitespace()
+    });
+    if authority.get(user) != Some(&b':') {
+        return None;
+    }
+    let start = user + 1;
+    let end = start
+        + span(&authority[start..], |byte| {
+            !matches!(byte, b'@' | b'/') && !byte.is_ascii_whitespace()
+        });
+    (end > start && authority.get(end) == Some(&b'@')).then_some((start, end))
 }
 
 /// How many leading bytes of `bytes` satisfy `accept`.
@@ -321,16 +372,43 @@ mod tests {
     }
 
     #[test]
+    fn a_url_password_is_masked_and_the_rest_of_the_url_kept() {
+        assert_eq!(
+            redact("connect postgres://pierre:hunter2@db.internal:5432/pierre failed"),
+            "connect postgres://pierre:[REDACTED]@db.internal:5432/pierre failed"
+        );
+        for plain in [
+            "https://api.strava.com:443/v3/athlete",
+            "http://127.0.0.1:8081/health",
+            "see https://example.com/a:b",
+        ] {
+            assert_eq!(redact(plain), plain);
+        }
+    }
+
+    #[test]
     fn credential_names_are_recognised_and_others_are_not() {
         for name in [
             "SLACK_BOT_TOKEN",
             "resend_api_key",
             "DB_PASSWORD",
             "SENTRY_DSN",
+            "ANTHROPIC_API_KEY_2",
+            "GITHUB_PERSONAL_ACCESS_TOKEN_CI",
+            "API_KEY",
         ] {
             assert!(is_secret_name(name), "{name}");
         }
-        for name in ["RUST_LOG", "HTTP_PORT", "OTEL_SERVICE_NAME", "TOKEN_TTL"] {
+        for name in [
+            "RUST_LOG",
+            "HTTP_PORT",
+            "OTEL_SERVICE_NAME",
+            "TOKEN_TTL",
+            "RSA_KEY_SIZE",
+            "SCIOTTE_PASSWORD_STEP_TIMEOUT",
+            "AWS_ACCESS_KEY_ID",
+            "MONKEY_BUSINESS",
+        ] {
             assert!(!is_secret_name(name), "{name}");
         }
     }
