@@ -1,5 +1,13 @@
 # Changelog
 
+## [6.2.0] — 2026-10-20
+
+### Added
+
+- feat(secrets): URL passwords, and tagged or numbered credential names
+- feat(secrets): mask Bearer credentials and JWTs by shape
+
+
 ## [6.1.0] — 2026-10-20
 
 ### Added
