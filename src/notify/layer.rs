@@ -27,6 +27,7 @@ use super::state::{
 use super::visit::NotifyVisitor;
 use crate::notifications::{PostHogClient, SlackClient};
 use crate::notify_target::NOTIFY_TARGET;
+use crate::secrets;
 
 /// Default cadence at which the batch flusher wakes to drain ripe buffers.
 /// Individual rules can still configure longer intervals; this just bounds
@@ -428,6 +429,10 @@ where
         if let Some(enricher) = &self.inner.enricher {
             enricher.enrich(&event_name, &mut merged);
         }
+        // After enrichment, so a host-derived field is masked too.
+        for value in merged.values_mut() {
+            secrets::redact_in_place(value);
+        }
 
         self.capture_analytics(&event_name, &merged);
         self.dispatch(&event_name, &merged);
@@ -774,6 +779,55 @@ mod tests {
         )
         .with_analytics(provider, posthog)
         .build()
+    }
+
+    /// Test `AnalyticsProvider` that keeps the fields it was handed.
+    struct RecordingAnalytics {
+        seen: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    }
+
+    impl AnalyticsProvider for RecordingAnalytics {
+        fn capture_for(
+            &self,
+            _event: &str,
+            fields: &HashMap<String, String>,
+        ) -> Option<AnalyticsCapture> {
+            self.seen.lock().unwrap().push(fields.clone());
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_secret_never_reaches_the_sinks() {
+        secrets::register("notify-secret-0123456789");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let posthog = Arc::new(PostHogClient::with_host("phc_test", "http://127.0.0.1:1"));
+        let layer = NotifyLayer::builder(
+            dummy_slack(),
+            Arc::new(StaticRoutingProvider::new()),
+            "dev".into(),
+        )
+        .with_analytics(
+            Arc::new(RecordingAnalytics {
+                seen: Arc::clone(&seen),
+            }),
+            posthog,
+        )
+        .build();
+        with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!(
+                target: NOTIFY_TARGET,
+                event = "provider.failed",
+                detail = "refused key notify-secret-0123456789",
+                "call with notify-secret-0123456789 failed"
+            );
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        for value in seen[0].values() {
+            assert!(!value.contains("notify-secret-0123456789"), "{value}");
+        }
+        assert_eq!(seen[0]["detail"], "refused key [REDACTED]");
     }
 
     #[tokio::test]

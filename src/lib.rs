@@ -43,6 +43,7 @@ pub mod notifications;
 #[cfg(feature = "notifications")]
 pub mod notify;
 pub mod notify_target;
+pub mod secrets;
 pub mod server;
 #[cfg(feature = "service-client")]
 pub mod service_client;

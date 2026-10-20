@@ -18,6 +18,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 use super::{EmailClient, NotificationConfig, SlackClient};
+use crate::secrets;
 
 /// A `tracing::Layer` that captures ERROR-level events and dispatches
 /// batched notifications to Slack and/or email.
@@ -122,11 +123,17 @@ where
         let mut visitor = EventVisitor::new();
         event.record(&mut visitor);
 
-        let error_event = ErrorEvent {
+        // Masked here, before the event is queued, so neither the Slack nor
+        // the email digest ever holds a registered secret.
+        let mut error_event = ErrorEvent {
             target: event.metadata().target().to_owned(),
             message: visitor.message,
             fields: visitor.fields,
         };
+        secrets::redact_in_place(&mut error_event.message);
+        for value in error_event.fields.values_mut() {
+            secrets::redact_in_place(value);
+        }
 
         // Non-blocking send — if the channel is full/closed, we just drop the event
         let _ = self.sender.send(error_event);
@@ -434,6 +441,28 @@ mod tests {
         let key = event.dedup_key();
         assert!(key.starts_with("dravr_canot::dispatch::"));
         assert!(key.contains("connection refused"));
+    }
+
+    #[test]
+    fn a_registered_secret_is_masked_before_the_event_is_queued() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        secrets::register("error-secret-0123456789");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let layer = ErrorNotificationLayer { sender };
+        with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::error!(
+                url = "https://api.example.com/?key=error-secret-0123456789",
+                "provider rejected error-secret-0123456789"
+            );
+        });
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.message, "provider rejected [REDACTED]");
+        assert_eq!(
+            event.fields["url"],
+            "https://api.example.com/?key=[REDACTED]"
+        );
     }
 
     #[test]

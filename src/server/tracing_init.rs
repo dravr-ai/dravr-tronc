@@ -43,6 +43,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
+use crate::secrets::{self, RedactingMakeWriter};
 use crate::server::log_ceiling::{LevelCeilings, TargetCeiling};
 
 /// `service.name` of a process that does not set `OTEL_SERVICE_NAME`.
@@ -124,11 +125,15 @@ pub fn init_with_ceilings(transport: &str, ceilings: &'static [TargetCeiling]) -
 
 /// Where the log lines of `transport` go: stderr for stdio, whose stdout
 /// carries the protocol, stdout for everything else.
+///
+/// Every line is passed through [`secrets::redact`], and the credentials in
+/// the environment are registered first (see [`secrets::register_env`]).
 fn log_writer(transport: &str) -> BoxMakeWriter {
+    secrets::register_env();
     if transport == "stdio" {
-        BoxMakeWriter::new(io::stderr)
+        BoxMakeWriter::new(RedactingMakeWriter::new(io::stderr))
     } else {
-        BoxMakeWriter::new(io::stdout)
+        BoxMakeWriter::new(RedactingMakeWriter::new(io::stdout))
     }
 }
 
