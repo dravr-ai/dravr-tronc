@@ -9,7 +9,7 @@ Building an MCP server in Rust means writing the same boilerplate every time: JS
 - **Generic over state** — `McpServer<S>` works with any `Send + Sync` state type
 - **Two transports** — stdio (for editor/CLI integration) and HTTP with SSE (for web clients)
 - **Zero configuration** — sensible defaults, env-var driven auth, plug and play
-- **Production ready** — constant-time auth, structured tracing, health checks, 76 tests
+- **Production ready** — constant-time auth, structured tracing, health checks, 600+ tests
 - **Minimal dependencies** — axum, tokio, serde, clap, tracing (no framework lock-in)
 
 ## Quick start

@@ -5,7 +5,7 @@
 // Copyright (c) 2026 dravr.ai
 
 #![cfg(feature = "google-iam")]
-// Same allowances tests/integration_test.rs carries: an integration test is not
+// Same allowances tests/it/integration_test.rs carries: an integration test is not
 // covered by the lib's `cfg_attr(test, ...)`, and assertions are what these are.
 #![allow(
     clippy::unwrap_used,

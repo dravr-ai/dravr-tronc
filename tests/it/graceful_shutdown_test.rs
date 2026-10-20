@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 /// Answers after 300ms, long enough to still be running when shutdown fires.
@@ -56,6 +57,37 @@ fn free_port() -> u16 {
         .port()
 }
 
+type Serving = JoinHandle<Result<(), String>>;
+
+/// Serve `server` on a free port until `trigger` fires, and connect to it.
+///
+/// The probed port is free only until another test in this binary binds
+/// port 0 and is handed the same one, so a serve whose bind lost that race
+/// is retried on a new port. A bind fails before anything is awaited on the
+/// listener, so a serve still running once its port answers holds the port.
+async fn serve_and_connect() -> (u16, oneshot::Sender<()>, Serving, TcpStream) {
+    for _ in 0..10 {
+        let port = free_port();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowTool));
+        let server = Arc::new(McpServer::new("drain", "0.1.0", registry, Arc::new(())));
+        let (trigger, fired) = oneshot::channel::<()>();
+        let serving = tokio::spawn(async move {
+            serve_with_shutdown(server, "127.0.0.1", port, async {
+                fired.await.ok();
+            })
+            .await
+            .map_err(|e| e.to_string())
+        });
+        let stream = connect(port).await;
+        sleep(Duration::from_millis(50)).await;
+        if !serving.is_finished() {
+            return (port, trigger, serving, stream);
+        }
+    }
+    panic!("no free port could be bound in ten tries");
+}
+
 async fn connect(port: u16) -> TcpStream {
     for _ in 0..100 {
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
@@ -70,20 +102,7 @@ async fn connect(port: u16) -> TcpStream {
 /// `serve_with_shutdown` return `Ok`; nothing new is accepted afterwards.
 #[tokio::test]
 async fn shutdown_drains_the_request_in_flight() {
-    let port = free_port();
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(SlowTool));
-    let server = Arc::new(McpServer::new("drain", "0.1.0", registry, Arc::new(())));
-    let (trigger, fired) = oneshot::channel::<()>();
-    let serving = tokio::spawn(async move {
-        serve_with_shutdown(server, "127.0.0.1", port, async {
-            fired.await.ok();
-        })
-        .await
-        .map_err(|e| e.to_string())
-    });
-
-    let mut stream = connect(port).await;
+    let (port, trigger, serving, mut stream) = serve_and_connect().await;
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}"#;
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\

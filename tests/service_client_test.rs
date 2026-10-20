@@ -5,7 +5,7 @@
 // Copyright (c) 2026 dravr.ai
 
 #![cfg(feature = "service-client")]
-// Same allowances tests/integration_test.rs carries: an integration test is not
+// Same allowances tests/it/integration_test.rs carries: an integration test is not
 // covered by the lib's `cfg_attr(test, ...)`, and the panicking handler here is
 // the behaviour under test.
 #![allow(

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-// Same allowances tests/integration_test.rs carries: an integration test is not
+// Same allowances tests/it/integration_test.rs carries: an integration test is not
 // covered by the lib's `cfg_attr(test, ...)`, and the panicking handlers here
 // are the behaviour under test.
 #![allow(

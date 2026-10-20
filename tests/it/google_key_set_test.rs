@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
-#![cfg(feature = "google-iam")]
 // Same allowances tests/iam_test.rs carries: an integration test is not
 // covered by the lib's `cfg_attr(test, ...)`, and assertions are what these are.
 #![allow(
