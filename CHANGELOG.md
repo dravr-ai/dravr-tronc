@@ -1,5 +1,20 @@
 # Changelog
 
+## [6.1.0] — 2026-10-20
+
+### Added
+
+- feat(secrets): mask configured secret values in logs and notifications
+
+### Fixed
+
+- fix(security): no token chars in Debug; withhold credential headers
+
+### Other
+
+- chore(build): bump .build to 50dd908
+
+
 ## [6.0.0] — 2026-10-19
 
 ### Added
