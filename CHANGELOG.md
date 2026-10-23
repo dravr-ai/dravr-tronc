@@ -1,5 +1,13 @@
 # Changelog
 
+## [6.2.1] — 2026-10-23
+
+### Other
+
+- chore(cargo): add homepage and documentation links to crate metadata
+- chore(build): bump .build to 520f637, the fleet Rust pin check
+
+
 ## [6.2.0] — 2026-10-20
 
 ### Added
