@@ -130,3 +130,15 @@ jobs:
         run: sudo apt-get install -y ripgrep
       - name: Run architectural validation
         run: .build/validation/validate.sh
+
+  # The one check a branch rule or a reader needs: green only when every job
+  # above succeeded. `!cancelled()` runs it after a failure too, and comparing
+  # each result to "success" rather than testing for "failure" counts a skipped
+  # or cancelled job as red, which `needs` alone would let through.
+  ci-ok:
+    name: CI OK
+    if: ${{ !cancelled() }}
+    needs: [check, clippy, fmt, test, conformance, lockstep, validate]
+    runs-on: ubuntu-latest
+    steps:
+      - run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
