@@ -28,6 +28,7 @@ mod schema_2020_12_test;
 #[cfg(feature = "schema-validation")]
 mod schema_validation_test;
 mod shed_test;
+mod ssrf_guard_test;
 mod task_signal_test;
 mod tasks_extension_test;
 mod testkit_test;

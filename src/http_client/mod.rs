@@ -13,6 +13,11 @@
 //! query — so formatting the error as it comes writes the credential into
 //! every error message and log line built from it.
 //!
+//! **A URL the operator did not choose is fetched through [`guard`]**: a
+//! client per policy (`webhook`, `allowlist`, `archive_fetch`) that checks
+//! every redirect hop, connects only to addresses outside the SSRF deny list
+//! it has just checked, and caps the body.
+//!
 //! With the `otel-http-client` feature, [`TracePropagationMiddleware`] is the
 //! `reqwest-middleware` layer that puts every outbound request of a client in
 //! the caller's trace.
@@ -20,6 +25,7 @@
 use std::error::Error;
 use std::iter;
 
+pub mod guard;
 #[cfg(feature = "otel-http-client")]
 mod trace;
 
