@@ -385,8 +385,7 @@ impl GuardedRequest {
     /// A guard refusal raised on a redirect hop or at connect time, a cap that
     /// ran out, or [`GuardError::Transport`].
     pub async fn send(self) -> Result<GuardedResponse, GuardError> {
-        let started = Instant::now();
-        let deadline = started + self.limits.total_timeout;
+        let deadline = cap_after(Instant::now(), self.limits.total_timeout);
         let response = within(deadline, self.limits.idle_timeout, self.builder.send())
             .await?
             .map_err(GuardError::from_reqwest)?;
@@ -458,13 +457,22 @@ impl GuardedResponse {
     }
 }
 
+/// How far a cap can reach: a duration past it (`Duration::MAX` for "no cap")
+/// is clamped here rather than overflowing `Instant`, which would panic.
+const FURTHEST_CAP: Duration = Duration::from_hours(30 * 365 * 24);
+
+/// The instant `cap` after `start`, clamped to [`FURTHEST_CAP`].
+fn cap_after(start: Instant, cap: Duration) -> Instant {
+    start.checked_add(cap.min(FURTHEST_CAP)).unwrap_or(start)
+}
+
 /// Run `future` until the total deadline or the idle cap, whichever is first.
 async fn within<T>(
     deadline: Instant,
     idle_timeout: Duration,
     future: impl Future<Output = T>,
 ) -> Result<T, GuardError> {
-    let idle_deadline = Instant::now() + idle_timeout;
+    let idle_deadline = cap_after(Instant::now(), idle_timeout);
     let (cap, refusal) = if idle_deadline < deadline {
         (idle_deadline, GuardError::IdleTimeout)
     } else {

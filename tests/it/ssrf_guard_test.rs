@@ -552,3 +552,31 @@ async fn a_redirect_to_the_metadata_address_is_refused() {
         Some(GuardError::DeniedAddress)
     );
 }
+
+#[tokio::test]
+async fn limits_of_duration_max_mean_no_cap_rather_than_a_panic() {
+    let (port, _) = serve().await;
+    let limits = FetchLimits {
+        max_body_bytes: u64::MAX,
+        connect_timeout: Duration::MAX,
+        idle_timeout: Duration::MAX,
+        total_timeout: Duration::MAX,
+    };
+    let client = client(
+        FetchPolicy::webhook(),
+        ScriptedResolver::always(LOOPBACK),
+        Some(limits),
+    );
+
+    let body = client
+        .get(&format!("http://a.test:{port}/ok"))
+        .unwrap()
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    assert!(body.starts_with(b"ok host="));
+}

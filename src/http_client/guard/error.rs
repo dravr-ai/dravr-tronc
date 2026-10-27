@@ -92,7 +92,8 @@ impl GuardError {
         if let Some(refusal) = refusal {
             return refusal;
         }
-        if error.is_timeout() {
+        // A connect timeout is a transport failure, not the total cap.
+        if error.is_timeout() && !error.is_connect() {
             return Self::TotalTimeout;
         }
         Self::Transport(describe_request_error(error))
