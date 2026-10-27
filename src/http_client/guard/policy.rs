@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use url::{Host, Url};
 
+use super::deny::is_denied_ip;
 use super::error::GuardError;
 
 /// The longest redirect chain a policy that follows redirects accepts.
@@ -188,6 +189,21 @@ impl FetchPolicy {
         }
     }
 
+    /// Check `url` against every rule of the policy that needs no DNS:
+    /// scheme, credentials, port, host allowlist, local names and a literal
+    /// address. A fetch applies the same rules, then checks every address the
+    /// host resolves to; use this alone to vet a URL that something other
+    /// than a [`GuardedClient`](super::GuardedClient) will call.
+    ///
+    /// # Errors
+    ///
+    /// The [`GuardError`] naming the first rule the URL breaks.
+    pub fn check_url(&self, url: &str) -> Result<Url, GuardError> {
+        let parsed = Url::parse(url).map_err(|_| GuardError::InvalidUrl)?;
+        self.check(&parsed, is_denied_ip)?;
+        Ok(parsed)
+    }
+
     /// Check a parsed URL against every rule that does not need DNS.
     ///
     /// `refuses` decides whether a literal IP host is denied; it is the same
@@ -270,12 +286,10 @@ fn is_local_name(domain: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::deny::is_denied_ip;
     use super::*;
 
     fn check(policy: &FetchPolicy, url: &str) -> Result<(), GuardError> {
-        let url = Url::parse(url).map_err(|_| GuardError::InvalidUrl)?;
-        policy.check(&url, is_denied_ip)
+        policy.check_url(url).map(drop)
     }
 
     fn strava() -> HostAllowlist {
@@ -388,6 +402,17 @@ mod tests {
         assert_eq!(
             check(&policy, "https://user:pw@llm.example.com/"),
             Err(GuardError::CredentialsInUrl)
+        );
+    }
+
+    #[test]
+    fn a_text_that_is_not_an_absolute_url_is_invalid() {
+        let policy = FetchPolicy::allowlist(HostAllowlist::new(["not-a-url"]));
+        assert_eq!(check(&policy, "not-a-url"), Err(GuardError::InvalidUrl));
+        assert_eq!(check(&policy, ""), Err(GuardError::InvalidUrl));
+        assert_eq!(
+            check(&FetchPolicy::webhook(), "http://"),
+            Err(GuardError::InvalidUrl)
         );
     }
 
