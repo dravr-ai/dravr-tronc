@@ -1,5 +1,22 @@
 # Changelog
 
+## [6.3.0] — 2026-10-27
+
+### Added
+
+- feat(http-client): FetchPolicy::check_url for a URL another client calls
+- feat(http-client): SSRF-guarded fetch with three policies
+
+### Fixed
+
+- fix(http-client): clamp guard caps instead of overflowing Instant
+
+### Other
+
+- build(cargo): declare rust-version, the fleet pin
+- build: name optional-dependency features; add a CI OK gate
+
+
 ## [6.2.1] — 2026-10-23
 
 ### Other
