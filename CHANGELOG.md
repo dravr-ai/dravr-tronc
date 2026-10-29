@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.5.0] — 2026-10-29
+
+### Fixed
+
+- fix(http-client): refuse allowlist entries that can never match
+
+
 ## [6.4.0] — 2026-10-29
 
 ### Added
