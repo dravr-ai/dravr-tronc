@@ -31,6 +31,7 @@ use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
 use dravr_tronc::mcp::transport::http::{mcp_router, serve};
+use dravr_tronc::mcp::transport::TransportError;
 use dravr_tronc::server::request_guard::{
     enforce_deadline, guard_requests, guard_requests_with_threshold, parse_slow_request_threshold,
     RequestId, DEFAULT_SLOW_REQUEST_THRESHOLD, HANDLER_PANIC, MAX_REQUEST_ID_LEN,
@@ -41,7 +42,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time;
+use tokio::{task, time};
 use tower::ServiceExt;
 use tracing::subscriber::{set_default, DefaultGuard};
 use tracing::Level;
@@ -835,32 +836,60 @@ fn the_slow_threshold_is_read_as_milliseconds_with_zero_for_off() {
 // Standalone MCP transport
 // ============================================================================
 
+/// Start the standalone transport, which binds by port, on a free loopback port.
+///
+/// The port is probed and released before `serve` binds it, so any test in this
+/// binary that binds port 0 meanwhile can take it. `serve` then fails to bind and
+/// the readiness probe would reach that test's server instead, which resets the
+/// connection when its test ends. A `serve` task that ended on a bind error
+/// lost the port, and a fresh one is tried.
+async fn serve_standalone_on_a_free_port() -> SocketAddr {
+    for _ in 0..10 {
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let server = Arc::new(McpServer::new(
+            "test",
+            "0.1.0",
+            ToolRegistry::<()>::new(),
+            Arc::new(()),
+        ));
+        let serving = tokio::spawn(async move { serve(server, "127.0.0.1", port).await });
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        for _ in 0..100 {
+            // Let the `serve` task run its bind before judging the port.
+            task::yield_now().await;
+            if serving.is_finished() {
+                break;
+            }
+            if TcpStream::connect(addr).await.is_ok() {
+                task::yield_now().await;
+                if !serving.is_finished() {
+                    return addr;
+                }
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            serving.is_finished(),
+            "the standalone transport never started listening"
+        );
+        match serving.await.unwrap() {
+            Err(TransportError::Bind { .. }) => {}
+            other => panic!("the standalone transport stopped: {other:?}"),
+        }
+    }
+    panic!("another test took every port probed for the standalone transport");
+}
+
 /// `serve` — the standalone MCP transport every satellite can run — layers
 /// the guard itself, so its requests carry an id without the caller wiring it.
 #[tokio::test]
 async fn the_standalone_mcp_transport_is_guarded() {
-    let port = {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        probe.local_addr().unwrap().port()
-    };
-    let server = Arc::new(McpServer::new(
-        "test",
-        "0.1.0",
-        ToolRegistry::<()>::new(),
-        Arc::new(()),
-    ));
-    tokio::spawn(async move { serve(server, "127.0.0.1", port).await });
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
-    let mut ready = false;
-    for _ in 0..100 {
-        if TcpStream::connect(addr).await.is_ok() {
-            ready = true;
-            break;
-        }
-        time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(ready, "the standalone transport never started listening");
+    let addr = serve_standalone_on_a_free_port().await;
 
     let raw = raw_exchange(
         addr,

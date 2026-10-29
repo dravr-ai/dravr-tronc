@@ -79,7 +79,9 @@ async fn serve_and_connect() -> (u16, oneshot::Sender<()>, Serving, TcpStream) {
             .await
             .map_err(|e| e.to_string())
         });
-        let stream = connect(port).await;
+        let Some(stream) = connect(port, &serving).await else {
+            continue;
+        };
         sleep(Duration::from_millis(50)).await;
         if !serving.is_finished() {
             return (port, trigger, serving, stream);
@@ -88,10 +90,15 @@ async fn serve_and_connect() -> (u16, oneshot::Sender<()>, Serving, TcpStream) {
     panic!("no free port could be bound in ten tries");
 }
 
-async fn connect(port: u16) -> TcpStream {
+/// Connect to `port` once it answers, or `None` once `serving` has ended: a
+/// serve that lost its bind leaves the port refusing, not answering late.
+async fn connect(port: u16, serving: &Serving) -> Option<TcpStream> {
     for _ in 0..100 {
+        if serving.is_finished() {
+            return None;
+        }
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-            return stream;
+            return Some(stream);
         }
         sleep(Duration::from_millis(20)).await;
     }

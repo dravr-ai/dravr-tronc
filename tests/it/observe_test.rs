@@ -36,6 +36,13 @@ struct State;
 /// Process-wide rather than per-test: a span's callsite caches whether any
 /// subscriber wants it, and a thread-local one installed after another test
 /// thread ran with none can find that cache already saying no.
+///
+/// Every test that can create the `observed` span calls this first, through
+/// [`observed_server`]. Installing the global default rebuilds every callsite's
+/// interest before the registry becomes visible to other threads, so a test
+/// that registers the callsite inside that gap caches "never" against no
+/// subscriber at all, and nothing rebuilds it afterwards. `Once` blocks every
+/// caller until the install has returned, which closes the gap.
 fn span_registry() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
@@ -106,6 +113,7 @@ impl Observer for Recorder {
 }
 
 fn observed_server(policy: PayloadCapturePolicy) -> (McpServer<State>, Arc<Recorder>) {
+    span_registry();
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(SleepTool));
     let recorder = Arc::new(Recorder::default());
@@ -131,7 +139,6 @@ fn outcomes(recorder: &Recorder) -> Vec<(String, OperationOutcome)> {
 
 #[tokio::test]
 async fn a_tool_call_starts_and_completes_once_inside_the_observer_span() {
-    span_registry();
     let (server, recorder) = observed_server(PayloadCapturePolicy::default());
 
     let response = server.handle_raw(&call(&json!({}))).await.unwrap();
