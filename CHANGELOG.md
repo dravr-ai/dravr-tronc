@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.4.0] — 2026-10-29
+
+### Added
+
+- feat(http-client): path-prefixed HostAllowlist entries
+
+
 ## [6.3.0] — 2026-10-27
 
 ### Added
