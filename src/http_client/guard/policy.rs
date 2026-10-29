@@ -929,7 +929,11 @@ mod tests {
         );
         // `new` keeps a host-only entry's meaning: it admits every path.
         let policy = FetchPolicy::archive_fetch(HostAllowlist::new([prefixed, "s3.amazonaws.com"]));
-        assert_eq!(check(&policy, "https://s3.amazonaws.com/other/a"), Ok(()));
+        assert_eq!(
+            check(&policy, "https://s3.amazonaws.com/other/a"),
+            Ok(()),
+            "bug: new() must keep a bare host admitting every path"
+        );
     }
 
     fn export_bucket_hosts() -> HostAllowlist {
