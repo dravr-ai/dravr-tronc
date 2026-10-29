@@ -37,6 +37,11 @@ pub const MAX_REDIRECTS: usize = 5;
 /// segment anywhere but at the end (`//`). `url` has already resolved dot
 /// segments and the backslashes of a special scheme before this rule reads the
 /// path. A host-only entry admits every path on its host, as it always has.
+///
+/// An entry that could never match — whitespace, a port or userinfo in the
+/// host, a prefix with no host — is skipped by [`new`](Self::new) and refused
+/// by [`try_new`](Self::try_new), which also refuses a prefixed entry whose
+/// host is listed bare as well.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostAllowlist {
     entries: Vec<AllowedEntry>,
@@ -79,7 +84,8 @@ struct PathPrefix {
 impl PathPrefix {
     /// The prefix an entry's text after its host spells, or `None` when it
     /// spells none (`host/`). A segment that is empty, a dot segment, or holds
-    /// `%`, `\`, `?`, `#` or a control character makes the entry invalid.
+    /// `%`, `\`, `?`, `#`, whitespace or a control character makes the entry
+    /// invalid.
     fn parse(text: &str) -> Result<Option<Self>, ()> {
         if text.is_empty() {
             return Ok(None);
@@ -93,9 +99,9 @@ impl PathPrefix {
                 let invalid = segment.is_empty()
                     || segment == "."
                     || segment == ".."
-                    || segment
-                        .chars()
-                        .any(|c| matches!(c, '%' | '\\' | '?' | '#') || c.is_control());
+                    || segment.chars().any(|c| {
+                        matches!(c, '%' | '\\' | '?' | '#') || c.is_control() || c.is_whitespace()
+                    });
                 if invalid {
                     Err(())
                 } else {
@@ -153,32 +159,83 @@ impl PathPrefix {
     }
 }
 
-/// An allowlist entry that cannot be read: its path prefix holds an empty or
-/// dot segment, or a `%`, `\`, `?`, `#` or control character.
+/// An allowlist entry that cannot be read, or that [`HostAllowlist::try_new`]
+/// refuses because it could never admit anything.
 ///
 /// The entry is the operator's configuration, not a user's URL, so the error
 /// names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidAllowlistEntry {
     entry: String,
+    reason: InvalidReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidReason {
+    /// The host holds whitespace, a port, userinfo or another character no
+    /// URL host is compared with.
+    Host,
+    /// A path prefix with nothing before it.
+    MissingHost,
+    /// The path prefix holds an empty or dot segment, or a forbidden character.
+    Prefix,
+    /// The same host is also listed bare, which admits every path on it.
+    Shadowed,
+}
+
+impl InvalidAllowlistEntry {
+    /// The entry as the operator wrote it, trimmed.
+    #[must_use]
+    pub fn entry(&self) -> &str {
+        &self.entry
+    }
 }
 
 impl fmt::Display for InvalidAllowlistEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "allowlist entry `{}` has an invalid path prefix: segments must be non-empty, \
-             not `.` or `..`, and hold no `%`, `\\`, `?`, `#` or control character",
-            self.entry
-        )
+        let entry = &self.entry;
+        match self.reason {
+            InvalidReason::Host => write!(
+                f,
+                "allowlist entry `{entry}` has an invalid host: a host name or IP address only, \
+                 with no whitespace, port, `@`, `%`, `\\`, `?` or `#`"
+            ),
+            InvalidReason::MissingHost => {
+                write!(f, "allowlist entry `{entry}` has a path prefix but no host")
+            }
+            InvalidReason::Prefix => write!(
+                f,
+                "allowlist entry `{entry}` has an invalid path prefix: segments must be non-empty, \
+                 not `.` or `..`, and hold no `%`, `\\`, `?`, `#`, whitespace or control character"
+            ),
+            InvalidReason::Shadowed => write!(
+                f,
+                "allowlist entry `{entry}` is confined to a path prefix, but its host is also \
+                 listed without one, which admits every path on it"
+            ),
+        }
     }
 }
 
 impl Error for InvalidAllowlistEntry {}
 
+/// Whether `host`, a non-IP entry host, holds a character no URL host is
+/// compared with: such an entry could never match.
+fn is_unmatchable_domain(host: &str) -> bool {
+    host.chars().any(|c| {
+        matches!(c, ':' | '@' | '[' | ']' | '%' | '\\' | '?' | '#')
+            || c.is_whitespace()
+            || c.is_control()
+    })
+}
+
 /// One entry read: `None` when it is empty.
 fn parse_entry(entry: &str) -> Result<Option<AllowedEntry>, InvalidAllowlistEntry> {
     let entry = entry.trim();
+    let invalid = |reason| InvalidAllowlistEntry {
+        entry: entry.to_owned(),
+        reason,
+    };
     let (host, path) = entry
         .split_once('/')
         .map_or((entry, None), |(host, path)| (host, Some(path)));
@@ -188,18 +245,20 @@ fn parse_entry(entry: &str) -> Result<Option<AllowedEntry>, InvalidAllowlistEntr
         .unwrap_or(host);
     let host = host.strip_suffix('.').unwrap_or(host);
     if host.is_empty() {
-        return Ok(None);
+        return match path {
+            None => Ok(None),
+            Some(_) => Err(invalid(InvalidReason::MissingHost)),
+        };
     }
+    let host = match host.parse::<IpAddr>() {
+        Ok(ip) => AllowedHost::Ip(ip),
+        Err(_) if is_unmatchable_domain(host) => return Err(invalid(InvalidReason::Host)),
+        Err(_) => AllowedHost::Domain(host.to_ascii_lowercase()),
+    };
     let path = match path {
         None => None,
-        Some(path) => PathPrefix::parse(path).map_err(|()| InvalidAllowlistEntry {
-            entry: entry.to_owned(),
-        })?,
+        Some(path) => PathPrefix::parse(path).map_err(|()| invalid(InvalidReason::Prefix))?,
     };
-    let host = host.parse::<IpAddr>().map_or_else(
-        |_| AllowedHost::Domain(host.to_ascii_lowercase()),
-        AllowedHost::Ip,
-    );
     Ok(Some(AllowedEntry { host, path }))
 }
 
@@ -209,9 +268,11 @@ impl HostAllowlist {
     /// Each entry is a host name or an IP address, optionally followed by a
     /// path prefix (`host/prefix/`); surrounding whitespace, the brackets of
     /// an IPv6 literal (`[::1]`) and a trailing dot on the host are removed,
-    /// and empty entries are skipped. An entry whose path prefix cannot be
-    /// read is skipped too, so it admits nothing: use
-    /// [`try_new`](Self::try_new) to refuse it instead.
+    /// and empty entries are skipped. An entry that cannot be read — a host
+    /// holding whitespace, a port or userinfo, a prefix with no host, or a
+    /// prefix that cannot be read — is skipped too, so it admits nothing: use
+    /// [`try_new`](Self::try_new) to refuse it instead. A host listed both
+    /// bare and under a prefix admits every path, the bare entry winning.
     pub fn new<I, S>(entries: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -229,20 +290,36 @@ impl HostAllowlist {
     ///
     /// # Errors
     ///
-    /// [`InvalidAllowlistEntry`] naming the first entry whose path prefix
-    /// cannot be read.
+    /// [`InvalidAllowlistEntry`] naming the first entry that cannot be read,
+    /// or a prefixed entry whose host is also listed bare: the bare entry
+    /// admits every path on the host, so the prefix would confine nothing.
     pub fn try_new<I, S>(entries: I) -> Result<Self, InvalidAllowlistEntry>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut parsed = Vec::new();
+        let mut parsed: Vec<(String, AllowedEntry)> = Vec::new();
         for entry in entries {
-            if let Some(entry) = parse_entry(entry.as_ref())? {
-                parsed.push(entry);
+            let text = entry.as_ref();
+            if let Some(entry) = parse_entry(text)? {
+                parsed.push((text.trim().to_owned(), entry));
             }
         }
-        Ok(Self { entries: parsed })
+        let shadowed = parsed.iter().find(|(_, prefixed)| {
+            prefixed.path.is_some()
+                && parsed
+                    .iter()
+                    .any(|(_, bare)| bare.path.is_none() && bare.host == prefixed.host)
+        });
+        if let Some((text, _)) = shadowed {
+            return Err(InvalidAllowlistEntry {
+                entry: text.clone(),
+                reason: InvalidReason::Shadowed,
+            });
+        }
+        Ok(Self {
+            entries: parsed.into_iter().map(|(_, entry)| entry).collect(),
+        })
     }
 
     /// An allowlist read from a comma-separated list, the shape an
@@ -257,8 +334,7 @@ impl HostAllowlist {
     ///
     /// # Errors
     ///
-    /// [`InvalidAllowlistEntry`] naming the first entry whose path prefix
-    /// cannot be read.
+    /// As [`try_new`](Self::try_new).
     pub fn try_from_comma_separated(text: &str) -> Result<Self, InvalidAllowlistEntry> {
         Self::try_new(text.split(','))
     }
@@ -768,7 +844,8 @@ mod tests {
             assert_eq!(
                 HostAllowlist::try_new([entry]).map(drop),
                 Err(InvalidAllowlistEntry {
-                    entry: entry.to_owned()
+                    entry: entry.to_owned(),
+                    reason: InvalidReason::Prefix,
                 }),
                 "{entry}"
             );
@@ -784,10 +861,75 @@ mod tests {
         assert_eq!(
             refusal,
             InvalidAllowlistEntry {
-                entry: "bad.test/a/../b".to_owned()
+                entry: "bad.test/a/../b".to_owned(),
+                reason: InvalidReason::Prefix,
             }
         );
         assert!(refusal.to_string().contains("bad.test/a/../b"));
+    }
+
+    #[test]
+    fn an_entry_whose_host_cannot_match_is_refused_by_try_and_admits_nothing_otherwise() {
+        for entry in [
+            "s3.amazonaws.com /strava.portability/",
+            "s3.amazonaws.com/ strava.portability/",
+            "s3.amazonaws.com/strava.portability /",
+            "s3.amazonaws.com:443/strava.portability/",
+            "s3.amazonaws.com:443",
+            "[::1]:8080/x/",
+            "user@s3.amazonaws.com/x/",
+            "s3 .amazonaws.com",
+            "/strava.portability/",
+            "/",
+        ] {
+            let refusal = HostAllowlist::try_new([entry]).map(drop);
+            assert!(refusal.is_err(), "{entry} must be refused, got {refusal:?}");
+            if let Err(refusal) = refusal {
+                assert!(
+                    refusal.to_string().contains(entry),
+                    "{refusal} names {entry}"
+                );
+            }
+            assert!(HostAllowlist::new([entry]).is_empty(), "{entry}");
+        }
+        assert!(
+            HostAllowlist::try_from_comma_separated(
+                "email.strava.com,s3.amazonaws.com /strava.portability/"
+            )
+            .is_err(),
+            "a space beside the slash stops the list rather than leaving a dead entry"
+        );
+        for entry in [
+            "::1",
+            "[::1]",
+            "127.0.0.1",
+            "  s3.amazonaws.com/strava.portability/  ",
+        ] {
+            assert!(HostAllowlist::try_new([entry]).is_ok(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_bare_host_beside_its_prefixed_entry_is_refused_by_try() {
+        let prefixed = "s3.amazonaws.com/strava.portability/";
+        for entries in [
+            [prefixed, "s3.amazonaws.com"],
+            ["S3.AMAZONAWS.COM.", prefixed],
+        ] {
+            let refusal = HostAllowlist::try_new(entries).map(drop);
+            assert!(refusal.is_err(), "{entries:?} must be refused");
+            if let Err(refusal) = refusal {
+                assert!(refusal.to_string().contains(prefixed), "{refusal}");
+            }
+        }
+        assert!(
+            HostAllowlist::try_new([prefixed, "email.strava.com", "s3.amazonaws.com/other/"])
+                .is_ok(),
+            "two prefixes on one host, and other hosts, are not a conflict"
+        );
+        // `new` keeps a host-only entry's meaning: it admits every path.
+        let policy = FetchPolicy::archive_fetch(HostAllowlist::new([prefixed, "s3.amazonaws.com"]));
+        assert_eq!(check(&policy, "https://s3.amazonaws.com/other/a"), Ok(()));
     }
 
     fn export_bucket_hosts() -> HostAllowlist {
