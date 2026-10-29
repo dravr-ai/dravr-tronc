@@ -1,12 +1,15 @@
 // ABOUTME: The three fetch policies (webhook, allowlist, archive_fetch) and the URL rules each enforces
-// ABOUTME: HostAllowlist is the exact, case-insensitive host list an operator or a source configures
+// ABOUTME: HostAllowlist is the exact host list an operator configures, each entry optionally confined to a path prefix
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::error::Error;
+use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use percent_encoding::percent_decode_str;
 use url::{Host, Url};
 
 use super::deny::is_denied_ip;
@@ -21,9 +24,28 @@ pub const MAX_REDIRECTS: usize = 5;
 /// There is no suffix or wildcard matching, so `api.example.com` on the list
 /// does not admit `evil.api.example.com`, and `example.com` does not admit
 /// `example.com.evil.org`.
+///
+/// An entry may also carry a path prefix, `host/prefix`, such as
+/// `s3.amazonaws.com/strava.portability/`: it admits a URL only when the host
+/// matches exactly **and** the URL's path lies under the prefix, compared
+/// segment by segment, so `/strava.portabilityX/` is not under
+/// `/strava.portability/`. A prefix ending in `/` names a directory and admits
+/// only what is inside it. Each segment of the URL's path is percent-decoded
+/// before the comparison, and a path spelled ambiguously is refused rather
+/// than guessed at: a segment that decodes to one containing `/`, `\` or `%`,
+/// to a control character, to `.` or `..`, or that is not UTF-8, and an empty
+/// segment anywhere but at the end (`//`). `url` has already resolved dot
+/// segments and the backslashes of a special scheme before this rule reads the
+/// path. A host-only entry admits every path on its host, as it always has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostAllowlist {
-    entries: Vec<AllowedHost>,
+    entries: Vec<AllowedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AllowedEntry {
+    host: AllowedHost,
+    path: Option<PathPrefix>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +54,164 @@ enum AllowedHost {
     Ip(IpAddr),
 }
 
+impl AllowedHost {
+    fn matches(&self, host: &Host<&str>) -> bool {
+        match (self, host) {
+            (Self::Domain(name), Host::Domain(domain)) => {
+                let domain = domain.strip_suffix('.').unwrap_or(domain);
+                name.eq_ignore_ascii_case(domain)
+            }
+            (Self::Ip(ip), Host::Ipv4(v4)) => *ip == IpAddr::V4(*v4),
+            (Self::Ip(ip), Host::Ipv6(v6)) => *ip == IpAddr::V6(*v6),
+            _ => false,
+        }
+    }
+}
+
+/// The path an entry confines its host to: whole segments, compared exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathPrefix {
+    segments: Vec<String>,
+    /// The prefix ended in `/`: the URL's path must go past it.
+    directory: bool,
+}
+
+impl PathPrefix {
+    /// The prefix an entry's text after its host spells, or `None` when it
+    /// spells none (`host/`). A segment that is empty, a dot segment, or holds
+    /// `%`, `\`, `?`, `#` or a control character makes the entry invalid.
+    fn parse(text: &str) -> Result<Option<Self>, ()> {
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let (text, directory) = text
+            .strip_suffix('/')
+            .map_or((text, false), |rest| (rest, true));
+        let segments = text
+            .split('/')
+            .map(|segment| {
+                let invalid = segment.is_empty()
+                    || segment == "."
+                    || segment == ".."
+                    || segment
+                        .chars()
+                        .any(|c| matches!(c, '%' | '\\' | '?' | '#') || c.is_control());
+                if invalid {
+                    Err(())
+                } else {
+                    Ok(segment.to_owned())
+                }
+            })
+            .collect::<Result<Vec<_>, ()>>()?;
+        Ok(Some(Self {
+            segments,
+            directory,
+        }))
+    }
+
+    /// Whether the URL path `path` (as `Url::path` serialises it) lies under
+    /// the prefix and is spelled unambiguously.
+    fn admits(&self, path: &str) -> bool {
+        let Some(path) = path.strip_prefix('/') else {
+            return false;
+        };
+        let raw: Vec<&str> = path.split('/').collect();
+        let last = raw.len().saturating_sub(1);
+        let mut decoded = Vec::with_capacity(raw.len());
+        for (index, segment) in raw.iter().enumerate() {
+            if segment.is_empty() && index != last {
+                return false;
+            }
+            let Ok(text) = percent_decode_str(segment).decode_utf8() else {
+                return false;
+            };
+            if text == "."
+                || text == ".."
+                || text
+                    .chars()
+                    .any(|c| matches!(c, '/' | '\\' | '%') || c.is_control())
+            {
+                return false;
+            }
+            decoded.push(text);
+        }
+        // A trailing empty segment (`/dir/`) names the directory itself.
+        if decoded.last().is_some_and(|segment| segment.is_empty()) {
+            decoded.pop();
+        }
+        let enough = if self.directory {
+            decoded.len() > self.segments.len()
+        } else {
+            decoded.len() >= self.segments.len()
+        };
+        enough
+            && self
+                .segments
+                .iter()
+                .zip(&decoded)
+                .all(|(expected, actual)| expected == actual)
+    }
+}
+
+/// An allowlist entry that cannot be read: its path prefix holds an empty or
+/// dot segment, or a `%`, `\`, `?`, `#` or control character.
+///
+/// The entry is the operator's configuration, not a user's URL, so the error
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidAllowlistEntry {
+    entry: String,
+}
+
+impl fmt::Display for InvalidAllowlistEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "allowlist entry `{}` has an invalid path prefix: segments must be non-empty, \
+             not `.` or `..`, and hold no `%`, `\\`, `?`, `#` or control character",
+            self.entry
+        )
+    }
+}
+
+impl Error for InvalidAllowlistEntry {}
+
+/// One entry read: `None` when it is empty.
+fn parse_entry(entry: &str) -> Result<Option<AllowedEntry>, InvalidAllowlistEntry> {
+    let entry = entry.trim();
+    let (host, path) = entry
+        .split_once('/')
+        .map_or((entry, None), |(host, path)| (host, Some(path)));
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let path = match path {
+        None => None,
+        Some(path) => PathPrefix::parse(path).map_err(|()| InvalidAllowlistEntry {
+            entry: entry.to_owned(),
+        })?,
+    };
+    let host = host.parse::<IpAddr>().map_or_else(
+        |_| AllowedHost::Domain(host.to_ascii_lowercase()),
+        AllowedHost::Ip,
+    );
+    Ok(Some(AllowedEntry { host, path }))
+}
+
 impl HostAllowlist {
     /// An allowlist of the given entries.
     ///
-    /// Each entry is a host name or an IP address; surrounding whitespace, the
-    /// brackets of an IPv6 literal (`[::1]`) and a trailing dot are removed,
-    /// and empty entries are skipped.
+    /// Each entry is a host name or an IP address, optionally followed by a
+    /// path prefix (`host/prefix/`); surrounding whitespace, the brackets of
+    /// an IPv6 literal (`[::1]`) and a trailing dot on the host are removed,
+    /// and empty entries are skipped. An entry whose path prefix cannot be
+    /// read is skipped too, so it admits nothing: use
+    /// [`try_new`](Self::try_new) to refuse it instead.
     pub fn new<I, S>(entries: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -45,23 +219,30 @@ impl HostAllowlist {
     {
         let entries = entries
             .into_iter()
-            .filter_map(|entry| {
-                let entry = entry.as_ref().trim();
-                let entry = entry
-                    .strip_prefix('[')
-                    .and_then(|rest| rest.strip_suffix(']'))
-                    .unwrap_or(entry);
-                let entry = entry.strip_suffix('.').unwrap_or(entry);
-                if entry.is_empty() {
-                    return None;
-                }
-                Some(entry.parse::<IpAddr>().map_or_else(
-                    |_| AllowedHost::Domain(entry.to_ascii_lowercase()),
-                    AllowedHost::Ip,
-                ))
-            })
+            .filter_map(|entry| parse_entry(entry.as_ref()).ok().flatten())
             .collect();
         Self { entries }
+    }
+
+    /// An allowlist of the given entries, read as [`new`](Self::new) reads
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidAllowlistEntry`] naming the first entry whose path prefix
+    /// cannot be read.
+    pub fn try_new<I, S>(entries: I) -> Result<Self, InvalidAllowlistEntry>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut parsed = Vec::new();
+        for entry in entries {
+            if let Some(entry) = parse_entry(entry.as_ref())? {
+                parsed.push(entry);
+            }
+        }
+        Ok(Self { entries: parsed })
     }
 
     /// An allowlist read from a comma-separated list, the shape an
@@ -71,22 +252,41 @@ impl HostAllowlist {
         Self::new(text.split(','))
     }
 
+    /// An allowlist read from a comma-separated list, as
+    /// [`try_new`](Self::try_new) reads its entries.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidAllowlistEntry`] naming the first entry whose path prefix
+    /// cannot be read.
+    pub fn try_from_comma_separated(text: &str) -> Result<Self, InvalidAllowlistEntry> {
+        Self::try_new(text.split(','))
+    }
+
     /// Whether the allowlist has no entries, and so admits no host.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Whether `host` is on the allowlist.
-    fn admits(&self, host: &Host<&str>) -> bool {
-        self.entries.iter().any(|entry| match (entry, host) {
-            (AllowedHost::Domain(name), Host::Domain(domain)) => {
-                let domain = domain.strip_suffix('.').unwrap_or(domain);
-                name.eq_ignore_ascii_case(domain)
+    /// Whether `url`, whose host is `host`, is on the allowlist.
+    ///
+    /// [`GuardError::PathNotAllowed`] when its host is listed only under path
+    /// prefixes it lies outside, [`GuardError::HostNotAllowed`] when its host
+    /// is not listed at all.
+    fn admits(&self, host: &Host<&str>, url: &Url) -> Result<(), GuardError> {
+        let mut listed_under_a_prefix = false;
+        for entry in self.entries.iter().filter(|entry| entry.host.matches(host)) {
+            match &entry.path {
+                None => return Ok(()),
+                Some(prefix) if prefix.admits(url.path()) => return Ok(()),
+                Some(_) => listed_under_a_prefix = true,
             }
-            (AllowedHost::Ip(ip), Host::Ipv4(v4)) => *ip == IpAddr::V4(*v4),
-            (AllowedHost::Ip(ip), Host::Ipv6(v6)) => *ip == IpAddr::V6(*v6),
-            _ => false,
+        }
+        Err(if listed_under_a_prefix {
+            GuardError::PathNotAllowed
+        } else {
+            GuardError::HostNotAllowed
         })
     }
 }
@@ -234,9 +434,7 @@ impl FetchPolicy {
         match &self.kind {
             PolicyKind::Webhook => {}
             PolicyKind::Allowlist(hosts) | PolicyKind::ArchiveFetch(hosts) => {
-                if !hosts.admits(&host) {
-                    return Err(GuardError::HostNotAllowed);
-                }
+                hosts.admits(&host, url)?;
             }
         }
         if !self.applies_deny_list() {
@@ -425,6 +623,175 @@ mod tests {
             check(&policy, "http://localhost:11434/"),
             Err(GuardError::HostNotAllowed)
         );
+    }
+
+    fn export_bucket() -> FetchPolicy {
+        FetchPolicy::archive_fetch(HostAllowlist::new([
+            "email.strava.com",
+            "s3.amazonaws.com/strava.portability/",
+        ]))
+    }
+
+    #[test]
+    fn a_prefixed_entry_admits_the_path_style_export_url() {
+        let policy = export_bucket();
+        assert_eq!(
+            check(
+                &policy,
+                "https://s3.amazonaws.com/strava.portability/athlete/1/export/live/export_1.zip?X-Amz-Expires=604800&X-Amz-Signature=abc"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                &policy,
+                "https://S3.AmazonAWS.com./strava.portability/a.zip"
+            ),
+            Ok(()),
+            "the host still compares case-insensitively"
+        );
+        assert_eq!(
+            check(
+                &policy,
+                "https://s3.amazonaws.com/strava%2Eportability/a.zip"
+            ),
+            Ok(()),
+            "an encoded segment that decodes to the prefix is the prefix"
+        );
+        assert_eq!(
+            check(&policy, "https://email.strava.com/ls/click?upn=anything"),
+            Ok(()),
+            "a host-only entry beside it admits every path"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_entry_refuses_another_bucket_on_the_same_host() {
+        let policy = export_bucket();
+        for url in [
+            "https://s3.amazonaws.com/other-bucket/a.zip",
+            "https://s3.amazonaws.com/strava.portabilityX/a.zip",
+            "https://s3.amazonaws.com/strava.portability.evil/a.zip",
+            "https://s3.amazonaws.com/STRAVA.PORTABILITY/a.zip",
+            "https://s3.amazonaws.com/strava.portability",
+            "https://s3.amazonaws.com/strava.portability/",
+            "https://s3.amazonaws.com/",
+        ] {
+            assert_eq!(
+                check(&policy, url),
+                Err(GuardError::PathNotAllowed),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            check(&policy, "https://strava.portability.s3.amazonaws.com/a.zip"),
+            Err(GuardError::HostNotAllowed),
+            "a virtual-hosted spelling is another host"
+        );
+    }
+
+    #[test]
+    fn no_spelling_of_the_path_escapes_the_prefix() {
+        let policy = export_bucket();
+        for url in [
+            // Dot segments, plain and encoded: `url` resolves them first.
+            "https://s3.amazonaws.com/strava.portability/../other/a.zip",
+            "https://s3.amazonaws.com/strava.portability/%2e%2e/other/a.zip",
+            "https://s3.amazonaws.com/strava.portability/.%2E/other/a.zip",
+            "https://s3.amazonaws.com/strava.portability\\..\\other/a.zip",
+            // Separators hidden in an encoding are refused, not guessed at.
+            "https://s3.amazonaws.com/strava.portability%2F..%2Fother/a.zip",
+            "https://s3.amazonaws.com/strava.portability/..%2Fother/a.zip",
+            "https://s3.amazonaws.com/strava.portability/a%5C..%5Cb.zip",
+            "https://s3.amazonaws.com/strava.portability/a%252F..%252Fb.zip",
+            "https://s3.amazonaws.com/strava.portability/a%00.zip",
+            "https://s3.amazonaws.com/strava.portability/%ff.zip",
+            // An empty segment, before or inside the prefix.
+            "https://s3.amazonaws.com//strava.portability/a.zip",
+            "https://s3.amazonaws.com/strava.portability//a.zip",
+        ] {
+            assert_eq!(
+                check(&policy, url),
+                Err(GuardError::PathNotAllowed),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_without_a_trailing_slash_admits_the_path_itself() {
+        let policy = FetchPolicy::archive_fetch(HostAllowlist::new(["export.test/a/b"]));
+        assert_eq!(check(&policy, "https://export.test/a/b"), Ok(()));
+        assert_eq!(check(&policy, "https://export.test/a/b/c.zip"), Ok(()));
+        assert_eq!(
+            check(&policy, "https://export.test/a/bc"),
+            Err(GuardError::PathNotAllowed),
+            "the prefix ends on a segment boundary"
+        );
+        assert_eq!(
+            check(&policy, "https://export.test/a"),
+            Err(GuardError::PathNotAllowed)
+        );
+    }
+
+    #[test]
+    fn host_only_entries_behave_as_before() {
+        let hosts = HostAllowlist::new(["export.strava.com", "export.strava.com/"]);
+        assert_eq!(
+            hosts,
+            HostAllowlist::new(["export.strava.com", "export.strava.com"])
+        );
+        let policy = FetchPolicy::archive_fetch(hosts);
+        assert_eq!(check(&policy, "https://export.strava.com/"), Ok(()));
+        assert_eq!(
+            check(&policy, "https://export.strava.com/any/where/%2F..%2F"),
+            Ok(()),
+            "a host-only entry reads no path"
+        );
+        assert_eq!(
+            check(&policy, "https://other.strava.com/a.zip"),
+            Err(GuardError::HostNotAllowed)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_prefix_is_refused_by_try_and_admits_nothing_otherwise() {
+        for entry in [
+            "s3.amazonaws.com/a//b/",
+            "s3.amazonaws.com/../b/",
+            "s3.amazonaws.com/./b",
+            "s3.amazonaws.com/a%2Fb/",
+            "s3.amazonaws.com/a\\b/",
+            "s3.amazonaws.com/a?b",
+            "s3.amazonaws.com//",
+        ] {
+            assert_eq!(
+                HostAllowlist::try_new([entry]).map(drop),
+                Err(InvalidAllowlistEntry {
+                    entry: entry.to_owned()
+                }),
+                "{entry}"
+            );
+            assert!(HostAllowlist::new([entry]).is_empty(), "{entry}");
+        }
+        let parsed = HostAllowlist::try_from_comma_separated(
+            " email.strava.com , s3.amazonaws.com/strava.portability/ ,",
+        )
+        .expect("both entries read"); // Safe: test assertion
+        assert_eq!(parsed, export_bucket_hosts());
+        let refusal = HostAllowlist::try_from_comma_separated("ok.test, bad.test/a/../b")
+            .expect_err("the dot segment is refused"); // Safe: test assertion
+        assert_eq!(
+            refusal,
+            InvalidAllowlistEntry {
+                entry: "bad.test/a/../b".to_owned()
+            }
+        );
+        assert!(refusal.to_string().contains("bad.test/a/../b"));
+    }
+
+    fn export_bucket_hosts() -> HostAllowlist {
+        HostAllowlist::new(["email.strava.com", "s3.amazonaws.com/strava.portability/"])
     }
 
     #[test]

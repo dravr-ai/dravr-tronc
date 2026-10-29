@@ -1,5 +1,5 @@
 // ABOUTME: The SSRF-guarded fetch against a real local server, names answered by a scripted resolver
-// ABOUTME: Pins IP pinning against rebinding, per-hop redirect checks, the hop cap and the byte/idle/total caps
+// ABOUTME: Pins IP pinning against rebinding, per-hop host and path-prefix checks, the hop cap and the byte/idle/total caps
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -96,6 +96,11 @@ async fn serve() -> (u16, Arc<AtomicUsize>) {
         .route("/hop/{n}", get(hop))
         .route("/off-list", get(off_list))
         .route("/to-metadata", get(to_metadata))
+        .route("/bucket/ok", get(ok))
+        .route("/bucket/to-other", get(to_other_bucket))
+        .route("/bucket/to-escape", get(to_escape))
+        .route("/bucket/to-encoded-escape", get(to_encoded_escape))
+        .route("/other/ok", get(ok))
         .route("/stall-head", get(stall_head))
         .route("/stall-body", get(stall_body))
         .route("/trickle", get(trickle))
@@ -128,6 +133,26 @@ async fn hop(State(state): State<ServerState>, Path(n): Path<u32>) -> Response {
 
 async fn off_list(State(state): State<ServerState>) -> Response {
     redirect_to(&format!("http://evil.test:{}/ok", state.port))
+}
+
+async fn to_other_bucket(State(state): State<ServerState>) -> Response {
+    redirect_to(&format!("http://a.test:{}/other/ok", state.port))
+}
+
+/// A hop that climbs out of the bucket with encoded dot segments.
+async fn to_escape(State(state): State<ServerState>) -> Response {
+    redirect_to(&format!(
+        "http://a.test:{}/bucket/%2e%2e/other/ok",
+        state.port
+    ))
+}
+
+/// A hop that hides the separators of a climb in percent-encoding.
+async fn to_encoded_escape(State(state): State<ServerState>) -> Response {
+    redirect_to(&format!(
+        "http://a.test:{}/bucket/..%2Fother%2Fok",
+        state.port
+    ))
 }
 
 async fn to_metadata() -> Response {
@@ -339,6 +364,57 @@ async fn a_redirect_off_the_allowlist_is_refused() {
         !resolver.lookups().contains(&"evil.test".to_owned()),
         "never resolved"
     );
+}
+
+#[tokio::test]
+async fn a_path_prefixed_entry_fetches_inside_its_prefix() {
+    let (port, requests) = serve().await;
+    let client = client(
+        listed(&["a.test/bucket/"]),
+        ScriptedResolver::always(LOOPBACK),
+        None,
+    );
+
+    let response = client
+        .get(&format!("http://a.test:{port}/bucket/ok"))
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client.get(&format!("http://a.test:{port}/other/ok")).err(),
+        Some(GuardError::PathNotAllowed),
+        "a URL outside the prefix is refused before any request"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_out_of_the_prefix_is_refused_before_it_is_sent() {
+    for route in ["to-other", "to-escape", "to-encoded-escape"] {
+        let (port, requests) = serve().await;
+        let client = client(
+            listed(&["a.test/bucket/"]),
+            ScriptedResolver::always(LOOPBACK),
+            None,
+        );
+
+        let refusal = client
+            .get(&format!("http://a.test:{port}/bucket/{route}"))
+            .unwrap()
+            .send()
+            .await
+            .err();
+
+        assert_eq!(refusal, Some(GuardError::PathNotAllowed), "{route}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "{route}: the hop into another bucket was never sent"
+        );
+    }
 }
 
 #[tokio::test]

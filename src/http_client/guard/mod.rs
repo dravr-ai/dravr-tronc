@@ -59,7 +59,7 @@ use url::Host;
 
 pub use deny::is_denied_ip;
 pub use error::GuardError;
-pub use policy::{FetchLimits, FetchPolicy, HostAllowlist, MAX_REDIRECTS};
+pub use policy::{FetchLimits, FetchPolicy, HostAllowlist, InvalidAllowlistEntry, MAX_REDIRECTS};
 
 /// The SHA-256 of a URL, in lowercase hex: what a log line or a span carries
 /// in place of a URL that may hold a signed token.

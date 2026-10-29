@@ -31,6 +31,9 @@ pub enum GuardError {
     MissingHost,
     /// The host is not on the policy's allowlist.
     HostNotAllowed,
+    /// The host is on the allowlist only under a path prefix, and the URL's
+    /// path is outside it or spelled ambiguously.
+    PathNotAllowed,
     /// The host is a local-only name (`localhost`, `*.local`, `*.internal`).
     LocalName,
     /// The host is, or resolves to, an address in a denied range.
@@ -61,6 +64,7 @@ impl fmt::Display for GuardError {
             Self::PortNotAllowed => f.write_str("the URL port is not allowed"),
             Self::MissingHost => f.write_str("the URL has no host"),
             Self::HostNotAllowed => f.write_str("the URL host is not on the allowlist"),
+            Self::PathNotAllowed => f.write_str("the URL path is outside the allowlisted prefix"),
             Self::LocalName => f.write_str("the URL host is a local-only name"),
             Self::DeniedAddress => {
                 f.write_str("the URL host resolves to a forbidden address range")

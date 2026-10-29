@@ -487,6 +487,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "percent-encoding",
  "reqwest",
  "reqwest-middleware",
  "ring",
