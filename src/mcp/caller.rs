@@ -774,7 +774,7 @@ mod tests {
         assert!(!ctx.is_admin);
     }
 
-    // ---- resolve_mcp_auth: the gate commere and barrage resolved by hand ----
+    // ---- resolve_mcp_auth: a service's whole /mcp gate from its environment ----
 
     const KEY_ENV: &str = "TRONC_MCP_AUTH_UNIT_KEY";
     const REALM: &str = "dravr-unit";
@@ -838,7 +838,8 @@ mod tests {
             McpAuthError::InsecureBind(InsecureBindError {
                 host: "0.0.0.0".to_owned(),
                 gate: Some(format!("{KEY_ENV} or the {PREFIX}_CALLER_* variables")),
-            })
+            }),
+            "a reachable bind with neither gate is refused, naming both ways to arm one"
         );
         assert!(
             refused
@@ -855,7 +856,11 @@ mod tests {
 
         let auth = resolve("127.0.0.1", None).unwrap();
 
-        assert_eq!(auth.mode, AuthMode::LoopbackDev);
+        assert_eq!(
+            auth.mode,
+            AuthMode::LoopbackDev,
+            "no gate on loopback is development"
+        );
         assert!(auth.hook.is_none(), "loopback development installs no hook");
         assert!(
             !auth.verifies_callers(),
@@ -874,14 +879,26 @@ mod tests {
         let missing = call(&auth, None).await;
         env::remove_var(KEY_ENV);
 
-        assert_eq!(auth.mode, AuthMode::Enforced);
+        assert_eq!(auth.mode, AuthMode::Enforced, "a set key is enforced");
         assert!(!auth.verifies_callers(), "a key names no caller");
         assert!(auth.metadata.is_none(), "no metadata without caller tokens");
         let ctx = admitted.unwrap();
-        assert_eq!(ctx.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(
+            ctx.auth_method.as_deref(),
+            Some("api_key"),
+            "the key admits through the api-key method"
+        );
         assert_eq!(ctx.user_id, None, "the key carries no identity");
-        assert_eq!(challenge_of(wrong), format!("Bearer realm=\"{REALM}\""));
-        assert_eq!(challenge_of(missing), format!("Bearer realm=\"{REALM}\""));
+        assert_eq!(
+            challenge_of(wrong),
+            format!("Bearer realm=\"{REALM}\""),
+            "a wrong key is answered with the realm challenge"
+        );
+        assert_eq!(
+            challenge_of(missing),
+            format!("Bearer realm=\"{REALM}\""),
+            "no key is answered with the realm challenge"
+        );
     }
 
     #[tokio::test]
@@ -896,11 +913,19 @@ mod tests {
         env::remove_var(KEY_ENV);
 
         let metadata = config.resource_metadata().unwrap();
-        assert_eq!(auth.mode, AuthMode::Enforced);
+        assert_eq!(auth.mode, AuthMode::Enforced, "caller tokens are a gate");
         assert!(auth.verifies_callers(), "caller tokens configured");
-        assert_eq!(auth.metadata.as_ref(), Some(&metadata));
+        assert_eq!(
+            auth.metadata.as_ref(),
+            Some(&metadata),
+            "the metadata published is the configured resource's"
+        );
         let ctx = admitted.unwrap();
-        assert_eq!(ctx.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(
+            ctx.auth_method.as_deref(),
+            Some("api_key"),
+            "the shared key is admitted beside caller tokens"
+        );
         assert_eq!(ctx.user_id, None, "the key stands in for no caller");
         assert_eq!(
             challenge_of(missing),
@@ -909,10 +934,8 @@ mod tests {
         );
     }
 
-    /// commere and barrage, which this lifts, resolved the posture with caller
-    /// tokens counted as a gate, so it was always `Enforced` and their
-    /// anonymous-loopback branch never ran: no credential was refused even on
-    /// loopback. That fail-closed behaviour is what is kept.
+    /// Caller tokens count as a gate, so the posture is `Enforced` on every
+    /// host and a request with no credential is refused even on loopback.
     #[tokio::test]
     #[serial]
     async fn caller_tokens_without_a_key_refuse_no_credential_even_on_loopback() {
@@ -923,7 +946,7 @@ mod tests {
         let missing = call(&auth, None).await;
 
         assert_eq!(auth.mode, AuthMode::Enforced, "caller tokens are a gate");
-        assert!(auth.verifies_callers());
+        assert!(auth.verifies_callers(), "caller tokens configured");
         assert_eq!(
             challenge_of(missing),
             config.resource_metadata().unwrap().www_authenticate(),
@@ -941,7 +964,7 @@ mod tests {
         let missing = call(&auth, None).await;
         let shared = call(&auth, Some("")).await;
 
-        assert_eq!(auth.mode, AuthMode::Enforced);
+        assert_eq!(auth.mode, AuthMode::Enforced, "caller tokens are a gate");
         let expected = config.resource_metadata().unwrap().www_authenticate();
         assert_eq!(
             challenge_of(missing),
@@ -994,7 +1017,8 @@ mod tests {
                     format!("{PREFIX}_CALLER_JWKS_URL"),
                     format!("{PREFIX}_AUTHORIZATION_SERVER"),
                 ]
-            })
+            }),
+            "a partial caller configuration names every variable still missing"
         );
     }
 }

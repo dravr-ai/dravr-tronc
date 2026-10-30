@@ -346,10 +346,22 @@ mod tests {
             Ok(Some(ApiKeyAuthHook::new(ENV, "dravr-svc"))),
             "a key gates a loopback bind too"
         );
-        assert_eq!(reachable.challenge(), "Bearer realm=\"dravr-svc\"");
+        assert_eq!(
+            reachable.challenge(),
+            "Bearer realm=\"dravr-svc\"",
+            "the hook challenges with the realm it was given"
+        );
         let ctx = admitted.expect("the key admits its holder"); // Safe: test assertion
-        assert_eq!(ctx.auth_method.as_deref(), Some(API_KEY_AUTH_METHOD));
-        assert_eq!(ctx.request_id, Some(Value::from(3)));
+        assert_eq!(
+            ctx.auth_method.as_deref(),
+            Some(API_KEY_AUTH_METHOD),
+            "the key admits through the api-key method"
+        );
+        assert_eq!(
+            ctx.request_id,
+            Some(Value::from(3)),
+            "the context carries the request's id"
+        );
         assert_eq!(ctx.user_id, None, "the key names no user");
         assert!(!ctx.is_admin, "the key is never admin");
         for (label, refused) in [("a wrong key", wrong), ("no key", missing)] {

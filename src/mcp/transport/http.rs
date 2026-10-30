@@ -17,7 +17,7 @@ use axum::extract::State;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::uri::Authority;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::middleware::{from_fn, from_fn_with_state, Next};
+use axum::middleware::{self, from_fn, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -340,13 +340,13 @@ async fn resolve_bind(host: &str, port: u16) -> Result<(String, Vec<SocketAddr>)
 /// listed are served, an empty list serving a loopback `Host` only.
 fn guard_app(app: Router, hosts: Option<&[String]>) -> Router {
     let app = match hosts {
-        Some(hosts) => app.layer(from_fn_with_state(
+        Some(hosts) => app.layer(middleware::from_fn_with_state(
             Arc::<[String]>::from(hosts),
             require_listed_host,
         )),
         None => app,
     };
-    app.layer(from_fn(guard_requests))
+    app.layer(middleware::from_fn(guard_requests))
 }
 
 /// The address `listener` actually bound — the port the OS picked for a

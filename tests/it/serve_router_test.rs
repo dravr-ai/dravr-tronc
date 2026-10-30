@@ -126,7 +126,10 @@ async fn serves_the_hosts_router_under_the_request_guard() {
         .expect("the serving task did not panic")
         .expect("it stops cleanly");
 
-    assert!(health.starts_with("HTTP/1.1 200"), "{health:?}");
+    assert!(
+        health.starts_with("HTTP/1.1 200"),
+        "the host's own route is served: {health:?}"
+    );
     assert!(health.ends_with("healthy"), "the route's body: {health:?}");
     assert!(
         health
@@ -159,7 +162,10 @@ async fn a_loopback_bind_refuses_a_foreign_host() {
         rebound.starts_with("HTTP/1.1 403"),
         "a foreign Host is refused on loopback: {rebound:?}"
     );
-    assert!(rebound.contains("Host not allowed"), "{rebound:?}");
+    assert!(
+        rebound.contains("Host not allowed"),
+        "the refusal says the Host is not allowed: {rebound:?}"
+    );
     assert!(
         localhost.starts_with("HTTP/1.1 200"),
         "a loopback name is served: {localhost:?}"
@@ -248,8 +254,16 @@ async fn a_port_in_use_is_a_typed_bind_error() {
 
     match outcome {
         Err(TransportError::Bind { addr, source }) => {
-            assert_eq!(addr, format!("127.0.0.1:{port}"));
-            assert_eq!(source.kind(), io::ErrorKind::AddrInUse);
+            assert_eq!(
+                addr,
+                format!("127.0.0.1:{port}"),
+                "the bind error names the address it tried"
+            );
+            assert_eq!(
+                source.kind(),
+                io::ErrorKind::AddrInUse,
+                "the bind error keeps the OS cause"
+            );
         }
         other => panic!("expected TransportError::Bind, got {other:?}"),
     }
@@ -266,7 +280,10 @@ async fn an_unresolvable_host_is_a_typed_resolve_error() {
 
     match outcome {
         Err(TransportError::Resolve { addr, .. }) => {
-            assert_eq!(addr, "no-such-host.invalid:0");
+            assert_eq!(
+                addr, "no-such-host.invalid:0",
+                "the resolve error names the address it looked up"
+            );
         }
         other => panic!("expected TransportError::Resolve, got {other:?}"),
     }

@@ -2494,7 +2494,10 @@ mod tests {
         assert!(server.has_auth_hook(), "Some installs the hook");
         match server.authenticate(&ping(Some("anything"))).await {
             Err(AuthError::Unauthorized { www_authenticate }) => {
-                assert_eq!(www_authenticate, "Bearer realm=\"unit\"");
+                assert_eq!(
+                    www_authenticate, "Bearer realm=\"unit\"",
+                    "the installed hook answers with its own realm challenge"
+                );
             }
             other => panic!("the installed hook must refuse, got {other:?}"),
         }

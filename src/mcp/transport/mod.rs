@@ -31,9 +31,8 @@ pub const HTTP_TRANSPORT: &str = "http";
 ///   an [`AuthHook`](crate::mcp::auth::AuthHook), a loopback bind serves a
 ///   loopback `Host` only, and `SIGINT`/`SIGTERM` stop it gracefully.
 ///
-/// This is the `match` every MCP binary used to write by hand, including the
-/// arm that refuses a transport it does not know — which here is a typed
-/// error the binary's `main` returns, not an `eprintln!` and `exit(1)`.
+/// A transport it does not know is refused with a typed error the binary's
+/// `main` returns, not an `eprintln!` and `exit(1)`.
 ///
 /// ```rust,ignore
 /// let cli = Cli::parse();
