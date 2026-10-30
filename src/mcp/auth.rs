@@ -1,5 +1,5 @@
 // ABOUTME: Host-supplied authentication seam for the HTTP transport (RFC 9728 resource server)
-// ABOUTME: AuthHook resolves a per-call ToolContext; ApiKeyAuthHook is the shared-bearer-key hook
+// ABOUTME: AuthHook resolves a per-call ToolContext; ApiKeyAuthHook and shared_key_gate gate on one key
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -30,7 +30,7 @@ use subtle::ConstantTimeEq;
 
 use crate::mcp::protocol::JsonRpcRequest;
 use crate::mcp::tool::ToolContext;
-use crate::server::auth::configured_key;
+use crate::server::auth::{configured_key, startup_auth, AuthMode, InsecureBindError};
 
 /// Why an [`AuthHook`] rejected a request. The HTTP transport maps each variant
 /// to its status code.
@@ -133,10 +133,10 @@ pub const API_KEY_AUTH_METHOD: &str = "api_key";
 /// two ways an MCP route needs:
 ///
 /// - **It fails closed.** With the variable unset, empty or blank it admits
-///   nobody, where `require_auth` admits everybody. Attach it only when the key is set
-///   — [`startup_auth`](crate::server::auth::startup_auth) answering
-///   [`AuthMode::Enforced`](crate::server::auth::AuthMode::Enforced) — so an
-///   absent key is decided once, at startup, and never becomes an open door.
+///   nobody, where `require_auth` admits everybody. Attach it only when the
+///   key is set — [`startup_auth`] answering [`AuthMode::Enforced`], or
+///   [`shared_key_gate`] answering `Some` — so an absent key is decided once,
+///   at startup, and never becomes an open door.
 /// - **Its refusal is the MCP one:** a `401` with an RFC 6750 §3 bearer
 ///   challenge (`Bearer realm="…"`) and a JSON-RPC error body, rendered by the
 ///   HTTP transport, instead of `require_auth`'s REST error.
@@ -220,5 +220,163 @@ impl<S: Send + Sync + ?Sized> AuthHook<S> for ApiKeyAuthHook {
             .ok_or_else(|| AuthError::Unauthorized {
                 www_authenticate: self.challenge.clone(),
             })
+    }
+}
+
+/// The gate for an `/mcp` route guarded by the shared key in `env_var`,
+/// resolved for a bind on `host`: the hook to install, or none.
+///
+/// This is [`startup_auth`] — the posture logged, a reachable bind with no
+/// key refused — turned into what an [`McpServer`](crate::mcp::server::McpServer)
+/// takes:
+///
+/// - key set → `Some` [`ApiKeyAuthHook`] answering refusals with a
+///   `Bearer realm="<realm>"` challenge, on any host;
+/// - no key, loopback host → `None`: unauthenticated local development, which
+///   [`startup_auth`] has already logged at WARN;
+/// - no key, reachable host → [`InsecureBindError`] naming `env_var`, and the
+///   server must not start.
+///
+/// It gates `/mcp` with the hook, which fails closed and answers the MCP
+/// `401`, rather than with [`require_auth`](crate::server::auth::require_auth),
+/// which fails open and answers the REST one. A REST route beside it still
+/// takes `require_auth`: both read `env_var` by the same rule, so the two
+/// gates agree on the key.
+///
+/// ```rust,ignore
+/// let gate = shared_key_gate("RIVIERE_API_TOKEN", "dravr-riviere", &args.host)?;
+/// let server = McpServer::new("dravr-riviere", VERSION, registry, state)
+///     .with_optional_auth_hook(gate.map(|hook| Arc::new(hook) as _));
+/// ```
+///
+/// It judges an HTTP bind, so a binary that also serves stdio calls it only
+/// when the transport is
+/// [`HTTP_TRANSPORT`](crate::mcp::transport::HTTP_TRANSPORT): stdio opens no
+/// socket, and resolving the gate there would log a posture that does not
+/// apply and refuse a keyless reachable `--host` stdio never binds. See
+/// [`transport::run`](crate::mcp::transport::run).
+///
+/// # Errors
+///
+/// [`InsecureBindError`], its `gate` naming `env_var`, when the key is unset
+/// or blank and `host` is not loopback.
+pub fn shared_key_gate(
+    env_var: &str,
+    realm: &str,
+    host: &str,
+) -> Result<Option<ApiKeyAuthHook>, InsecureBindError> {
+    Ok(match startup_auth(env_var, host)? {
+        AuthMode::Enforced => Some(ApiKeyAuthHook::new(env_var, realm)),
+        AuthMode::LoopbackDev => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use serde_json::Value;
+
+    use super::*;
+
+    fn request(token: Option<&str>) -> JsonRpcRequest {
+        let mut request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#)
+                .expect("a ping parses"); // Safe: test assertion
+        request.auth_token = token.map(str::to_owned);
+        request
+    }
+
+    async fn authenticate(
+        hook: &ApiKeyAuthHook,
+        token: Option<&str>,
+    ) -> Result<ToolContext, AuthError> {
+        AuthHook::<()>::authenticate(hook, &request(token), &Arc::new(())).await
+    }
+
+    #[test]
+    fn no_key_on_loopback_is_no_gate() {
+        const ENV: &str = "TRONC_SHARED_KEY_GATE_TEST_LOOPBACK";
+        env::remove_var(ENV);
+
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert_eq!(
+                shared_key_gate(ENV, "svc", host),
+                Ok(None),
+                "{host} with no key serves unauthenticated local development"
+            );
+        }
+    }
+
+    #[test]
+    fn no_key_on_a_reachable_bind_is_refused_naming_the_key() {
+        const ENV: &str = "TRONC_SHARED_KEY_GATE_TEST_REACHABLE";
+        env::set_var(ENV, " \n");
+
+        let refused = shared_key_gate(ENV, "svc", "0.0.0.0");
+        env::remove_var(ENV);
+
+        assert_eq!(
+            refused,
+            Err(InsecureBindError {
+                host: "0.0.0.0".to_owned(),
+                gate: Some(ENV.to_owned()),
+            }),
+            "a blank key on a reachable bind is no gate, and the refusal names the key to set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_key_gates_every_host_with_a_hook_that_fails_closed() {
+        const ENV: &str = "TRONC_SHARED_KEY_GATE_TEST_ENFORCED";
+        env::set_var(ENV, "k-42\n");
+
+        let reachable = shared_key_gate(ENV, "dravr-svc", "0.0.0.0")
+            .expect("a key arms the gate") // Safe: test assertion
+            .expect("an armed gate is a hook"); // Safe: test assertion
+        let loopback = shared_key_gate(ENV, "dravr-svc", "127.0.0.1");
+
+        let admitted = authenticate(&reachable, Some("k-42")).await;
+        let wrong = authenticate(&reachable, Some("k-43")).await;
+        let missing = authenticate(&reachable, None).await;
+        env::remove_var(ENV);
+
+        assert_eq!(
+            loopback,
+            Ok(Some(ApiKeyAuthHook::new(ENV, "dravr-svc"))),
+            "a key gates a loopback bind too"
+        );
+        assert_eq!(reachable.challenge(), "Bearer realm=\"dravr-svc\"");
+        let ctx = admitted.expect("the key admits its holder"); // Safe: test assertion
+        assert_eq!(ctx.auth_method.as_deref(), Some(API_KEY_AUTH_METHOD));
+        assert_eq!(ctx.request_id, Some(Value::from(3)));
+        assert_eq!(ctx.user_id, None, "the key names no user");
+        assert!(!ctx.is_admin, "the key is never admin");
+        for (label, refused) in [("a wrong key", wrong), ("no key", missing)] {
+            match refused {
+                Err(AuthError::Unauthorized { www_authenticate }) => assert_eq!(
+                    www_authenticate, "Bearer realm=\"dravr-svc\"",
+                    "{label} is answered with the realm challenge"
+                ),
+                other => panic!("{label} must be refused with a 401, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hook_admits_nobody_once_the_key_is_removed() {
+        const ENV: &str = "TRONC_SHARED_KEY_GATE_TEST_REMOVED";
+        env::set_var(ENV, "k-7");
+        let hook = shared_key_gate(ENV, "svc", "0.0.0.0")
+            .expect("a key arms the gate") // Safe: test assertion
+            .expect("an armed gate is a hook"); // Safe: test assertion
+
+        env::remove_var(ENV);
+        let refused = authenticate(&hook, Some("k-7")).await;
+
+        assert!(
+            matches!(refused, Err(AuthError::Unauthorized { .. })),
+            "a gate armed at startup stays closed when its key goes away, got {refused:?}"
+        );
     }
 }
