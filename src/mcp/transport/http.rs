@@ -1,5 +1,5 @@
 // ABOUTME: HTTP transport implementing MCP Streamable HTTP with JSON and SSE responses
-// ABOUTME: Serves a POST /mcp endpoint that accepts JSON-RPC and responds via JSON or event stream
+// ABOUTME: Serves POST /mcp (JSON or event stream), and binds a host's own router with the same guard
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -17,7 +17,7 @@ use axum::extract::State;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::uri::Authority;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::middleware::{from_fn, Next};
+use axum::middleware::{self, from_fn, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -172,6 +172,9 @@ pub fn guarded_mcp_router<S: Send + Sync + ?Sized + 'static>(server: Arc<McpServ
 /// its name to 127.0.0.1 reaches a loopback server with that name in `Host`,
 /// so this is what stops it where the `Origin` gate cannot.
 ///
+/// The address actually bound is logged, so a port-0 bind says which port it
+/// got.
+///
 /// It shuts down gracefully on [`shutdown_signal`] (SIGINT, or SIGTERM on
 /// Unix): it stops accepting, lets every request in flight finish, then
 /// returns `Ok`. [`serve_with_shutdown`] takes the trigger from the caller.
@@ -211,48 +214,181 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let authenticated = server.has_auth_hook();
-    let addr = format!("{host}:{port}");
-    let resolved: Vec<SocketAddr> = match lookup_host(&addr).await {
-        Ok(resolved) => resolved.collect(),
-        Err(source) => {
-            return Err(TransportError::Resolve {
-                addr: addr.clone(),
-                source,
-            })
-        }
-    };
-    if !authenticated && !resolved.iter().all(|a| a.ip().is_loopback()) {
+    let (addr, resolved) = resolve_bind(host, port).await?;
+    let loopback = resolved.iter().all(|a| a.ip().is_loopback());
+    if !authenticated && !loopback {
         return Err(InsecureBindError::new(host).into());
     }
 
     // A loopback bind is the one DNS rebinding reaches, so unless the host
     // named its own list, only a loopback `Host` is served there.
-    let loopback = resolved.iter().all(|a| a.ip().is_loopback());
     let host_guarded = loopback && server.allowed_hosts().is_none();
-    let mut app = mcp_router(server);
-    if host_guarded {
-        app = app.layer(from_fn(require_loopback_host));
-    }
-    let app = app.layer(from_fn(guard_requests));
-    let listener = match TcpListener::bind(resolved.as_slice()).await {
-        Ok(listener) => listener,
-        Err(source) => return Err(TransportError::Bind { addr, source }),
-    };
+    let app = guard_app(mcp_router(server), host_guarded.then_some(&[][..]));
+    let listener = bind_listener(addr.clone(), &resolved).await?;
+    let bound = bound_address(&listener, &addr);
 
     info!(
-        address = %addr,
+        address = %bound,
         authenticated,
         protocol_version = PROTOCOL_VERSION,
         "HTTP MCP transport listening"
     );
 
+    serve_until(listener, app, shutdown).await?;
+
+    info!(address = %bound, "HTTP MCP transport stopped");
+    Ok(())
+}
+
+/// Serve a host's own application router — `/health` beside
+/// [`mcp_router`], REST routes, whatever it assembled — on `host:port`,
+/// until [`shutdown_signal`].
+///
+/// The bind, guard and shutdown [`serve`] gives the bare `/mcp` router, for a
+/// router the host built:
+///
+/// - `app` is layered with [`guard_requests`] once, outermost, so pass it
+///   **unguarded** ([`mcp_router`], never [`guarded_mcp_router`]); two guards
+///   would log every request twice.
+/// - `allowed_hosts` is the router's `Host` list, the one
+///   [`McpServer::with_allowed_hosts`] gives [`serve`]. `None`: a loopback
+///   bind serves a loopback `Host` only, on every route — the DNS-rebinding
+///   defence [`serve`] applies — and any other bind serves any `Host`.
+///   `Some(list)`: every route, on any bind, serves a loopback `Host` and the
+///   hosts the list names ([`is_host_allowed`]), so a router behind a tunnel
+///   or proxy on the same machine names the public host it forwards. An
+///   [`McpServer`] inside the router still applies its own list on top.
+/// - The address actually bound is logged, so a port-0 bind says which port
+///   it got.
+/// - It stops gracefully on `SIGINT` or `SIGTERM`: no new connection is
+///   accepted, every request in flight is answered, then it returns `Ok`.
+///
+/// **It authenticates nothing.** The router carries its own gates, so the
+/// bind cannot be judged here: resolve the posture first, with
+/// [`startup_auth`](crate::server::auth::startup_auth) for a shared key,
+/// [`shared_key_gate`](crate::mcp::auth::shared_key_gate) for a key-gated
+/// `/mcp`, or [`resolve_startup_auth`](crate::server::auth::resolve_startup_auth)
+/// for any other gate, and return its refusal from `main` before calling
+/// this.
+///
+/// # Errors
+///
+/// [`TransportError::Resolve`], [`TransportError::Bind`] or
+/// [`TransportError::Serve`].
+pub async fn serve_router(
+    app: Router,
+    host: &str,
+    port: u16,
+    allowed_hosts: Option<&[String]>,
+) -> Result<(), TransportError> {
+    serve_router_with_shutdown(app, host, port, allowed_hosts, shutdown_signal()).await
+}
+
+/// [`serve_router`], shutting down gracefully when `shutdown` resolves.
+///
+/// For a binary that owns its own shutdown sequence (draining a queue,
+/// flushing telemetry) and triggers the server's part of it itself.
+///
+/// # Errors
+///
+/// As [`serve_router`].
+pub async fn serve_router_with_shutdown<F>(
+    app: Router,
+    host: &str,
+    port: u16,
+    allowed_hosts: Option<&[String]>,
+    shutdown: F,
+) -> Result<(), TransportError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (addr, resolved) = resolve_bind(host, port).await?;
+    let loopback = resolved.iter().all(|a| a.ip().is_loopback());
+    let hosts = allowed_hosts.or_else(|| loopback.then_some(&[][..]));
+    let app = guard_app(app, hosts);
+    let listener = bind_listener(addr.clone(), &resolved).await?;
+    let bound = bound_address(&listener, &addr);
+
+    info!(
+        address = %bound,
+        host_list = ?hosts,
+        "HTTP server listening"
+    );
+
+    serve_until(listener, app, shutdown).await?;
+
+    info!(address = %bound, "HTTP server stopped");
+    Ok(())
+}
+
+/// `host:port`, and every socket address it resolves to.
+///
+/// # Errors
+///
+/// [`TransportError::Resolve`] when the lookup fails.
+async fn resolve_bind(host: &str, port: u16) -> Result<(String, Vec<SocketAddr>), TransportError> {
+    let addr = format!("{host}:{port}");
+    let resolved: Result<Vec<SocketAddr>, _> = lookup_host(&addr).await.map(Iterator::collect);
+    match resolved {
+        Ok(resolved) => Ok((addr, resolved)),
+        Err(source) => Err(TransportError::Resolve { addr, source }),
+    }
+}
+
+/// `app` under [`guard_requests`], outermost, and, when `hosts` is a list,
+/// under [`require_listed_host`] inside it: a loopback `Host` and the hosts
+/// listed are served, an empty list serving a loopback `Host` only.
+fn guard_app(app: Router, hosts: Option<&[String]>) -> Router {
+    let app = match hosts {
+        Some(hosts) => app.layer(middleware::from_fn_with_state(
+            Arc::<[String]>::from(hosts),
+            require_listed_host,
+        )),
+        None => app,
+    };
+    app.layer(middleware::from_fn(guard_requests))
+}
+
+/// The address `listener` actually bound — the port the OS picked for a
+/// port-0 bind — or the requested `addr` when the socket cannot say.
+fn bound_address(listener: &TcpListener, addr: &str) -> String {
+    listener
+        .local_addr()
+        .map_or_else(|_| addr.to_owned(), |bound| bound.to_string())
+}
+
+/// A listener on the first of `resolved` that binds.
+///
+/// # Errors
+///
+/// [`TransportError::Bind`] naming `addr` when none does.
+async fn bind_listener(
+    addr: String,
+    resolved: &[SocketAddr],
+) -> Result<TcpListener, TransportError> {
+    TcpListener::bind(resolved)
+        .await
+        .map_err(|source| TransportError::Bind { addr, source })
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves and every request in
+/// flight is answered.
+///
+/// # Errors
+///
+/// [`TransportError::Serve`] when the server stops on an I/O error.
+async fn serve_until<F>(
+    listener: TcpListener,
+    app: Router,
+    shutdown: F,
+) -> Result<(), TransportError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
-        .map_err(TransportError::Serve)?;
-
-    info!(address = %addr, "HTTP MCP transport stopped");
-    Ok(())
+        .map_err(TransportError::Serve)
 }
 
 /// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
@@ -1367,10 +1503,16 @@ fn check_host(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -> Result<(), 
 }
 
 /// Middleware [`serve`] layers over a loopback bind whose server names no
-/// host list: only a loopback `Host` reaches it, so a page rebinding its own
-/// name to 127.0.0.1 cannot drive it.
-async fn require_loopback_host(request: Request, next: Next) -> Response {
-    match check_host(request.headers(), request.uri(), &[]) {
+/// host list (with an empty `allowed`), and [`serve_router`] over a loopback
+/// bind or a router given a list: only a loopback `Host` or one `allowed`
+/// names reaches it, so a page rebinding its own name to 127.0.0.1 cannot
+/// drive it.
+async fn require_listed_host(
+    State(allowed): State<Arc<[String]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match check_host(request.headers(), request.uri(), &allowed) {
         Ok(()) => next.run(request).await,
         Err(refusal) => refusal.into_response(),
     }
