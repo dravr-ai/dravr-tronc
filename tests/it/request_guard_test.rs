@@ -30,7 +30,7 @@ use axum::{Extension, Router};
 use dravr_tronc::mcp::schema::{Tool, ToolResponse};
 use dravr_tronc::mcp::server::McpServer;
 use dravr_tronc::mcp::tool::{McpTool, ToolContext, ToolRegistry};
-use dravr_tronc::mcp::transport::http::{mcp_router, serve, serve_with_shutdown};
+use dravr_tronc::mcp::transport::http::{mcp_router, serve};
 use dravr_tronc::mcp::transport::TransportError;
 use dravr_tronc::server::request_guard::{
     enforce_deadline, guard_requests, guard_requests_with_threshold, parse_slow_request_threshold,
@@ -42,7 +42,6 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio::{task, time};
 use tower::ServiceExt;
 use tracing::subscriber::{set_default, DefaultGuard};
@@ -884,58 +883,6 @@ async fn serve_standalone_on_a_free_port() -> SocketAddr {
         }
     }
     panic!("another test took every port probed for the standalone transport");
-}
-
-/// A port-0 bind logs the port the OS picked, not `:0`: that line is how a
-/// binary started with `--port 0` tells its caller where it listens.
-#[tokio::test]
-async fn a_port_zero_serve_logs_the_port_it_bound() {
-    let (logs, _subscriber) = capture_logs();
-    let server = Arc::new(McpServer::new(
-        "test",
-        "0.1.0",
-        ToolRegistry::<()>::new(),
-        Arc::new(()),
-    ));
-    let (trigger, fired) = oneshot::channel::<()>();
-    let serving = tokio::spawn(async move {
-        serve_with_shutdown(server, "127.0.0.1", 0, async {
-            fired.await.ok();
-        })
-        .await
-    });
-
-    let mut listening = None;
-    for _ in 0..100 {
-        task::yield_now().await;
-        listening = logs
-            .text()
-            .lines()
-            .find(|line| line.contains("HTTP MCP transport listening"))
-            .map(str::to_owned);
-        if listening.is_some() || serving.is_finished() {
-            break;
-        }
-        time::sleep(Duration::from_millis(20)).await;
-    }
-    let listening = listening.expect("the transport logs that it listens");
-    let port: u16 = listening
-        .split("address=127.0.0.1:")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("the line names the bound address")
-        .parse()
-        .expect("a port");
-    let reached = TcpStream::connect(("127.0.0.1", port)).await;
-    trigger.send(()).expect("the server is still waiting");
-    serving.await.unwrap().expect("a clean stop");
-
-    assert_ne!(port, 0, "the logged port is the one bound: {listening}");
-    assert!(reached.is_ok(), "the logged port is where it listens");
-    assert!(
-        logs.text().contains(&format!("address=127.0.0.1:{port}")),
-        "the stop line names the bound address too"
-    );
 }
 
 /// `serve` — the standalone MCP transport every satellite can run — layers

@@ -19,8 +19,6 @@ use crate::error::{
     MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::mcp::auth::{AuthError, AuthHook};
-#[cfg(feature = "google-iam")]
-use crate::mcp::caller::McpAuth;
 use crate::mcp::cancellation::{cancelled_request_id, InFlightRequests, NOTIFICATIONS_CANCELLED};
 use crate::mcp::client_channel::{
     CallerKey, ClientConnection, PendingRequests, DEFAULT_CLIENT_REQUEST_TIMEOUT,
@@ -246,46 +244,6 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     pub fn with_auth_hook(mut self, auth_hook: Arc<dyn AuthHook<S>>) -> Self {
         self.auth_hook = Some(auth_hook);
         self
-    }
-
-    /// Install `auth_hook` when it is `Some`; `None` leaves the server as it
-    /// was, so it never removes a hook installed earlier.
-    ///
-    /// For a gate resolved at startup that may legitimately be absent —
-    /// [`shared_key_gate`](crate::mcp::auth::shared_key_gate) answering
-    /// `None` for loopback development — without a `match` around the
-    /// builder chain:
-    ///
-    /// ```rust,ignore
-    /// let gate = shared_key_gate(KEY_ENV, REALM, &args.host)?;
-    /// let server = McpServer::new(NAME, VERSION, registry, state)
-    ///     .with_optional_auth_hook(gate.map(|hook| Arc::new(hook) as _));
-    /// ```
-    #[must_use]
-    pub fn with_optional_auth_hook(self, auth_hook: Option<Arc<dyn AuthHook<S>>>) -> Self {
-        match auth_hook {
-            Some(hook) => self.with_auth_hook(hook),
-            None => self,
-        }
-    }
-
-    /// Apply how `/mcp` authenticates, as
-    /// [`resolve_mcp_auth`](crate::mcp::caller::resolve_mcp_auth) resolved it:
-    /// its hook, when it has one (see [`Self::with_optional_auth_hook`]), and
-    /// its RFC 9728 metadata, when caller tokens are configured (see
-    /// [`Self::with_protected_resource_metadata`]).
-    ///
-    /// Decide what to register from
-    /// [`McpAuth::verifies_callers`](crate::mcp::caller::McpAuth::verifies_callers)
-    /// before handing `auth` over: it is consumed here.
-    #[cfg(feature = "google-iam")]
-    #[must_use]
-    pub fn with_mcp_auth(self, auth: McpAuth<S>) -> Self {
-        let server = match auth.metadata {
-            Some(metadata) => self.with_protected_resource_metadata(metadata),
-            None => self,
-        };
-        server.with_optional_auth_hook(auth.hook)
     }
 
     /// Whether a host authentication hook is installed — whether anything
@@ -2448,123 +2406,5 @@ mod tests {
         let err = resp.error.expect("error"); // Safe: test assertion
         assert_eq!(err.code, INVALID_PARAMS);
         assert_eq!(err.message, "Unknown tool: nonexistent");
-    }
-
-    // ---- with_optional_auth_hook / with_mcp_auth ----
-
-    use crate::mcp::auth::ApiKeyAuthHook;
-
-    /// A key variable no test sets: the hook over it admits nobody.
-    const UNSET_KEY: &str = "TRONC_SERVER_UNIT_UNSET_KEY";
-
-    fn bare_server() -> McpServer<TestState> {
-        McpServer::new(
-            "auth-unit",
-            "0.1.0",
-            ToolRegistry::new(),
-            Arc::new(TestState),
-        )
-    }
-
-    fn ping(token: Option<&str>) -> JsonRpcRequest {
-        let mut request: JsonRpcRequest =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
-                .expect("ping parses"); // Safe: test assertion
-        request.auth_token = token.map(str::to_owned);
-        request
-    }
-
-    #[tokio::test]
-    async fn no_optional_hook_leaves_the_server_open() {
-        let server = bare_server().with_optional_auth_hook(None);
-
-        assert!(!server.has_auth_hook(), "None installs nothing");
-        let ctx = server.authenticate(&ping(None)).await;
-        assert!(
-            ctx.is_ok_and(|ctx| ctx.auth_method.is_none()),
-            "an open server runs a request as the anonymous context"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_optional_hook_from_a_gate_is_installed_and_enforced() {
-        let gate = Some(ApiKeyAuthHook::new(UNSET_KEY, "unit"));
-        let server = bare_server().with_optional_auth_hook(gate.map(|hook| Arc::new(hook) as _));
-
-        assert!(server.has_auth_hook(), "Some installs the hook");
-        match server.authenticate(&ping(Some("anything"))).await {
-            Err(AuthError::Unauthorized { www_authenticate }) => {
-                assert_eq!(
-                    www_authenticate, "Bearer realm=\"unit\"",
-                    "the installed hook answers with its own realm challenge"
-                );
-            }
-            other => panic!("the installed hook must refuse, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn none_never_removes_a_hook_installed_earlier() {
-        let hook = Arc::new(ApiKeyAuthHook::new(UNSET_KEY, "unit"));
-        let server = bare_server()
-            .with_auth_hook(hook)
-            .with_optional_auth_hook(None);
-
-        assert!(server.has_auth_hook(), "None must not open a gated server");
-    }
-
-    #[cfg(feature = "google-iam")]
-    #[tokio::test]
-    async fn mcp_auth_installs_its_hook_and_publishes_its_metadata() {
-        use crate::mcp::resource_metadata::ProtectedResourceMetadata;
-        use crate::server::auth::AuthMode;
-
-        let metadata = ProtectedResourceMetadata::new(
-            "https://svc.example.com/mcp",
-            vec!["https://api.example.com".to_owned()],
-        )
-        .expect("a valid resource"); // Safe: test assertion
-        let auth = McpAuth::<TestState> {
-            mode: AuthMode::Enforced,
-            hook: Some(Arc::new(ApiKeyAuthHook::new(UNSET_KEY, "unit"))),
-            metadata: Some(metadata),
-        };
-
-        let server = bare_server().with_mcp_auth(auth);
-
-        assert!(server.has_auth_hook(), "the resolved hook is installed");
-        let published = server
-            .protected_resource_metadata()
-            .expect("the metadata is published"); // Safe: test assertion
-        assert_eq!(
-            published.metadata_paths(),
-            vec![
-                "/.well-known/oauth-protected-resource".to_owned(),
-                "/.well-known/oauth-protected-resource/mcp".to_owned(),
-            ],
-            "the router serves the resolved metadata at its well-known paths"
-        );
-        assert!(
-            server.authenticate(&ping(None)).await.is_err(),
-            "the installed hook refuses a request with no credential"
-        );
-    }
-
-    #[cfg(feature = "google-iam")]
-    #[test]
-    fn loopback_mcp_auth_with_no_gate_leaves_the_server_open() {
-        use crate::server::auth::AuthMode;
-
-        let server = bare_server().with_mcp_auth(McpAuth {
-            mode: AuthMode::LoopbackDev,
-            hook: None,
-            metadata: None,
-        });
-
-        assert!(!server.has_auth_hook(), "loopback development has no hook");
-        assert!(
-            server.protected_resource_metadata().is_none(),
-            "no caller tokens, nothing published"
-        );
     }
 }

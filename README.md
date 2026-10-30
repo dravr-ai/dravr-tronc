@@ -103,28 +103,6 @@ gracefully on SIGINT or SIGTERM, answering every request in flight first;
 binary can act on the cause — a `Bind` whose source is `AddrInUse`, a refused `InsecureBind` —
 instead of parsing a message. A `main` that only reports it `?`s it into `Box<dyn Error>`.
 
-A binary that takes `--transport` from `server::cli::McpArgs` hands the choice to
-`mcp::transport::run`, which runs `stdio::run` or `http::serve` and refuses any other name with
-`TransportError::UnknownTransport` — no hand-written `match`, no `eprintln!` and `exit(1)`:
-
-```rust
-dravr_tronc::mcp::transport::run(server, &cli.server).await?;
-```
-
-The server arrives with its gate installed, so resolve the gate on the `http` arm only: stdio opens
-no socket, and `shared_key_gate` there would log a posture that does not apply and refuse a keyless
-`--host` stdio never binds.
-
-```rust
-use dravr_tronc::mcp::transport::HTTP_TRANSPORT;
-
-let gate = if cli.server.transport == HTTP_TRANSPORT {
-    shared_key_gate("MY_API_KEY", "my-service", &cli.server.host)?
-} else {
-    None
-};
-```
-
 What `POST /mcp` requires of a client (Streamable HTTP, revision 2026-07-28):
 
 - `Content-Type: application/json` (else 415); a body over `McpServer::max_request_bytes` (4 MiB
@@ -237,29 +215,12 @@ let app = axum::Router::new()
 `serve` in step 3 layers `guard_requests` itself; an app that assembles its own router adds it
 once, last. See [Request guard](#request-guard).
 
-Or hand the unguarded router to `http::serve_router` (`serve_router_with_shutdown` to own the
-trigger), which binds it the way `serve` binds `/mcp`: `guard_requests` layered once, a loopback
-bind answering a loopback `Host` only unless you pass the router's own `Host` list (a tunnel's public
-name, say — `with_allowed_hosts` is the same opt-out for `serve`), the bound address logged, a
-graceful stop on SIGINT or SIGTERM, and typed `Resolve` / `Bind` / `Serve` errors. It authenticates nothing itself — the
-router carries its own gates — so resolve the posture (`startup_auth`, `shared_key_gate`,
-`resolve_startup_auth`, `resolve_mcp_auth`) before calling it.
-
-```rust
-let gate = shared_key_gate("MY_API_KEY", "my-service", &args.host)?;
-let server = Arc::new(server.with_optional_auth_hook(gate.map(|hook| Arc::new(hook) as _)));
-let app = axum::Router::new()
-    .route("/health", axum::routing::get(health_handler))
-    .merge(mcp_router(server));
-dravr_tronc::mcp::transport::http::serve_router(app, &args.host, args.port, None).await?;
-```
-
 ## Modules
 
 | Module | Purpose |
 |--------|---------|
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
-| `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping; `with_optional_auth_hook` installs a gate resolved at startup when there is one (never removing one), `with_mcp_auth` *(feature `google-iam`)* applies a resolved `McpAuth` (hook and RFC 9728 metadata) |
+| `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `execute` refuses `ADMIN_ONLY` to a non-admin, `REQUIRES_AUTH`/`REQUIRES_TENANT` to a context without a caller/tenant, and a tool's `required_scopes` to a grant missing one (one whose `outputSchema` root is not `type: "object"`, or has a property schema that is not an object, is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |
 | `mcp::computation` *(feature `computation`)* | `Computation` — a tool stated as one typed operation: input and output schemas generated from its types, the result returned as `structuredContent` (and the same JSON as text) at each number's own precision; a list result is a `schema::Listed<T>` (`{"items": [...]}`), since `structuredContent` is an object |
@@ -269,14 +230,13 @@ dravr_tronc::mcp::transport::http::serve_router(app, &args.host, args.port, None
 | `mcp::logging` | `LogLevel` (RFC 5424 severities, ordered) and the `notifications/message` params |
 | `mcp::elicitation` | Form-mode `elicitation/create` — `ElicitRequest`, the restricted `ElicitationSchema` with SEP-1034 defaults and SEP-1330 enums, `ElicitResult` |
 | `testkit` *(feature `testkit`)* | `McpTestClient` — MCP over the in-process router (`oneshot`, no socket), the host's own router with its auth/CORS layers (`over_router`), or HTTP, with bearer, headers, `_meta`, legacy or modern era: `initialize`, `list_tools`, `call_tool`, `request`, `exchange` (the messages a call streams before its response), `raw`; it keeps the `Mcp-Session-Id`, answers server requests with an `on_server_request` handler, and `end_session`s; `McpTestServer` — a server on `127.0.0.1:0`; `TestIssuer` (with `google-iam`) — a stand-in authorization server minting caller tokens; `testkit::assert` — tool/JSON-RPC assertions and `assert_tools_snapshot`, a committed `tools/list` |
-| `mcp::transport` | `run` — serve an `McpServer` on the transport `McpArgs` names (`stdio` or `http`), `TransportError::UnknownTransport` for any other; `TransportError`, why an entry point stopped |
 | `mcp::transport::stdio` | Newline-delimited JSON over stdin/stdout; one connection, one session; on stdin EOF it answers the requests already read (10 s at most), then closes stdout and cancels the connection, so a job holding a tool's context does not hold the process |
-| `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE`; `serve` / `serve_with_shutdown` for `/mcp` alone; `serve_router` / `serve_router_with_shutdown` — a host's own router bound under `guard_requests`, loopback `Host` only on a loopback bind unless given a `Host` list, graceful stop |
+| `mcp::transport::http` | Axum POST `/mcp` handler with SSE (Streamable HTTP): event-stream answers, client responses, opt-in sessions and `DELETE` |
 | `mcp::transport::mirror` | SEP-2243 request headers — `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` held to the body |
 | `mcp::pagination` | Cursor pagination for list methods — opaque cursors that survive the list changing |
 | `mcp::resource_metadata` | `ProtectedResourceMetadata` — the RFC 9728 document the router can serve (`jwks_uri` optional, `SchemePolicy` for plain `http`); `ProtectedResourceMetadataSet` / `ResourceMetadataSource` — the document chosen per request, by dialed host; `BearerChallenge` — the 401/403 challenge with RFC 6750 `error` and `scope` |
-| `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook; `shared_key_gate` — `startup_auth` turned into the hook for a key-gated `/mcp` (`None` on keyless loopback, `InsecureBindError` on a keyless reachable bind) |
-| `mcp::caller` *(feature `google-iam`)* | Verified caller identity — `CallerTokenVerifier` checks a platform-minted RS256 JWT (JWKS signature, `iss`, per-server `aud`, `exp`/`nbf`) and reads `sub`/tenant/`scope`/`client_id`; `CallerAuthHook` makes it the call's `ToolContext`, optionally beside the shared key (identity-free); `CallerTokenConfig::from_env`; `resolve_mcp_auth` — a service's whole `/mcp` gate (caller tokens, shared key, or neither on loopback) resolved into an `McpAuth`, `McpAuthError` when it cannot |
+| `mcp::auth` | `AuthHook` seam — the host turns a request into a per-call `ToolContext`; `ApiKeyAuthHook`, the shared-key hook |
+| `mcp::caller` *(feature `google-iam`)* | Verified caller identity — `CallerTokenVerifier` checks a platform-minted RS256 JWT (JWKS signature, `iss`, per-server `aud`, `exp`/`nbf`) and reads `sub`/tenant/`scope`/`client_id`; `CallerAuthHook` makes it the call's `ToolContext`, optionally beside the shared key or anonymous loopback (both identity-free); `CallerTokenConfig::from_env` |
 | `server::auth` | Bearer token middleware — env-var driven, constant-time comparison; `startup_auth` / `resolve_startup_auth`, the startup posture check |
 | `http_client` *(feature `http-client`)* | `describe_request_error` — a `reqwest::Error` as text without its URL, which can carry a credential; `guard` — the SSRF-guarded fetch of a URL the operator did not choose: `GuardedClient` under a `FetchPolicy` (`webhook`: http(s), no redirects; `allowlist`: an operator's exact host list, e.g. a self-hosted LLM; `archive_fetch`: https, default port, exact hosts; a `HostAllowlist` entry may carry a path prefix, `host/prefix/`, admitting only paths under it, compared on percent-decoded whole segments, ambiguous spellings refused), every redirect hop re-checked (host and path prefix) before it is sent, up to 5, names resolved once and connected to only after every address passed the deny list (RFC 1918, loopback, link-local and metadata, `100.64/10`, `0/8`, `198.18/15`, `240/4`, multicast, ULA, `64:ff9b::/96`, `2002::/16`, Teredo, v4-mapped), no proxy, byte/idle/total caps, errors and `url_digest` without the URL; `TracePropagationMiddleware` *(feature `otel-http-client`)* — the `reqwest-middleware` 0.3 layer opening a CLIENT span per outbound request and sending its `traceparent` |
 | `iam` *(feature `google-iam`)* | Google ID tokens, both ends — `IdTokenSource` to call, `require_google_id_token` to be called; `GoogleKeySet`, the cache of Google's signing keys for one key-set URL, refetching for an unknown `kid` at most every 30s |
@@ -305,9 +265,9 @@ availability is not an argument for using them.
 |---|---|---|
 | another dravr workload on Google infrastructure | `iam::require_google_id_token` (callee) / `iam::IdTokenSource` (caller) | `google-iam` |
 | a human, through a browser or an app | the host's own session auth; `mcp::auth::AuthHook` for MCP routes | — |
-| a user, through a client the platform's authorization server issued a token to — on MCP routes of a server that holds no users of its own | `mcp::caller::resolve_mcp_auth`, which builds a `CallerAuthHook` over a `CallerTokenVerifier` | `google-iam` |
+| a user, through a client the platform's authorization server issued a token to — on MCP routes of a server that holds no users of its own | `mcp::caller::CallerAuthHook` over a `CallerTokenVerifier` | `google-iam` |
 | a third-party webhook | that vendor's signature — e.g. `notifications::slack::SlackClient::verify_signature` — never a bearer | `notifications` |
-| our own binary, over the wire, with nowhere to put a Google identity | `server::auth::require_auth` for REST routes, `mcp::auth::shared_key_gate` (an `ApiKeyAuthHook`) for MCP routes | — |
+| our own binary, over the wire, with nowhere to put a Google identity | `server::auth::require_auth` for REST routes, `mcp::auth::ApiKeyAuthHook` for MCP routes | — |
 | on stdio, or a linked crate in the same process | nothing | — |
 
 Mechanisms compose, so the question is never *which one* for a whole service. A server can verify
@@ -344,18 +304,17 @@ when the key is set, WARN when it is serving unauthenticated on loopback — and
 reachable bind without the key, naming the variable to set:
 
 ```rust
-use dravr_tronc::mcp::auth::shared_key_gate;
+use dravr_tronc::server::auth::{startup_auth, AuthMode};
+use dravr_tronc::mcp::auth::ApiKeyAuthHook;
 
-// MCP routes: the hook fails closed, so it exists only when the key is set —
-// `None` on loopback development, a refusal on a reachable bind without the key.
-let gate = shared_key_gate("MY_API_KEY", "my-service", &args.host)?;
-let server = server.with_optional_auth_hook(gate.map(|hook| Arc::new(hook) as _));
+let mode = startup_auth("MY_API_KEY", &args.host)?;
+
+// MCP routes: the hook fails closed, so attach it only when the key is set.
+let server = match mode {
+    AuthMode::Enforced => server.with_auth_hook(Arc::new(ApiKeyAuthHook::new("MY_API_KEY", "my-service"))),
+    AuthMode::LoopbackDev => server,
+};
 ```
-
-`shared_key_gate` is `startup_auth` (same log, same refusal) turned into the hook. Gate `/mcp` with
-it rather than layering `require_auth` over `mcp_router`: the middleware fails open and answers the
-REST error, the hook fails closed and answers the MCP one. A REST route beside it still takes
-`require_auth`; both read the key by the same rule.
 
 `ApiKeyAuthHook` answers a missing or wrong key with the MCP refusal — `401`,
 `WWW-Authenticate: Bearer realm="my-service"` and a JSON-RPC error body — which a REST middleware
@@ -398,25 +357,26 @@ check is a `401` carrying the challenge you configure — the reason goes to the
 set that cannot be fetched is a `500`, because that outage says nothing about the token.
 
 ```rust
-use dravr_tronc::mcp::caller::resolve_mcp_auth;
+use dravr_tronc::mcp::auth::ApiKeyAuthHook;
+use dravr_tronc::mcp::caller::{CallerAuthHook, CallerTokenConfig};
+use dravr_tronc::server::auth::{api_key_configured, resolve_startup_auth, AuthMode};
 
-// Reads MY_RESOURCE_URL, MY_CALLER_ISSUER, MY_CALLER_JWKS_URL, MY_AUTHORIZATION_SERVER: all or none.
-let auth = resolve_mcp_auth(&args.host, "MY_API_KEY", "my-service", "MY", http)?;
+// MY_RESOURCE_URL, MY_CALLER_ISSUER, MY_CALLER_JWKS_URL, MY_AUTHORIZATION_SERVER: all or none.
+let caller = CallerTokenConfig::from_env("MY")?;
+let keyed = api_key_configured("MY_API_KEY");
+let mode = resolve_startup_auth(&args.host, keyed || caller.is_some())?;
 
-// Register the per-user tools only when a request can carry a verified caller.
-let registry = build_registry(auth.verifies_callers());
-let server = McpServer::new("my-service", VERSION, registry, state).with_mcp_auth(auth);
+if let Some(config) = caller {
+    let metadata = config.resource_metadata()?;
+    let mut hook = CallerAuthHook::new(Arc::new(config.verifier(http)), metadata.www_authenticate());
+    if keyed {
+        hook = hook.with_shared_key(ApiKeyAuthHook::new("MY_API_KEY", "my-service"));
+    } else if mode == AuthMode::LoopbackDev {
+        hook = hook.allowing_anonymous();
+    }
+    server = server.with_protected_resource_metadata(metadata).with_auth_hook(Arc::new(hook));
+}
 ```
-
-`resolve_mcp_auth` reads the caller variables under the prefix it is given (`McpAuthError::Caller`
-when they are partly set), picks the gate and logs it:
-
-- caller tokens configured → a `CallerAuthHook` answering refusals with the metadata's challenge,
-  the shared key admitted beside it (identity-free) when set, and the RFC 9728 metadata to publish;
-  a request with no credential is refused on every host, loopback included;
-- only the shared key → an `ApiKeyAuthHook`, and no request carries a verified caller;
-- neither → no hook on loopback, `McpAuthError::InsecureBind` naming both ways to arm it on a
-  reachable bind.
 
 The tool states what it needs, and `ToolRegistry::execute` enforces it, so no tool stays closed by
 its own discipline:
@@ -426,11 +386,9 @@ its own discipline:
 - `McpTool::required_scopes` — refused unless the grant holds every scope named, in the vocabulary
   of the authorization server that issues the tokens.
 
-The shared key (`with_shared_key`) is admitted with no identity, so it keeps reaching the tools that
-touch no tenant's data and never one that does. `resolve_mcp_auth` never serves an anonymous request
-once caller tokens are configured; a `CallerAuthHook` a host builds itself can still admit one with
-`allowing_anonymous`, identity-free, and a request presenting a credential that fails is refused even
-then.
+The shared key (`with_shared_key`) and an anonymous loopback request (`allowing_anonymous`) are
+admitted with no identity, so they keep reaching the tools that touch no tenant's data and never one
+that does. A request presenting a credential that fails is refused even when anonymous is allowed.
 `testkit::TestIssuer` stands in for the authorization server in tests: a fresh key, its JWK set on
 loopback, and a minter.
 
