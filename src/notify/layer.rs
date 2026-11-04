@@ -75,12 +75,27 @@ const DEFAULT_FLUSH_TICK: Duration = Duration::from_secs(5);
 /// );
 /// // Compose with `tracing_subscriber::registry()` and other layers as usual.
 /// ```
+///
+/// A deployment with no Slack workspace still captures analytics: build the
+/// layer with [`NotifyLayer::analytics_builder`], which has no Slack sink and
+/// never consults routing rules.
 pub struct NotifyLayer<R: RoutingProvider> {
     inner: Arc<LayerInner<R>>,
 }
 
+/// The Slack half of a layer: the client that posts, the provider whose rules
+/// choose which events post and where, and the environment those rules'
+/// env filters compare against. The three only mean anything together.
+struct SlackSink<R: RoutingProvider> {
+    client: Arc<SlackClient>,
+    provider: Arc<R>,
+    environment: String,
+}
+
 struct LayerInner<R: RoutingProvider> {
-    slack: Arc<SlackClient>,
+    /// `None` on a layer built by [`NotifyLayer::analytics_builder`]: events
+    /// reach the `PostHog` sink alone.
+    slack: Option<SlackSink<R>>,
     /// Per-event `PostHog` capture policy. `None` = Slack-only layer.
     analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
     /// `PostHog` transport. Paired with `analytics_provider`; both must be set.
@@ -91,8 +106,6 @@ struct LayerInner<R: RoutingProvider> {
     /// Interactive elements appended to an immediate post. `None` = every
     /// event posts as text only.
     actions: Option<Arc<dyn NotifyActions>>,
-    provider: Arc<R>,
-    environment: String,
     default_rule: Option<RoutingRule>,
     dedup: DedupMap,
     batches: SharedBatchBuffers,
@@ -120,24 +133,32 @@ impl<R: RoutingProvider> NotifyLayer<R> {
         provider: Arc<R>,
         environment: String,
     ) -> NotifyLayerBuilder<R> {
-        NotifyLayerBuilder {
-            slack,
+        NotifyLayerBuilder::with_slack(Some(SlackSink {
+            client: slack,
             provider,
             environment,
-            default_rule: None,
-            flush_tick: DEFAULT_FLUSH_TICK,
-            analytics_provider: None,
-            posthog: None,
-            enricher: None,
-            actions: None,
-        }
+        }))
+    }
+
+    /// Start a builder for a layer with no Slack sink: every event reaches the
+    /// `PostHog` analytics sink alone, so routing rules, the default rule,
+    /// actions and the batch flusher never come into play. For a deployment
+    /// that captures analytics without a Slack workspace.
+    pub fn analytics_builder(
+        analytics: Arc<dyn AnalyticsProvider>,
+        posthog: Arc<PostHogClient>,
+    ) -> NotifyLayerBuilder<R> {
+        NotifyLayerBuilder::with_slack(None).with_analytics(analytics, posthog)
     }
 
     /// Apply rule + side effects to one `(event_name, merged_fields)` pair.
     /// Splits the synchronous path from `on_event` so it's exercised by tests.
+    /// A layer without a Slack sink returns at once: rules only choose posts.
     fn dispatch(&self, event_name: &str, fields: &HashMap<String, String>) {
-        let Some(rule) = self
-            .inner
+        let Some(slack) = &self.inner.slack else {
+            return;
+        };
+        let Some(rule) = slack
             .provider
             .route_for(event_name)
             .or_else(|| self.inner.default_rule.clone())
@@ -145,7 +166,7 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             return;
         };
 
-        if !rule.enabled || !rule.allows_env(&self.inner.environment) {
+        if !rule.enabled || !rule.allows_env(&slack.environment) {
             return;
         }
 
@@ -163,7 +184,8 @@ impl<R: RoutingProvider> NotifyLayer<R> {
             let line = format_line(event_name, fields);
             self.enqueue_batch(event_name, &rule.channel, batch.interval, line);
         } else {
-            self.post_immediate(&rule.channel, event_name, fields);
+            let blocks = self.immediate_blocks(event_name, fields);
+            slack.client.post_message(&rule.channel, &blocks);
         }
     }
 
@@ -219,11 +241,6 @@ impl<R: RoutingProvider> NotifyLayer<R> {
         });
     }
 
-    fn post_immediate(&self, channel: &str, event_name: &str, fields: &HashMap<String, String>) {
-        let blocks = self.immediate_blocks(event_name, fields);
-        self.inner.slack.post_message(channel, &blocks);
-    }
-
     /// The Block Kit body of an immediate post: the event's section and
     /// context, then an `actions` block when the host's [`NotifyActions`]
     /// supplies elements for this event.
@@ -265,9 +282,7 @@ impl<R: RoutingProvider> NotifyLayer<R> {
 
 /// Builder for [`NotifyLayer`].
 pub struct NotifyLayerBuilder<R: RoutingProvider> {
-    slack: Arc<SlackClient>,
-    provider: Arc<R>,
-    environment: String,
+    slack: Option<SlackSink<R>>,
     default_rule: Option<RoutingRule>,
     flush_tick: Duration,
     analytics_provider: Option<Arc<dyn AnalyticsProvider>>,
@@ -277,6 +292,20 @@ pub struct NotifyLayerBuilder<R: RoutingProvider> {
 }
 
 impl<R: RoutingProvider> NotifyLayerBuilder<R> {
+    /// A builder holding only `slack` and the defaults; the two public
+    /// constructors differ in nothing else.
+    fn with_slack(slack: Option<SlackSink<R>>) -> Self {
+        Self {
+            slack,
+            default_rule: None,
+            flush_tick: DEFAULT_FLUSH_TICK,
+            analytics_provider: None,
+            posthog: None,
+            enricher: None,
+            actions: None,
+        }
+    }
+
     /// Set the fallback rule applied when `RoutingProvider::route_for`
     /// returns `None`. Without this, unknown events are dropped silently.
     pub fn default_rule(mut self, rule: RoutingRule) -> Self {
@@ -325,22 +354,25 @@ impl<R: RoutingProvider> NotifyLayerBuilder<R> {
         self
     }
 
-    /// Finalise the layer and spawn the background batch flusher.
+    /// Finalise the layer and, when it posts to Slack, spawn the background
+    /// batch flusher. A layer without a Slack sink never batches, so it
+    /// spawns nothing.
     pub fn build(self) -> NotifyLayer<R> {
+        let posts_to_slack = self.slack.is_some();
         let inner = Arc::new(LayerInner {
             slack: self.slack,
             analytics_provider: self.analytics_provider,
             posthog: self.posthog,
             enricher: self.enricher,
             actions: self.actions,
-            provider: self.provider,
-            environment: self.environment,
             default_rule: self.default_rule,
             dedup: Arc::new(Mutex::new(HashMap::new())),
             batches: Arc::new(Mutex::new(BatchBuffers::default())),
             sample_counter: AtomicU64::new(0),
         });
-        spawn_batch_flusher(Arc::clone(&inner), self.flush_tick);
+        if posts_to_slack {
+            spawn_batch_flusher(Arc::clone(&inner), self.flush_tick);
+        }
         NotifyLayer { inner }
     }
 }
@@ -685,6 +717,9 @@ fn spawn_batch_flusher<R: RoutingProvider>(inner: Arc<LayerInner<R>>, tick: Dura
 }
 
 fn flush_ripe_batches<R: RoutingProvider>(inner: &Arc<LayerInner<R>>) {
+    let Some(slack) = &inner.slack else {
+        return;
+    };
     let now = Instant::now();
     let mut to_post: Vec<(String, String, Vec<BatchedLine>)> = Vec::new();
     {
@@ -707,7 +742,7 @@ fn flush_ripe_batches<R: RoutingProvider>(inner: &Arc<LayerInner<R>>) {
     for (event_name, channel, lines) in to_post {
         let combined = format_batch(&event_name, &lines);
         let blocks = single_line_blocks(&event_name, &combined);
-        inner.slack.post_message(&channel, &blocks);
+        slack.client.post_message(&channel, &blocks);
     }
 }
 
@@ -859,6 +894,66 @@ mod tests {
         }));
         layer.capture_analytics("user.login", &HashMap::new());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    fn analytics_only_layer(calls: &Arc<AtomicU64>) -> NotifyLayerBuilder<StaticRoutingProvider> {
+        // Unroutable host: the fire-and-forget capture send fails harmlessly.
+        let posthog = Arc::new(PostHogClient::with_host("phc_test", "http://127.0.0.1:1"));
+        NotifyLayer::analytics_builder(
+            Arc::new(CountingAnalytics {
+                calls: Arc::clone(calls),
+                capture: true,
+            }),
+            posthog,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_layer_without_slack_still_captures_every_event() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let layer = analytics_only_layer(&calls).build();
+        with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!(target: NOTIFY_TARGET, event = "user.login", "signed in");
+            tracing::info!(target: NOTIFY_TARGET, event = "user.signup", "joined");
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "every event reaches the analytics provider"
+        );
+    }
+
+    #[test]
+    fn a_layer_without_slack_builds_outside_a_runtime() {
+        // No runtime here: a build that spawned the batch flusher would panic.
+        let calls = Arc::new(AtomicU64::new(0));
+        let layer = analytics_only_layer(&calls).build();
+        assert!(
+            layer.inner.slack.is_none(),
+            "an analytics layer has no Slack sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_layer_without_slack_never_routes_or_batches() {
+        // A consulted rule would draw a sample (the counter's first draw
+        // passes) and then queue the event; without a Slack sink the rule is
+        // never consulted, so neither happens.
+        let mut rule = RoutingRule::to_channel("#digest");
+        rule.sample_rate = 0.5;
+        rule.batch = Some(super::super::rule::BatchRule {
+            interval: Duration::from_secs(1),
+        });
+        let calls = Arc::new(AtomicU64::new(0));
+        let layer = analytics_only_layer(&calls).default_rule(rule).build();
+        layer.dispatch("user.login", &HashMap::new());
+        let guard = layer.inner.batches.lock().expect("mutex not poisoned"); // Safe: test assertion
+        assert!(guard.by_event.is_empty(), "no event was queued for Slack");
+        assert_eq!(
+            layer.inner.sample_counter.load(Ordering::Relaxed),
+            0,
+            "the rule's sampling was never consulted"
+        );
     }
 
     #[tokio::test]

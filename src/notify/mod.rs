@@ -17,6 +17,12 @@
 //! [`RoutingProvider`], applies dedup / sampling / env filtering / batching,
 //! and posts a Slack message via [`SlackClient`](crate::notifications::SlackClient).
 //!
+//! With an [`AnalyticsProvider`] and a
+//! [`PostHogClient`](crate::notifications::PostHogClient) attached, every
+//! event is also captured to `PostHog`, whatever the Slack rules decide. A
+//! layer built by [`NotifyLayer::analytics_builder`] has no Slack sink at
+//! all, so a deployment without a Slack workspace still captures analytics.
+//!
 //! ## Example
 //!
 //! ```rust,ignore
