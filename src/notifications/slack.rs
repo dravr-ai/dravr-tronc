@@ -1,4 +1,4 @@
-// ABOUTME: Slack API client for posting messages, updating messages, and verifying signatures
+// ABOUTME: Slack API client for posting and updating messages, opening modals, uploading files, verifying signatures
 // ABOUTME: Shared across all dravr-xxx services for consistent Slack integration
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -7,9 +7,9 @@
 use std::fmt;
 use std::str;
 
-use reqwest::Client;
+use reqwest::{Client, Response};
 use ring::hmac;
-use serde_json::Value;
+use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tracing::{error, warn};
 
@@ -21,6 +21,15 @@ const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
 
 /// Slack API endpoint for updating messages
 const SLACK_CHAT_UPDATE_URL: &str = "https://slack.com/api/chat.update";
+
+/// Slack API endpoint for opening a modal
+const SLACK_VIEWS_OPEN_URL: &str = "https://slack.com/api/views.open";
+
+/// Slack API endpoint that reserves an upload URL for one file
+const SLACK_GET_UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
+
+/// Slack API endpoint that shares reserved, uploaded files into a channel
+const SLACK_COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
 
 /// Maximum age of a Slack request timestamp before rejection (5 minutes)
 const MAX_TIMESTAMP_AGE_SECS: u64 = 300;
@@ -127,6 +136,59 @@ impl fmt::Display for SignatureError {
     }
 }
 
+/// A file to share into a channel with [`SlackClient::upload_file`]
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct SlackFile {
+    /// Name Slack stores the file under, extension included
+    pub filename: String,
+    /// Title shown with the file; the filename when absent
+    pub title: Option<String>,
+    /// What a screen reader says for an image
+    pub alt_text: Option<String>,
+    /// The file's content
+    pub bytes: Vec<u8>,
+}
+
+impl SlackFile {
+    /// A file named `filename` holding `bytes`, with no title or alt text
+    #[must_use]
+    pub fn new(filename: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            filename: filename.into(),
+            title: None,
+            alt_text: None,
+            bytes,
+        }
+    }
+
+    /// Show `title` with the file instead of its filename
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Have a screen reader say `alt_text` for the image
+    #[must_use]
+    pub fn with_alt_text(mut self, alt_text: impl Into<String>) -> Self {
+        self.alt_text = Some(alt_text.into());
+        self
+    }
+}
+
+impl fmt::Debug for SlackFile {
+    /// The content is a user's file: its size is logged, never its bytes
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackFile")
+            .field("filename", &self.filename)
+            .field("title", &self.title)
+            .field("alt_text", &self.alt_text)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 impl SlackClient {
     /// Create a new Slack client from configuration
     pub fn new(config: &SlackConfig) -> Self {
@@ -192,6 +254,66 @@ impl SlackClient {
         });
     }
 
+    /// Open `view` as a modal for the person whose interaction carried
+    /// `trigger_id` (`views.open`)
+    ///
+    /// Awaitable rather than fire-and-forget: Slack honours a `trigger_id` for
+    /// three seconds after the tap, so the caller opens the modal before it
+    /// answers the interaction, and learns whether it opened.
+    pub async fn open_view(&self, trigger_id: &str, view: &Value) -> SlackResult {
+        let payload = views_open_payload(trigger_id, view);
+        send_slack_request(&self.http, SLACK_VIEWS_OPEN_URL, &self.bot_token, &payload).await
+    }
+
+    /// Upload `file` and share it into `channel`, with `initial_comment` as
+    /// the message it is posted under
+    ///
+    /// Slack's external upload: `files.getUploadURLExternal` reserves a URL
+    /// for the file's name and length, the bytes are posted to that URL, and
+    /// `files.completeUploadExternal` shares the file into the channel. The
+    /// file stays inside the workspace, unlike an `image` block, which needs a
+    /// public URL. The bot needs the `files:write` scope; a missing scope comes
+    /// back as `ApiError("missing_scope")`.
+    pub async fn upload_file(
+        &self,
+        channel: &str,
+        file: SlackFile,
+        initial_comment: Option<&str>,
+    ) -> SlackResult {
+        let reserve = reserve_upload_form(&file);
+        let reserved = match call_slack_form(
+            &self.http,
+            SLACK_GET_UPLOAD_URL_URL,
+            &self.bot_token,
+            &reserve,
+        )
+        .await
+        .and_then(|body| reserved_upload(&body))
+        {
+            Ok(reserved) => reserved,
+            Err(failure) => return failure,
+        };
+
+        let title = file.title.unwrap_or(file.filename);
+        if let Err(failure) = post_upload_bytes(&self.http, &reserved.upload_url, file.bytes).await
+        {
+            return failure;
+        }
+
+        let complete = complete_upload_form(&reserved.file_id, &title, channel, initial_comment);
+        match call_slack_form(
+            &self.http,
+            SLACK_COMPLETE_UPLOAD_URL,
+            &self.bot_token,
+            &complete,
+        )
+        .await
+        {
+            Ok(_) => SlackResult::Ok,
+            Err(failure) => failure,
+        }
+    }
+
     /// Verify a Slack request signature (HMAC-SHA256 v0 scheme)
     ///
     /// Validates:
@@ -233,43 +355,155 @@ impl SlackClient {
     }
 }
 
-/// Send a request to a Slack API endpoint and parse the response
+/// Send a JSON request to a Slack API endpoint and parse the response
 async fn send_slack_request(
     client: &Client,
     url: &str,
     token: &str,
     payload: &Value,
 ) -> SlackResult {
-    let response = match client
+    let sent = client
         .post(url)
         .header("Authorization", format!("Bearer {token}"))
         .json(payload)
         .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return SlackResult::HttpError(describe_request_error(e)),
-    };
+        .await;
+    match read_slack_response(sent).await {
+        Ok(_) => SlackResult::Ok,
+        Err(failure) => failure,
+    }
+}
 
+/// Send a form-encoded request to a Slack API endpoint, returning the body of
+/// an `ok` answer
+///
+/// The `files.*` upload methods take form fields rather than a JSON body.
+async fn call_slack_form(
+    client: &Client,
+    url: &str,
+    token: &str,
+    form: &[(&str, String)],
+) -> Result<Value, SlackResult> {
+    let sent = client
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .form(form)
+        .send()
+        .await;
+    read_slack_response(sent).await
+}
+
+/// Read a Slack Web API answer: the body when it says `ok`, the failure
+/// otherwise
+async fn read_slack_response(sent: Result<Response, reqwest::Error>) -> Result<Value, SlackResult> {
+    let response = sent.map_err(|e| SlackResult::HttpError(describe_request_error(e)))?;
     if !response.status().is_success() {
-        return SlackResult::HttpError(format!("HTTP {}", response.status()));
+        return Err(SlackResult::HttpError(format!(
+            "HTTP {}",
+            response.status()
+        )));
     }
+    let body = response.json::<Value>().await.map_err(|e| {
+        SlackResult::HttpError(format!("response parse: {}", describe_request_error(e)))
+    })?;
+    ok_body(body)
+}
 
-    match response.json::<Value>().await {
-        Ok(body) => {
-            let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            if ok {
-                SlackResult::Ok
-            } else {
-                let error = body
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                SlackResult::ApiError(error.to_owned())
-            }
-        }
-        Err(e) => SlackResult::HttpError(format!("response parse: {}", describe_request_error(e))),
+/// A Slack answer's body when `ok` is true; otherwise its `error` code
+fn ok_body(body: Value) -> Result<Value, SlackResult> {
+    if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(body);
     }
+    let error = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Err(SlackResult::ApiError(error.to_owned()))
+}
+
+/// The `views.open` body that opens `view` on `trigger_id`
+fn views_open_payload(trigger_id: &str, view: &Value) -> Value {
+    json!({ "trigger_id": trigger_id, "view": view })
+}
+
+/// Where `files.getUploadURLExternal` says to post the file, and the id the
+/// file is shared under
+#[derive(Debug, PartialEq, Eq)]
+struct ReservedUpload {
+    upload_url: String,
+    file_id: String,
+}
+
+/// The fields `files.getUploadURLExternal` reserves `file` with: its name and
+/// its length in bytes, plus alt text when it has one
+fn reserve_upload_form(file: &SlackFile) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("filename", file.filename.clone()),
+        ("length", file.bytes.len().to_string()),
+    ];
+    if let Some(alt_text) = &file.alt_text {
+        form.push(("alt_txt", alt_text.clone()));
+    }
+    form
+}
+
+/// Read the upload URL and file id out of an `ok` reservation
+fn reserved_upload(body: &Value) -> Result<ReservedUpload, SlackResult> {
+    let field = |name: &str| body.get(name).and_then(Value::as_str).map(str::to_owned);
+    match (field("upload_url"), field("file_id")) {
+        (Some(upload_url), Some(file_id)) => Ok(ReservedUpload {
+            upload_url,
+            file_id,
+        }),
+        _ => Err(SlackResult::ApiError(
+            "files.getUploadURLExternal answered without upload_url and file_id".to_owned(),
+        )),
+    }
+}
+
+/// Post the file's bytes to the URL its reservation named
+///
+/// The URL is pre-signed for this one file, so the request carries no token.
+async fn post_upload_bytes(
+    client: &Client,
+    upload_url: &str,
+    bytes: Vec<u8>,
+) -> Result<(), SlackResult> {
+    let response = client
+        .post(upload_url)
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| SlackResult::HttpError(describe_request_error(e)))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(SlackResult::HttpError(format!(
+            "file upload HTTP {}",
+            response.status()
+        )))
+    }
+}
+
+/// The fields `files.completeUploadExternal` shares the reserved file into
+/// `channel` with, under `initial_comment` when there is one
+fn complete_upload_form(
+    file_id: &str,
+    title: &str,
+    channel: &str,
+    initial_comment: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        (
+            "files",
+            json!([{ "id": file_id, "title": title }]).to_string(),
+        ),
+        ("channel_id", channel.to_owned()),
+    ];
+    if let Some(comment) = initial_comment {
+        form.push(("initial_comment", comment.to_owned()));
+    }
+    form
 }
 
 #[cfg(test)]
@@ -420,5 +654,109 @@ mod tests {
         let now = chrono::Utc::now().timestamp().to_string();
         let result = client.verify_signature(&now, "v0=badhash", b"body");
         assert!(matches!(result, Err(SignatureError::InvalidSignature)));
+    }
+
+    #[test]
+    fn an_ok_answer_hands_back_its_body_and_a_refusal_its_error_code() {
+        let body = json!({ "ok": true, "file_id": "F1" });
+        assert!(matches!(ok_body(body.clone()), Ok(read) if read == body));
+
+        let refused = ok_body(json!({ "ok": false, "error": "expired_trigger_id" }));
+        assert!(
+            matches!(refused, Err(SlackResult::ApiError(code)) if code == "expired_trigger_id")
+        );
+
+        // An answer that never says ok is a failure, never a success.
+        let silent = ok_body(json!({ "file_id": "F1" }));
+        assert!(matches!(silent, Err(SlackResult::ApiError(code)) if code == "unknown"));
+    }
+
+    #[test]
+    fn a_modal_opens_on_the_trigger_the_tap_carried() {
+        let view = json!({ "type": "modal", "callback_id": "reply" });
+        assert_eq!(
+            views_open_payload("13345224609.738474920.8088930838d88f008e0", &view),
+            json!({ "trigger_id": "13345224609.738474920.8088930838d88f008e0", "view": view })
+        );
+    }
+
+    #[test]
+    fn a_file_is_reserved_by_its_name_and_byte_length() {
+        let file = SlackFile::new("screenshot.png", vec![0_u8; 2048]);
+        assert_eq!(
+            reserve_upload_form(&file),
+            [
+                ("filename", "screenshot.png".to_owned()),
+                ("length", "2048".to_owned())
+            ]
+        );
+
+        let described = file.with_alt_text("the week view");
+        assert_eq!(
+            reserve_upload_form(&described).last(),
+            Some(&("alt_txt", "the week view".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_reservation_names_where_to_post_and_the_file_it_reserved() {
+        let body = json!({
+            "ok": true,
+            "upload_url": "https://files.slack.com/upload/v1/abc",
+            "file_id": "F0AB12CD",
+        });
+        assert_eq!(
+            reserved_upload(&body).ok(),
+            Some(ReservedUpload {
+                upload_url: "https://files.slack.com/upload/v1/abc".to_owned(),
+                file_id: "F0AB12CD".to_owned(),
+            })
+        );
+
+        for partial in [
+            json!({ "ok": true, "file_id": "F0AB12CD" }),
+            json!({ "ok": true, "upload_url": "https://files.slack.com/upload/v1/abc" }),
+        ] {
+            assert!(
+                matches!(reserved_upload(&partial), Err(SlackResult::ApiError(_))),
+                "{partial}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_completed_upload_is_shared_into_the_channel_under_its_comment() {
+        let form = complete_upload_form(
+            "F0AB12CD",
+            "Screenshot",
+            "C0FEEDBACK",
+            Some("from an athlete"),
+        );
+        assert_eq!(
+            form,
+            [
+                (
+                    "files",
+                    r#"[{"id":"F0AB12CD","title":"Screenshot"}]"#.to_owned()
+                ),
+                ("channel_id", "C0FEEDBACK".to_owned()),
+                ("initial_comment", "from an athlete".to_owned()),
+            ]
+        );
+
+        let bare = complete_upload_form("F0AB12CD", "Screenshot", "C0FEEDBACK", None);
+        assert!(bare.iter().all(|(name, _)| *name != "initial_comment"));
+    }
+
+    #[test]
+    fn a_file_logs_its_size_never_its_bytes() {
+        let file =
+            SlackFile::new("screenshot.png", b"private pixels".to_vec()).with_title("Screenshot");
+        let logged = format!("{file:?}");
+        assert!(logged.contains("len: 14"), "{logged}");
+        assert!(
+            !logged.contains("112, 114"),
+            "the bytes must not be logged: {logged}"
+        );
     }
 }

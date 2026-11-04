@@ -8,7 +8,8 @@
 //!
 //! Shared notification infrastructure for all dravr-xxx services.
 //!
-//! - [`SlackClient`]: Post and update Slack messages, verify request signatures
+//! - [`SlackClient`]: Post and update Slack messages, open a modal, upload a
+//!   [`SlackFile`] into a channel, verify request signatures
 //! - [`EmailClient`]: Send email alerts via the Resend API
 //! - [`ResendClient`]: The one Resend send path — alerts and a host's
 //!   transactional mail — retrying a `429` within Resend's advertised reset
@@ -29,4 +30,4 @@ pub use email::EmailClient;
 pub use error_layer::ErrorNotificationLayer;
 pub use posthog::PostHogClient;
 pub use resend::{ResendBody, ResendClient, ResendEmail, ResendError, ResendReceipt};
-pub use slack::SlackClient;
+pub use slack::{SlackClient, SlackFile, SlackResult};
