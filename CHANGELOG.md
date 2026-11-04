@@ -1,5 +1,20 @@
 # Changelog
 
+## [6.6.0] — 2026-11-04
+
+### Added
+
+- feat(notifications): PostHog captures carry their time and a v7 uuid
+- feat(notify): a NotifyLayer without Slack still captures analytics
+- feat(mcp): shared key gate, caller auth, transport::run and serve_router
+
+### Other
+
+- revert(mcp): drop the unreleased shared scaffolding helpers
+- test(it): close the interest and port races that flaked the it binary
+- test(http-client): give the shadowed-host assert a message
+
+
 ## [6.5.0] — 2026-10-29
 
 ### Fixed
