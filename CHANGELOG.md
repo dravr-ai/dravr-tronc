@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.7.0] — 2026-11-05
+
+### Added
+
+- feat(notifications): SlackClient opens a modal and uploads a file
+
+
 ## [6.6.0] — 2026-11-04
 
 ### Added
