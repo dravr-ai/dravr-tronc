@@ -82,6 +82,7 @@ mod client;
 mod error;
 mod response;
 mod transport;
+mod websocket;
 
 pub use client::{ServiceClient, ServiceRequest, DEFAULT_SHED_RETRY_AFTER_SECS};
 pub use error::{ConfigError, ServiceError, Unfinished};
@@ -89,3 +90,7 @@ pub use reqwest::header::HeaderMap;
 pub use reqwest::StatusCode;
 pub use response::{Exchange, ServiceResponse};
 pub use transport::TransportFailure;
+pub use websocket::{
+    CloseCode, CloseFrame, ServiceWebSocket, WebSocketMessage, WebSocketUpgrade,
+    WEBSOCKET_HANDSHAKE_TIMEOUT,
+};

@@ -189,6 +189,25 @@ impl ServiceClient {
         &self.base_url
     }
 
+    /// A client for a loopback `base_url` that still mints a token, for tests
+    /// of the bearer path: `new` gives a loopback service none, and a
+    /// non-loopback one must be https, which a test server does not speak.
+    #[cfg(test)]
+    pub(super) fn token_bearing_on_loopback(base_url: &str, http: Client) -> Self {
+        Self {
+            service: Arc::from("svc"),
+            base: Url::parse(base_url).unwrap(), // Safe: test assertion
+            base_url: base_url.to_owned(),
+            tokens: Some(Arc::new(IdTokenSource::new("test-audience", http.clone()))),
+            http,
+        }
+    }
+
+    /// The base URL parsed: the one origin a request may be sent to.
+    pub(super) fn base(&self) -> &Url {
+        &self.base
+    }
+
     /// A GET of `path`, which starts with `/` and has its segments already
     /// encoded. `operation` names the call in errors and logs.
     ///
@@ -250,7 +269,7 @@ impl ServiceClient {
         }
     }
 
-    fn exchange(
+    pub(super) fn exchange(
         &self,
         operation: &str,
         request_id: RequestId,
@@ -275,7 +294,10 @@ impl ServiceClient {
     }
 
     /// `Authorization` for this service: a bearer token, or nothing on loopback.
-    async fn authorization(&self, operation: &str) -> Result<Option<HeaderValue>, ServiceError> {
+    pub(super) async fn authorization(
+        &self,
+        operation: &str,
+    ) -> Result<Option<HeaderValue>, ServiceError> {
         let Some(tokens) = &self.tokens else {
             return Ok(None);
         };

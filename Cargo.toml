@@ -57,7 +57,13 @@ google-iam = ["http-client", "dep:jsonwebtoken"]
 # dravr service under a Google ID token and a fresh request id, and reads the
 # guard's own answers. Opt-in because it names hyper to tell a connection
 # closed before any response from the other ways a send fails.
-service-client = ["google-iam", "dep:hyper"]
+service-client = [
+    "google-iam",
+    "dep:hyper",
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
 # OTLP-based distributed tracing and metrics export. When enabled,
 # `tracing_init::init` also wires a `tracing-opentelemetry` layer that exports
 # spans, and a meter provider that exports metrics, via OTLP (gRPC) to
@@ -127,6 +133,14 @@ subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "signal", "time"] }
 # CancellationToken: the signal a task's operation and an in-flight request watch.
 tokio-util = { version = "0.7", default-features = false }
+# `ServiceClient::connect_websocket`. 0.29 is the line axum 0.8's `ws` links,
+# so a host serving and dialling WebSockets resolves one tungstenite. rustls on
+# ring with webpki roots, the TLS stack reqwest's `rustls-tls` already links;
+# the config is built with the provider named, so a process with no default
+# provider (or two) still connects.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 tracing = "0.1"
 # Spans only: tronc records metrics through the opentelemetry API, never
 # through tracing macros, and bridges no `log` records.
@@ -152,6 +166,8 @@ jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_c
 # The otel tests export spans and metrics to memory, which only the testing
 # feature builds.
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+# `ws`: the WebSocket server the `connect_websocket` tests dial.
+axum = { version = "0.8", features = ["ws"] }
 serial_test = "3"
 http = "1"
 http-body-util = "0.1"
