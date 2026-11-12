@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.8.0] — 2026-11-12
+
+### Added
+
+- feat(service-client): connect_websocket under the service's ID token
+
+
 ## [6.7.0] — 2026-11-05
 
 ### Added
