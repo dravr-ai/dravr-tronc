@@ -304,14 +304,11 @@ async fn a_deadline_layered_on_rest_routes_leaves_a_merged_mcp_route_uncut() {
     #[async_trait]
     impl McpTool<()> for SlowTool {
         fn definition(&self) -> Tool {
-            Tool {
-                name: "slow".to_owned(),
-                description: "Answers after the REST deadline has passed".to_owned(),
-                input_schema: json!({"type": "object"}),
-                output_schema: None,
-                annotations: None,
-                execution: None,
-            }
+            Tool::new(
+                "slow",
+                "Answers after the REST deadline has passed",
+                json!({"type": "object"}),
+            )
         }
 
         async fn execute(
@@ -612,14 +609,11 @@ struct ProgressThenWork;
 #[async_trait]
 impl McpTool<()> for ProgressThenWork {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "progress_then_work".to_owned(),
-            description: "Reports progress, then works for 300 ms".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(
+            "progress_then_work",
+            "Reports progress, then works for 300 ms",
+            json!({"type": "object"}),
+        )
     }
 
     async fn execute(

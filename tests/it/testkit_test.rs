@@ -41,14 +41,12 @@ struct Whoami;
 #[async_trait]
 impl McpTool<()> for Whoami {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "whoami".to_owned(),
-            description: "Who the server thinks is calling".to_owned(),
-            input_schema: json!({ "type": "object" }),
-            output_schema: Some(json!({ "type": "object" })),
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(
+            "whoami",
+            "Who the server thinks is calling",
+            json!({ "type": "object" }),
+        )
+        .with_output_schema(json!({ "type": "object" }))
     }
 
     async fn execute(
@@ -73,14 +71,7 @@ struct Broken;
 #[async_trait]
 impl McpTool<()> for Broken {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "broken".to_owned(),
-            description: "Always fails".to_owned(),
-            input_schema: json!({ "type": "object" }),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new("broken", "Always fails", json!({ "type": "object" }))
     }
 
     async fn execute(

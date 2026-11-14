@@ -34,14 +34,9 @@ struct Fixed {
 #[async_trait]
 impl McpTool<Calls> for Fixed {
     fn definition(&self) -> Tool {
-        Tool {
-            name: self.name.to_owned(),
-            description: "A fixed answer".to_owned(),
-            input_schema: self.input_schema.clone(),
-            output_schema: self.output_schema.clone(),
-            annotations: None,
-            execution: None,
-        }
+        let mut tool = Tool::new(self.name, "A fixed answer", self.input_schema.clone());
+        tool.output_schema.clone_from(&self.output_schema);
+        tool
     }
 
     async fn execute(&self, state: &Arc<Calls>, _ctx: &ToolContext, _args: Value) -> ToolResponse {
@@ -202,19 +197,16 @@ async fn a_tool_whose_schema_does_not_compile_is_refused_every_call() {
 #[test]
 fn a_schema_without_a_dialect_is_read_as_2020_12() {
     // `prefixItems` exists only from 2020-12; an earlier draft ignores it.
-    let validator = ToolSchemaValidator::compile(&Tool {
-        name: "t".to_owned(),
-        description: String::new(),
-        input_schema: json!({
+    let validator = ToolSchemaValidator::compile(&Tool::new(
+        "t",
+        "",
+        json!({
             "type": "object",
             "properties": {
                 "pair": { "type": "array", "prefixItems": [{ "type": "string" }] }
             }
         }),
-        output_schema: None,
-        annotations: None,
-        execution: None,
-    })
+    ))
     .expect("compiles");
     assert!(validator.check_arguments(&json!({ "pair": ["a"] })).is_ok());
     assert!(validator.check_arguments(&json!({ "pair": [1] })).is_err());
@@ -222,14 +214,10 @@ fn a_schema_without_a_dialect_is_read_as_2020_12() {
 
 #[test]
 fn a_remote_reference_is_not_fetched() {
-    let refused = ToolSchemaValidator::compile(&Tool {
-        name: "t".to_owned(),
-        description: String::new(),
-        input_schema: json!({ "type": "object" }),
-        output_schema: Some(json!({ "$ref": "https://example.com/schema.json" })),
-        annotations: None,
-        execution: None,
-    })
+    let refused = ToolSchemaValidator::compile(
+        &Tool::new("t", "", json!({ "type": "object" }))
+            .with_output_schema(json!({ "$ref": "https://example.com/schema.json" })),
+    )
     .expect_err("an external document is never resolved");
     assert_eq!(refused.schema, SchemaRole::Output);
 }

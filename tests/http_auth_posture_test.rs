@@ -45,14 +45,11 @@ struct WhoAmI;
 #[async_trait]
 impl McpTool<State> for WhoAmI {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "whoami".to_owned(),
-            description: "Reports the resolved caller".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(
+            "whoami",
+            "Reports the resolved caller",
+            json!({"type": "object"}),
+        )
     }
 
     async fn execute(&self, _state: &Arc<State>, ctx: &ToolContext, _args: Value) -> ToolResponse {

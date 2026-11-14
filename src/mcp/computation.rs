@@ -96,20 +96,15 @@ pub trait Computation: Send + Sync {
 #[async_trait]
 impl<S: Send + Sync + ?Sized, T: Computation> McpTool<S> for T {
     fn definition(&self) -> Tool {
-        Tool {
-            name: T::NAME.to_owned(),
-            description: T::DESCRIPTION.to_owned(),
-            input_schema: schema_for!(T::Input).to_value(),
-            annotations: Some(ToolAnnotations {
+        Tool::new(T::NAME, T::DESCRIPTION, schema_for!(T::Input).to_value())
+            .with_annotations(ToolAnnotations {
                 title: Some(T::TITLE.to_owned()),
                 read_only_hint: Some(true),
                 destructive_hint: Some(false),
                 idempotent_hint: Some(true),
                 open_world_hint: Some(false),
-            }),
-            output_schema: Some(schema_for!(T::Output).to_value()),
-            execution: None,
-        }
+            })
+            .with_output_schema(schema_for!(T::Output).to_value())
     }
 
     async fn execute(&self, _state: &Arc<S>, _ctx: &ToolContext, arguments: Value) -> ToolResponse {

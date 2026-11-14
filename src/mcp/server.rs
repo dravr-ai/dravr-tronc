@@ -1966,6 +1966,90 @@ mod tests {
         assert!(result.get("cacheScope").is_none());
     }
 
+    /// Answers with one text block and a `_meta` key a host reads.
+    struct LabelledTool;
+
+    /// The key [`LabelledTool`] writes its `_meta` value under.
+    const LABELS_KEY: &str = "ai.dravr.vault/labels";
+
+    #[async_trait::async_trait]
+    impl McpTool<TestState> for LabelledTool {
+        fn definition(&self) -> Tool {
+            Tool::new(
+                "labelled_tool",
+                "Returns a labelled answer",
+                json!({"type": "object"}),
+            )
+        }
+
+        async fn execute(
+            &self,
+            _state: &Arc<TestState>,
+            _ctx: &ToolContext,
+            _arguments: Value,
+        ) -> ToolResponse {
+            ToolResponse::text("labelled".to_owned())
+                .with_meta(LABELS_KEY, json!({ "v": 1, "tier": "T1" }))
+        }
+    }
+
+    fn make_labelled_server() -> McpServer<TestState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(LabelledTool));
+        McpServer::new("test-server", "0.1.0", registry, Arc::new(TestState))
+    }
+
+    #[tokio::test]
+    async fn modern_tools_call_keeps_the_result_meta_beside_result_type() {
+        let server = make_labelled_server();
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 27, "method": "tools/call",
+                "params": {{ "name": "labelled_tool", "arguments": {{}}, {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"],
+            json!({ LABELS_KEY: { "v": 1, "tier": "T1" } }),
+            "framing a modern result adds resultType and leaves the tool's _meta whole"
+        );
+        assert_eq!(result["content"][0]["text"], "labelled");
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_call_carries_the_result_meta_as_is() {
+        let server = make_labelled_server();
+        let raw = r#"{"jsonrpc": "2.0", "id": 28, "method": "tools/call",
+            "params": { "name": "labelled_tool", "arguments": {} } }"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert_eq!(
+            result["_meta"],
+            json!({ LABELS_KEY: { "v": 1, "tier": "T1" } }),
+            "a 2025-11-25 result carries the tool's _meta unchanged"
+        );
+        assert!(
+            result.get("resultType").is_none(),
+            "a legacy result gains no resultType"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_sets_no_meta_answers_without_a_meta_key() {
+        let server = make_server();
+        let raw = format!(
+            r#"{{"jsonrpc": "2.0", "id": 29, "method": "tools/call",
+                "params": {{ "name": "ping_tool", "arguments": {{}}, {MODERN_META} }} }}"#
+        );
+        let resp = server.handle_raw(&raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        assert!(
+            result.get("_meta").is_none(),
+            "no _meta key is invented for a tool that set none"
+        );
+    }
+
     #[tokio::test]
     async fn modern_unsupported_version_returns_minus_32004() {
         let server = make_server();

@@ -73,14 +73,7 @@ struct Fixture {
 #[async_trait]
 impl McpTool<()> for Fixture {
     fn definition(&self) -> Tool {
-        Tool {
-            name: self.name.to_owned(),
-            description: self.description.to_owned(),
-            input_schema: self.input_schema.clone(),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(self.name, self.description, self.input_schema.clone())
     }
 
     async fn execute(
@@ -283,14 +276,7 @@ impl McpTool<()> for ChannelFixture {
             | Conversation::ElicitationDefaults
             | Conversation::ElicitationEnums => no_arguments(),
         };
-        Tool {
-            name: self.name.to_owned(),
-            description: self.description.to_owned(),
-            input_schema,
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(self.name, self.description, input_schema)
     }
 
     async fn execute(&self, _state: &Arc<()>, ctx: &ToolContext, arguments: Value) -> ToolResponse {
