@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.9.0] — 2026-11-17
+
+### Added
+
+- feat(notifications): SlackClient can be told its API origin
+
+
 ## [6.8.0] — 2026-11-12
 
 ### Added
