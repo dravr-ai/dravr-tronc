@@ -240,7 +240,7 @@ async fn null_columns_and_database_defaults_decode() {
 
 /// Text a date-time column may hold: each shape sqlx's decoder knows, and
 /// text it must reject.
-const DATETIME_TEXT: [&str; 34] = [
+const DATETIME_TEXT: [&str; 36] = [
     "2026-11-17T10:00:00+00:00",
     "2026-11-17T10:00:00.100+00:00",
     "2026-11-17T10:00:00Z",
@@ -266,6 +266,8 @@ const DATETIME_TEXT: [&str; 34] = [
     "2026-1-7 1:2:3",
     "2026-11-17 23:59:60",
     "2026-11-17 10:00:00+24:00",
+    "2026-11-17T10:00:00+24:00",
+    "2026-11-17t10:00:00+24:00",
     "2026-11-17 10:00:00 UTC",
     "2026-11-17",
     "10:00:00",
@@ -307,7 +309,7 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
             rejected += 1;
         }
     }
-    assert_eq!((accepted, rejected), (26, 8));
+    assert_eq!((accepted, rejected), (27, 9));
 
     // The offset-less shape means UTC; a stored offset is applied for an
     // instant and kept for a local reading.

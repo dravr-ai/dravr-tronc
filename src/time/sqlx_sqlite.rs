@@ -92,17 +92,22 @@ type Reading = (DateTime, i32);
 const UNIX_EPOCH: DateTime = DateTime::constant(1970, 1, 1, 0, 0, 0, 0);
 
 fn reading_from_text(value: &str) -> Option<Reading> {
-    let fields = text::strict_rfc3339_fields(value).ok().or_else(|| {
-        DATETIME_FORMATS
-            .into_iter()
-            .find_map(|format| text::parse(value, format).ok())
-    })?;
-    match fields.reading() {
-        Ok((civil, offset)) => Some((civil, offset.unwrap_or(0))),
-        // sqlx's chrono decoder reads the date and time alone, as UTC, when
-        // the offset is not one: `+24:00` and beyond.
-        Err(_) => Some((fields.datetime().ok()?, 0)),
+    let strict = text::strict_rfc3339_fields(value)
+        .and_then(|fields| fields.reading())
+        .ok();
+    if let Some((civil, offset)) = strict {
+        return Some((civil, offset.unwrap_or(0)));
     }
+    DATETIME_FORMATS.into_iter().find_map(|format| {
+        let fields = text::parse(value, format).ok()?;
+        match fields.reading() {
+            Ok((civil, offset)) => Some((civil, offset.unwrap_or(0))),
+            // sqlx's chrono decoder reads the date and time alone, as UTC,
+            // when one of these shapes carries an offset that is not one:
+            // `+24:00` and beyond.
+            Err(_) => Some((fields.datetime().ok()?, 0)),
+        }
+    })
 }
 
 /// The UTC reading `seconds` and `nanos` after the Unix epoch.
