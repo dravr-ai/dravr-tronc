@@ -41,7 +41,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// `PostHog` records when it happened rather than when it arrived, and a
 /// resend is the same event — `PostHog` deduplicates on the uuid — rather
 /// than a second one. A 5xx or a transport error is resent with backoff, up
-/// to [`MAX_ATTEMPTS`] sends; any other status is final, because resending
+/// to three sends; any other status is final, because resending
 /// the same body cannot change the answer.
 ///
 /// The client carries no identity, consent, or tier policy — callers (the
