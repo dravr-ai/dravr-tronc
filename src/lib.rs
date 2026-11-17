@@ -49,6 +49,7 @@ pub mod server;
 pub mod service_client;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+pub mod time;
 
 // Convenience re-exports
 pub use mcp::auth::{AuthError, AuthHook};

@@ -15,6 +15,7 @@ use tracing::{error, warn};
 
 use super::SlackConfig;
 use crate::http_client::describe_request_error;
+use crate::time::Instant;
 
 /// Origin of the Slack Web API: where every method is called unless a caller
 /// names another with [`SlackClient::with_api_origin`]
@@ -356,7 +357,7 @@ impl SlackClient {
         let ts: u64 = timestamp
             .parse()
             .map_err(|_| SignatureError::MissingHeader("x-slack-request-timestamp"))?;
-        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let now = u64::try_from(Instant::now().epoch_seconds()).unwrap_or(0);
         let age = now.saturating_sub(ts);
         if age > MAX_TIMESTAMP_AGE_SECS {
             return Err(SignatureError::TimestampExpired(age));
@@ -847,7 +848,7 @@ mod tests {
         // Regression: the valid-signature path must accept a correctly computed
         // HMAC when compared in constant time (ct_eq), not only reject bad ones.
         let secret = "test_signing_secret";
-        let now = chrono::Utc::now().timestamp().to_string();
+        let now = Instant::now().epoch_seconds().to_string();
         let body = b"payload=hello";
 
         let basestring = format!(
@@ -879,7 +880,7 @@ mod tests {
         let client = SlackClient::new(&config);
 
         // Use a recent timestamp so we don't hit the expiry check
-        let now = chrono::Utc::now().timestamp().to_string();
+        let now = Instant::now().epoch_seconds().to_string();
         let result = client.verify_signature(&now, "v0=badhash", b"body");
         assert!(matches!(result, Err(SignatureError::InvalidSignature)));
     }
