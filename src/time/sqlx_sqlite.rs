@@ -19,20 +19,24 @@
 //! means UTC, which is what `datetime('now')` and `CURRENT_TIMESTAMP`
 //! write), an integer as Unix seconds and a real as a Julian day.
 //!
+//! A [`CivilDateTime`] is read as the value shows it, over its whole range.
+//! An [`Instant`] reaches about a day less far at each end; a value out
+//! there is an error for an `Instant`, never a shifted one.
+//!
 //! One difference a caller cannot see through `bind` or `get`:
 //! `Type::type_info()` reports `TEXT` where chrono's impl reported
 //! `DATETIME`, because sqlx keeps that constructor private. SQLite binds by
 //! value, and `compatible()` accepts the same column types as before.
 
 use jiff::civil::DateTime;
-use jiff::tz::Offset;
+use jiff::SignedDuration;
 use sqlx::encode::IsNull;
 use sqlx::error::BoxDynError;
 use sqlx::sqlite::{SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef};
 use sqlx::{Decode, Encode, Sqlite, Type, TypeInfo, ValueRef};
 
 use super::text;
-use super::{CivilDate, CivilDateTime, CivilTime, Instant};
+use super::{CivilDate, CivilDateTime, CivilTime, Instant, TimeError};
 
 /// The date-time shapes sqlx's chrono decoder tries after RFC 3339, in its
 /// order.
@@ -77,25 +81,38 @@ fn storage(value: &SqliteValueRef<'_>) -> Storage {
     }
 }
 
-/// An instant and the offset, in seconds east of UTC, its text was written
-/// with.
-type Fixed = (Instant, i32);
+/// A date and time as the stored value shows them, and the offset in seconds
+/// east of UTC they were written with. Text without an offset, an integer
+/// and a real are all UTC.
+///
+/// A local reading is kept as read and never passed through an instant: the
+/// calendar reaches about a day further than [`Instant`] at each end.
+type Reading = (DateTime, i32);
 
-fn datetime_from_text(value: &str) -> Option<Fixed> {
-    if let Ok(found) = Instant::parse_from_rfc3339_with_offset(value) {
-        return Some(found);
+const UNIX_EPOCH: DateTime = DateTime::constant(1970, 1, 1, 0, 0, 0, 0);
+
+fn reading_from_text(value: &str) -> Option<Reading> {
+    let fields = text::strict_rfc3339_fields(value).ok().or_else(|| {
+        DATETIME_FORMATS
+            .into_iter()
+            .find_map(|format| text::parse(value, format).ok())
+    })?;
+    match fields.reading() {
+        Ok((civil, offset)) => Some((civil, offset.unwrap_or(0))),
+        // sqlx's chrono decoder reads the date and time alone, as UTC, when
+        // the offset is not one: `+24:00` and beyond.
+        Err(_) => Some((fields.datetime().ok()?, 0)),
     }
-    DATETIME_FORMATS.into_iter().find_map(|format| {
-        let parsed = text::parse(value, format).ok()?;
-        if let Ok((timestamp, offset)) = parsed.timestamp() {
-            return Some((Instant(timestamp), offset));
-        }
-        let utc = Offset::UTC.to_timestamp(parsed.datetime().ok()?).ok()?;
-        Some((Instant(utc), 0))
-    })
 }
 
-fn datetime_from_julian_day(value: f64) -> Option<Fixed> {
+/// The UTC reading `seconds` and `nanos` after the Unix epoch.
+fn reading_at_epoch(seconds: i64, nanos: u32) -> Option<Reading> {
+    let since = SignedDuration::from_secs(seconds)
+        .checked_add(SignedDuration::from_nanos(i64::from(nanos)))?;
+    Some((UNIX_EPOCH.checked_add(since).ok()?, 0))
+}
+
+fn reading_from_julian_day(value: f64) -> Option<Reading> {
     let timestamp = (value - UNIX_EPOCH_JULIAN_DAY) * SECONDS_PER_DAY;
     if !timestamp.is_finite() {
         return None;
@@ -104,27 +121,27 @@ fn datetime_from_julian_day(value: f64) -> Option<Fixed> {
     // fraction counted forward from them.
     let seconds = timestamp.trunc() as i64;
     let nanos = (timestamp.fract() * 1E9).abs() as u32;
-    let instant = Instant::from_epoch_seconds_and_nanos(seconds, nanos).ok()?;
-    Some((instant, 0))
+    reading_at_epoch(seconds, nanos)
 }
 
-fn decode_datetime(value: SqliteValueRef<'_>) -> Result<Fixed, BoxDynError> {
+fn decode_reading(value: SqliteValueRef<'_>) -> Result<Reading, BoxDynError> {
     let found = match storage(&value) {
         Storage::Text => {
             let text = <&str as Decode<Sqlite>>::decode(value)?;
-            return datetime_from_text(text)
+            return reading_from_text(text)
                 .ok_or_else(|| format!("invalid datetime: {text}").into());
         }
-        Storage::Integer => {
-            let seconds = <i64 as Decode<Sqlite>>::decode(value)?;
-            Instant::from_epoch_seconds(seconds)
-                .ok()
-                .map(|instant| (instant, 0))
-        }
-        Storage::Real => datetime_from_julian_day(<f64 as Decode<Sqlite>>::decode(value)?),
+        Storage::Integer => reading_at_epoch(<i64 as Decode<Sqlite>>::decode(value)?, 0),
+        Storage::Real => reading_from_julian_day(<f64 as Decode<Sqlite>>::decode(value)?),
         Storage::Other => None,
     };
     found.ok_or_else(|| "invalid datetime: not text, an integer or a real".into())
+}
+
+/// The instant of a reading, or [`TimeError::OutOfRange`] when the reading is
+/// in the last day of the calendar, past the last instant.
+fn instant_of((civil, offset): Reading) -> Result<Instant, TimeError> {
+    text::timestamp_at(civil, offset).map(Instant)
 }
 
 fn datetime_compatible(ty: &SqliteTypeInfo) -> bool {
@@ -156,7 +173,7 @@ impl<'q> Encode<'q, Sqlite> for Instant {
 
 impl<'r> Decode<'r, Sqlite> for Instant {
     fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
-        decode_datetime(value).map(|(instant, _)| instant)
+        Ok(instant_of(decode_reading(value)?)?)
     }
 }
 
@@ -180,9 +197,7 @@ impl<'r> Decode<'r, Sqlite> for CivilDateTime {
     /// The reading as written: a value stored with an offset decodes to its
     /// local date and time at that offset, as sqlx's chrono decoder gave.
     fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
-        let (instant, offset) = decode_datetime(value)?;
-        let local: DateTime = Offset::from_seconds(offset)?.to_datetime(instant.0);
-        Ok(Self(local))
+        decode_reading(value).map(|(local, _)| Self(local))
     }
 }
 
@@ -232,5 +247,27 @@ impl<'r> Decode<'r, Sqlite> for CivilTime {
             .into_iter()
             .find_map(|format| Self::parse_from_str(text, format).ok())
             .ok_or_else(|| format!("invalid time: {text}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{instant_of, Instant, TimeError, UNIX_EPOCH};
+
+    #[test]
+    fn an_offset_no_clock_has_is_out_of_range_not_an_engine_error() {
+        assert_eq!(
+            instant_of((UNIX_EPOCH, 3600)).map(Instant::epoch_seconds),
+            Ok(-3600)
+        );
+        // Past 25:59:59 the engine has no such offset; its own error type
+        // stays inside.
+        for offset in [93_600, 100_000, i32::MAX, i32::MIN] {
+            assert_eq!(
+                instant_of((UNIX_EPOCH, offset)),
+                Err(TimeError::OutOfRange),
+                "{offset}"
+            );
+        }
     }
 }

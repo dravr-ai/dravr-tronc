@@ -629,20 +629,35 @@ impl Parsed {
         Ok(DateTime::from_parts(self.date()?, self.time()?))
     }
 
+    /// The date and time read, as the text showed them, and the offset read
+    /// with them in seconds east of UTC, when the text had one. The offset
+    /// must be less than a day.
+    pub(super) fn reading(&self) -> Result<(DateTime, Option<i32>), TimeError> {
+        let offset = match self.offset {
+            Some(offset) if offset.abs() >= SECONDS_PER_DAY => return Err(TimeError::OutOfRange),
+            Some(offset) => Some(i32::try_from(offset).map_err(|_| TimeError::OutOfRange)?),
+            None => None,
+        };
+        Ok((self.datetime()?, offset))
+    }
+
     /// The instant read and its offset in seconds east of UTC. The offset is
     /// required, and must be less than a day.
     pub(super) fn timestamp(&self) -> Result<(Timestamp, i32), TimeError> {
-        let offset = self.offset.ok_or(TimeError::InvalidText)?;
-        if offset.abs() >= SECONDS_PER_DAY {
-            return Err(TimeError::OutOfRange);
+        if self.offset.is_none() {
+            return Err(TimeError::InvalidText);
         }
-        let seconds = i32::try_from(offset).map_err(|_| TimeError::OutOfRange)?;
-        let civil = self.datetime()?;
-        let timestamp = Offset::from_seconds(seconds)
-            .and_then(|offset| offset.to_timestamp(civil))
-            .map_err(|_| TimeError::OutOfRange)?;
-        Ok((timestamp, seconds))
+        let (civil, offset) = self.reading()?;
+        let seconds = offset.unwrap_or(0);
+        Ok((timestamp_at(civil, seconds)?, seconds))
     }
+}
+
+/// The instant at which a clock `offset_seconds` east of UTC shows `civil`.
+pub(super) fn timestamp_at(civil: DateTime, offset_seconds: i32) -> Result<Timestamp, TimeError> {
+    Offset::from_seconds(offset_seconds)
+        .and_then(|offset| offset.to_timestamp(civil))
+        .map_err(|_| TimeError::OutOfRange)
 }
 
 /// How the colon between an offset's hours and minutes is read.
@@ -999,6 +1014,12 @@ pub(super) fn relaxed_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError>
 /// Every field has its full width, the separator is `T`, `t` or a space, and
 /// the offset is `Z`, `z` or `±hh:mm` with its colon.
 pub(super) fn strict_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError> {
+    strict_rfc3339_fields(text)?.timestamp()
+}
+
+/// The fields of strict RFC 3339 text, before they are placed on the time
+/// line: for a reader that wants the date and time as written.
+pub(super) fn strict_rfc3339_fields(text: &str) -> Result<Parsed, TimeError> {
     let mut parsed = Parsed::default();
     let rest = fixed(text, 4, &mut parsed.year, 0..=9999)?;
     let rest = rest.strip_prefix('-').ok_or(TimeError::InvalidText)?;
@@ -1023,7 +1044,7 @@ pub(super) fn strict_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError> 
     }
     let (rest, seconds) = offset(rest, Colon::Required, true, false)?;
     set(&mut parsed.offset, seconds, i64::MIN..=i64::MAX)?;
-    finished(parsed, rest)?.timestamp()
+    finished(parsed, rest)
 }
 
 /// Reads a field of exactly `width` digits.

@@ -339,6 +339,82 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
     );
 }
 
+/// Local readings at the two ends of the range of `CivilDateTime`, where no
+/// instant exists: an `Instant` stops about 26 hours short of each end.
+/// Text without an offset, text with one, Unix seconds and a Julian day.
+const EDGE_READINGS: [&str; 14] = [
+    "SELECT '9999-12-31 23:59:59.999999999'",
+    "SELECT '9999-12-31T23:59:59'",
+    "SELECT '9999-12-31 23:59'",
+    "SELECT '9999-12-30 22:00:01'",
+    "SELECT '-9999-01-01 00:00:00'",
+    "SELECT '-9999-01-01T00:00:00.000000001'",
+    "SELECT '-9999-01-02 01:59:58'",
+    "SELECT '9999-12-31T23:59:59Z'",
+    "SELECT '9999-12-31T23:59:59.5+00:00'",
+    "SELECT '9999-12-31 23:59:59-05:00'",
+    "SELECT '9999-12-31 23:59+14:00'",
+    "SELECT '-9999-01-01 00:00:00+05:30'",
+    "SELECT 253402300799",
+    "SELECT 5373484.25",
+];
+
+#[tokio::test]
+async fn a_local_reading_decodes_over_its_whole_range() {
+    let mut connection = database().await;
+    for sql in EDGE_READINGS {
+        let row = sqlx::query(sql).fetch_one(&mut connection).await.unwrap();
+        let naive = row.try_get::<NaiveDateTime, _>(0).unwrap();
+        let local = row.try_get::<CivilDateTime, _>(0).ok();
+        assert_eq!(
+            local.map(|l| format!("{l:?}")),
+            Some(format!("{naive:?}")),
+            "{sql}"
+        );
+        // No instant is that far out, so none is invented.
+        assert!(row.try_get::<Instant, _>(0).is_err(), "{sql}");
+    }
+    let max: CivilDateTime = sqlx::query_scalar("SELECT ?")
+        .bind(CivilDateTime::MAX)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let min: CivilDateTime = sqlx::query_scalar("SELECT ?")
+        .bind(CivilDateTime::MIN)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!((min, max), (CivilDateTime::MIN, CivilDateTime::MAX));
+}
+
+#[tokio::test]
+async fn an_instant_out_of_range_is_refused_whatever_its_offset() {
+    // 21:30 at UTC-5 is 02:30 UTC the next day, past the last instant. Its
+    // offset is not dropped to make it fit.
+    let mut connection = database().await;
+    for text in [
+        "9999-12-30 21:30:00-05:00",
+        "9999-12-30T21:30-05:00",
+        "9999-12-30T21:30:00.5-05:00",
+        "-9999-01-02 03:00:00+05:00",
+    ] {
+        let row = sqlx::query("SELECT ?")
+            .bind(text)
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert!(row.try_get::<DateTime<Utc>, _>(0).is_ok(), "{text}");
+        assert!(row.try_get::<Instant, _>(0).is_err(), "{text}");
+        let naive = row.try_get::<NaiveDateTime, _>(0).unwrap();
+        let local = row.try_get::<CivilDateTime, _>(0).ok();
+        assert_eq!(
+            local.map(|l| format!("{l:?}")),
+            Some(format!("{naive:?}")),
+            "{text}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn integers_and_reals_decode_as_sqlx_chrono_decodes_them() {
     let mut connection = database().await;
