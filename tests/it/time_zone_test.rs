@@ -68,6 +68,7 @@ fn a_zone_is_found_by_its_exact_name_only() {
         "AMERICA/TORONTO",
         "utc",
         "Etc/Unknown",
+        "Factory",
         "Mars/Olympus_Mons",
         "",
         " America/Toronto",

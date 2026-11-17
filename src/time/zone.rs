@@ -25,6 +25,11 @@ fn database() -> &'static TimeZoneDatabase {
     DATABASE.get_or_init(TimeZoneDatabase::bundled)
 }
 
+/// The name the IANA database gives a machine whose zone was never set. It
+/// is in the compiled-in database and it is not a place: chrono-tz left it
+/// out, and so does [`Zone::from_name`].
+const PLACEHOLDER_ZONE: &str = "Factory";
+
 /// An IANA time zone, such as `America/Toronto`.
 ///
 /// Replaces `chrono_tz::Tz`. The zone rules come from a database compiled
@@ -124,9 +129,9 @@ impl Zone {
     pub fn from_name(name: &str) -> Result<Self, TimeError> {
         let unknown = || TimeError::UnknownZone(name.to_owned());
         let rules = database().get(name).map_err(|_| unknown())?;
-        // The database matches without regard to case and knows a
-        // placeholder zone; chrono-tz did neither.
-        if rules.is_unknown() || rules.iana_name() != Some(name) {
+        // The database matches without regard to case, and knows two
+        // placeholders for "no zone was set"; chrono-tz did neither.
+        if name == PLACEHOLDER_ZONE || rules.is_unknown() || rules.iana_name() != Some(name) {
             return Err(unknown());
         }
         Ok(Self {
@@ -285,6 +290,8 @@ impl FromStr for Zone {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono_tz::TZ_VARIANTS;
     use jiff::civil::date;
     use jiff::tz::TimeZone;
@@ -349,5 +356,23 @@ mod tests {
         // Every zone was walked and the walk found their changes of rule.
         assert!(zones >= TZ_VARIANTS.len(), "zones {zones}");
         assert!(changes > 30_000, "changes {changes}");
+    }
+
+    /// The names the database offers and `Zone` accepts are chrono-tz's
+    /// names: it knows no placeholder zone and no zone chrono-tz lacked.
+    #[test]
+    fn the_accepted_names_are_the_names_chrono_tz_had() {
+        let theirs: BTreeSet<&str> = TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+        let offered: Vec<String> = database()
+            .available()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        let extra: Vec<&str> = offered
+            .iter()
+            .map(String::as_str)
+            .filter(|name| Zone::from_name(name).is_ok() && !theirs.contains(name))
+            .collect();
+        assert_eq!(extra, Vec::<&str>::new());
+        assert!(offered.len() >= theirs.len(), "offered {}", offered.len());
     }
 }
