@@ -554,7 +554,14 @@ pub(super) struct Parsed {
     year: Option<i64>,
     month: Option<i64>,
     day: Option<i64>,
-    hour: Option<i64>,
+    /// Days since Monday, when the text named a weekday.
+    weekday: Option<i64>,
+    /// 0 for the morning, 1 for the afternoon: set by a 24-hour hour or by
+    /// AM/PM.
+    hour_div_12: Option<i64>,
+    /// The hour within its half of the day, 0 to 11: set by a 24-hour hour
+    /// or by a 12-hour one.
+    hour_mod_12: Option<i64>,
     minute: Option<i64>,
     second: Option<i64>,
     nanosecond: Option<i64>,
@@ -583,16 +590,27 @@ impl Parsed {
         let year = i16::try_from(year).map_err(|_| TimeError::OutOfRange)?;
         let month = i8::try_from(month).map_err(|_| TimeError::OutOfRange)?;
         let day = i8::try_from(day).map_err(|_| TimeError::OutOfRange)?;
-        Date::new(year, month, day).map_err(|_| TimeError::OutOfRange)
+        let date = Date::new(year, month, day).map_err(|_| TimeError::OutOfRange)?;
+        // A weekday in the text must be the date's own.
+        match self.weekday {
+            Some(named) if named != i64::from(date.weekday().to_monday_zero_offset()) => {
+                Err(TimeError::InvalidText)
+            }
+            _ => Ok(date),
+        }
     }
 
     /// The time of day read: hour and minute are required, the second
-    /// defaults to zero, and a fraction needs a second. A leap second `:60`
-    /// reads as `:59`: the types hold no leap seconds.
+    /// defaults to zero, and a fraction needs a second. A 12-hour hour needs
+    /// its AM or PM. A leap second `:60` reads as `:59`: the types hold no
+    /// leap seconds.
     pub(super) fn time(&self) -> Result<Time, TimeError> {
-        let (Some(hour), Some(minute)) = (self.hour, self.minute) else {
+        let (Some(half), Some(hour), Some(minute)) =
+            (self.hour_div_12, self.hour_mod_12, self.minute)
+        else {
             return Err(TimeError::InvalidText);
         };
+        let hour = half * 12 + hour;
         let second = self.second.unwrap_or(0).min(59);
         let nanosecond = match self.nanosecond {
             Some(nanos) if self.second.is_some() => nanos,
@@ -708,6 +726,31 @@ fn offset(
     Ok((rest, if negative { -seconds } else { seconds }))
 }
 
+/// Reads a month or weekday name: its first three letters in any case, and
+/// then, when `long` is given, the rest of the full name if it is there.
+/// Returns what follows and the name's index.
+fn name<'t, const N: usize>(
+    text: &'t str,
+    short: &[&str; N],
+    long: Option<&[&str; N]>,
+) -> Result<(&'t str, i64), TimeError> {
+    let (head, tail) = text.split_at_checked(3).ok_or(TimeError::InvalidText)?;
+    let index = short
+        .iter()
+        .position(|candidate| head.eq_ignore_ascii_case(candidate))
+        .ok_or(TimeError::InvalidText)?;
+    let suffix = long
+        .and_then(|names| names.get(index))
+        .and_then(|full| full.get(3..))
+        .unwrap_or("");
+    let rest = match tail.get(..suffix.len()) {
+        Some(found) if found.eq_ignore_ascii_case(suffix) => tail.get(suffix.len()..).unwrap_or(""),
+        _ => tail,
+    };
+    let index = i64::try_from(index).map_err(|_| TimeError::OutOfRange)?;
+    Ok((rest, index))
+}
+
 /// Reads exactly two ASCII digits.
 fn two_digits(text: &str) -> Option<(&str, i64)> {
     let bytes = text.as_bytes();
@@ -760,12 +803,35 @@ pub(super) fn scan<'t>(
                 set(&mut parsed.offset, seconds, i64::MIN..=i64::MAX)?;
                 text = rest;
             }
-            Item::ShortMonth => return Err(unsupported("%b")),
-            Item::LongMonth => return Err(unsupported("%B")),
-            Item::ShortWeekday => return Err(unsupported("%a")),
-            Item::LongWeekday => return Err(unsupported("%A")),
-            Item::LowerAmPm => return Err(unsupported("%P")),
-            Item::UpperAmPm => return Err(unsupported("%p")),
+            Item::ShortMonth | Item::LongMonth => {
+                let long = if matches!(*item, Item::LongMonth) {
+                    Some(&LONG_MONTHS)
+                } else {
+                    None
+                };
+                let (rest, index) = name(text, &SHORT_MONTHS, long)?;
+                set(&mut parsed.month, index + 1, 1..=12)?;
+                text = rest;
+            }
+            Item::ShortWeekday | Item::LongWeekday => {
+                let long = if matches!(*item, Item::LongWeekday) {
+                    Some(&LONG_WEEKDAYS)
+                } else {
+                    None
+                };
+                let (rest, index) = name(text, &SHORT_WEEKDAYS, long)?;
+                set(&mut parsed.weekday, index, 0..=6)?;
+                text = rest;
+            }
+            Item::LowerAmPm | Item::UpperAmPm => {
+                let half = match text.get(..2) {
+                    Some(word) if word.eq_ignore_ascii_case("am") => 0,
+                    Some(word) if word.eq_ignore_ascii_case("pm") => 1,
+                    _ => return Err(TimeError::InvalidText),
+                };
+                set(&mut parsed.hour_div_12, half, 0..=1)?;
+                text = text.get(2..).unwrap_or("");
+            }
             Item::ZoneName => return Err(unsupported("%Z")),
         }
     }
@@ -794,14 +860,29 @@ fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t 
         }
         Num::Month => (&mut parsed.month, 2, 1..=12),
         Num::Day => (&mut parsed.day, 2, 1..=31),
-        Num::Hour => (&mut parsed.hour, 2, 0..=23),
+        Num::Hour => {
+            let (rest, hour) = number(text, 1, 2)?;
+            if !(0..=23).contains(&hour) {
+                return Err(TimeError::OutOfRange);
+            }
+            set(&mut parsed.hour_div_12, hour / 12, 0..=1)?;
+            set(&mut parsed.hour_mod_12, hour % 12, 0..=11)?;
+            return Ok(rest);
+        }
+        Num::Hour12 => {
+            let (rest, hour) = number(text, 1, 2)?;
+            if !(1..=12).contains(&hour) {
+                return Err(TimeError::OutOfRange);
+            }
+            set(&mut parsed.hour_mod_12, hour % 12, 0..=11)?;
+            return Ok(rest);
+        }
         Num::Minute => (&mut parsed.minute, 2, 0..=59),
         Num::Second => (&mut parsed.second, 2, 0..=60),
         Num::Nanosecond => (&mut parsed.nanosecond, 9, 0..=999_999_999),
         Num::YearDiv100 => return Err(unsupported("%C")),
         Num::YearMod100 => return Err(unsupported("%y")),
         Num::Ordinal => return Err(unsupported("%j")),
-        Num::Hour12 => return Err(unsupported("%I")),
         Num::Timestamp => return Err(unsupported("%s")),
         Num::WeekdayFromMonday => return Err(unsupported("%u")),
         Num::DaysFromSunday => return Err(unsupported("%w")),
@@ -872,7 +953,8 @@ pub(super) fn relaxed_time(text: &str) -> Result<Time, TimeError> {
     let mut parsed = Parsed::default();
     let after_minute = scan(&mut parsed, text, &RELAXED_HOUR_MINUTE)?;
     let mut with_seconds = Parsed {
-        hour: parsed.hour,
+        hour_div_12: parsed.hour_div_12,
+        hour_mod_12: parsed.hour_mod_12,
         minute: parsed.minute,
         ..Parsed::default()
     };
@@ -926,7 +1008,10 @@ pub(super) fn strict_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError> 
     let rest = rest
         .strip_prefix(['t', 'T', ' '])
         .ok_or(TimeError::InvalidText)?;
-    let rest = fixed(rest, 2, &mut parsed.hour, 0..=23)?;
+    let mut hour = None;
+    let rest = fixed(rest, 2, &mut hour, 0..=23)?;
+    parsed.hour_div_12 = hour.map(|h| h / 12);
+    parsed.hour_mod_12 = hour.map(|h| h % 12);
     let rest = rest.strip_prefix(':').ok_or(TimeError::InvalidText)?;
     let rest = fixed(rest, 2, &mut parsed.minute, 0..=59)?;
     let rest = rest.strip_prefix(':').ok_or(TimeError::InvalidText)?;

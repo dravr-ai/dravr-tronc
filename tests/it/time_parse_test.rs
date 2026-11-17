@@ -629,20 +629,195 @@ fn weekdays_read_like_chrono() {
     }
 }
 
+/// Formats the satellites read provider and export text with: month and
+/// weekday names, a 12-hour clock, slashes.
+const NAMED_FORMATS: [&str; 14] = [
+    "%b %d, %Y, %I:%M:%S %p",
+    "%B %d, %Y",
+    "%b %d, %Y",
+    "%m/%d/%Y",
+    "%a, %d %b %Y",
+    "%A %Y-%m-%d",
+    "%A, %B %d, %Y %l:%M %P",
+    "%h %e %Y %H:%M %p",
+    "%I:%M %p",
+    "%I:%M:%S%p",
+    "%H:%M %p",
+    "%I:%M",
+    "%Y-%m-%d %a",
+    "%b%d%Y",
+];
+
+#[test]
+fn names_and_the_twelve_hour_clock_read_the_recorded_values() {
+    let read = |text, format| CivilDateTime::parse_from_str(text, format);
+    let expected = CivilDate::from_ymd(2026, 11, 17).unwrap();
+    assert_eq!(
+        read("Nov 17, 2026, 10:00:05 PM", "%b %d, %Y, %I:%M:%S %p"),
+        expected.and_hms(22, 0, 5)
+    );
+    assert_eq!(
+        read("nov 7, 2026, 12:00:05 am", "%b %d, %Y, %I:%M:%S %p").map(CivilDateTime::time),
+        CivilTime::from_hms(0, 0, 5)
+    );
+    assert_eq!(
+        CivilDate::parse_from_str("November 17, 2026", "%B %d, %Y"),
+        Ok(expected)
+    );
+    assert_eq!(
+        CivilDate::parse_from_str("11/17/2026", "%m/%d/%Y"),
+        Ok(expected)
+    );
+    assert_eq!(
+        CivilDate::parse_from_str("Tue, 17 Nov 2026", "%a, %d %b %Y"),
+        Ok(expected)
+    );
+    // A weekday that is not the date's own is refused, as chrono refuses it.
+    assert_eq!(
+        CivilDate::parse_from_str("Mon, 17 Nov 2026", "%a, %d %b %Y"),
+        Err(TimeError::InvalidText)
+    );
+    // A 12-hour hour without AM or PM names no time.
+    assert_eq!(
+        CivilTime::parse_from_str("10:00", "%I:%M"),
+        Err(TimeError::InvalidText)
+    );
+}
+
+/// Text in the shapes the named formats read, and near misses of each.
+fn named_inputs() -> Vec<String> {
+    let months = [
+        "Nov",
+        "nov",
+        "NOV",
+        "November",
+        "NOVEMBER",
+        "Novem",
+        "Sep",
+        "Sept",
+        "September",
+        "May",
+        "Mayo",
+        "Ma",
+        "Feb",
+        "february",
+        "F\u{e9}v",
+        "13",
+        "",
+    ];
+    let weekdays = ["Tue", "tuesday", "TUES", "Mon", "Sunday", "Tu", ""];
+    let clocks = [
+        "10:00:05 AM",
+        "10:00:05 pm",
+        "12:00:00 AM",
+        "12:30:00 PM",
+        "0:00:00 AM",
+        "13:00:00 PM",
+        "10:00:05",
+        "10:00:05 A",
+        "10:00:05 XM",
+        "10:00:05AM",
+        "1:05 pm",
+        "01:05 Pm",
+        "22:15 PM",
+        "10:15 AM",
+        "10:00:05 \u{202f}PM",
+    ];
+    let mut inputs: Vec<String> = Vec::new();
+    for month in months {
+        for clock in clocks.iter().take(4) {
+            inputs.push(format!("{month} 17, 2026, {clock}"));
+        }
+        for day in ["17", "7", "07", "31", "0"] {
+            inputs.push(format!("{month} {day}, 2026"));
+            inputs.push(format!("{month}{day}2026"));
+            inputs.push(format!("Tue, {day} {month} 2026"));
+            inputs.push(format!("{month} {day} 2026 22:15 PM"));
+        }
+    }
+    for weekday in weekdays {
+        inputs.push(format!("{weekday} 2026-11-17"));
+        inputs.push(format!("2026-11-17 {weekday}"));
+        inputs.push(format!("{weekday}, 17 Nov 2026"));
+        inputs.push(format!("{weekday}, November 17, 2026 1:05 pm"));
+    }
+    inputs.extend(clocks.iter().map(|clock| (*clock).to_owned()));
+    inputs.extend(
+        [
+            "11/17/2026",
+            "1/7/2026",
+            "13/01/2026",
+            "11/31/2026",
+            "11-17-2026",
+        ]
+        .map(String::from),
+    );
+
+    inputs
+}
+
+#[test]
+fn names_and_the_twelve_hour_clock_read_like_chrono_across_generated_inputs() {
+    let inputs = named_inputs();
+    let (mut accepted, mut compared) = (0, 0);
+    for input in &inputs {
+        for format in NAMED_FORMATS {
+            let date = NaiveDate::parse_from_str(input, format)
+                .ok()
+                .map(ymd_chrono);
+            assert_eq!(
+                CivilDate::parse_from_str(input, format).ok().map(ymd_ours),
+                date,
+                "date {format} {input:?}"
+            );
+            let time = NaiveTime::parse_from_str(input, format)
+                .ok()
+                .map(hms_chrono);
+            assert_eq!(
+                CivilTime::parse_from_str(input, format).ok().map(hms_ours),
+                time,
+                "time {format} {input:?}"
+            );
+            let both = NaiveDateTime::parse_from_str(input, format)
+                .ok()
+                .and_then(reading_chrono);
+            assert_eq!(
+                CivilDateTime::parse_from_str(input, format)
+                    .ok()
+                    .map(reading_ours),
+                both,
+                "date-time {format} {input:?}"
+            );
+            accepted +=
+                u32::from(date.is_some()) + u32::from(time.is_some()) + u32::from(both.is_some());
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, inputs.len() * 14);
+    assert!(
+        compared > 6_000 && accepted > 200,
+        "{accepted} of {compared}"
+    );
+}
+
 #[test]
 fn a_format_that_cannot_be_read_is_an_error() {
     let unsupported = |spec: &str| TimeError::UnsupportedFormat(spec.to_owned());
     assert_eq!(
-        CivilDate::parse_from_str("17 Nov 2026", "%d %b %Y"),
-        Err(unsupported("%b"))
+        CivilDate::parse_from_str("17 11 26", "%d %m %y"),
+        Err(unsupported("%y"))
     );
     assert_eq!(
-        CivilTime::parse_from_str("10:00 AM", "%I:%M %p"),
-        Err(unsupported("%I"))
+        CivilDate::parse_from_str("2026 321", "%Y %j"),
+        Err(unsupported("%j"))
     );
     assert_eq!(
         CivilDate::parse_from_str("2026-11-17", "%Y-%m-%d %U"),
         Err(unsupported("%U"))
+    );
+    assert_eq!(
+        Instant::parse_from_str("1794909600", "%s"),
+        Err(unsupported("%s"))
     );
     // A date-time format with no offset names no instant.
     assert_eq!(

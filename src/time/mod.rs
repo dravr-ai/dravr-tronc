@@ -127,10 +127,12 @@
 //!
 //! | Written and read | Written only |
 //! |---|---|
-//! | `%Y` `%m` `%d` `%e` `%H` `%k` `%M` `%S` `%f` `%.f` `%.3f` `%.6f` `%.9f` `%z` `%:z` `%F` `%T` `%R` `%n` `%t` `%%` | `%C` `%y` `%j` `%I` `%l` `%p` `%P` `%a` `%A` `%b` `%h` `%B` `%u` `%w` `%s` `%D` `%Z` |
+//! | `%Y` `%m` `%d` `%e` `%H` `%k` `%I` `%l` `%M` `%S` `%f` `%.f` `%.3f` `%.6f` `%.9f` `%p` `%P` `%a` `%A` `%b` `%h` `%B` `%z` `%:z` `%F` `%T` `%R` `%n` `%t` `%%` | `%C` `%y` `%j` `%u` `%w` `%s` `%D` `%Z` |
 //!
 //! `%#z` is read only. `%-d`, `%_d` and `%0d` change the padding of a
-//! numeric specifier.
+//! numeric specifier. When read, a month or weekday name is matched in any
+//! case, a weekday must be the date's own, and a 12-hour `%I` needs its
+//! `%p`.
 
 mod civil_date;
 mod civil_datetime;
