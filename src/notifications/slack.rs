@@ -16,20 +16,25 @@ use tracing::{error, warn};
 use super::SlackConfig;
 use crate::http_client::describe_request_error;
 
-/// Slack API endpoint for posting messages
-const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+/// Origin of the Slack Web API: where every method is called unless a caller
+/// names another with [`SlackClient::with_api_origin`]
+const SLACK_API_ORIGIN: &str = "https://slack.com";
 
-/// Slack API endpoint for updating messages
-const SLACK_CHAT_UPDATE_URL: &str = "https://slack.com/api/chat.update";
+/// Path of the Slack API method that posts a message
+const SLACK_POST_MESSAGE_PATH: &str = "/api/chat.postMessage";
 
-/// Slack API endpoint for opening a modal
-const SLACK_VIEWS_OPEN_URL: &str = "https://slack.com/api/views.open";
+/// Path of the Slack API method that updates a message
+const SLACK_CHAT_UPDATE_PATH: &str = "/api/chat.update";
 
-/// Slack API endpoint that reserves an upload URL for one file
-const SLACK_GET_UPLOAD_URL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
+/// Path of the Slack API method that opens a modal
+const SLACK_VIEWS_OPEN_PATH: &str = "/api/views.open";
 
-/// Slack API endpoint that shares reserved, uploaded files into a channel
-const SLACK_COMPLETE_UPLOAD_URL: &str = "https://slack.com/api/files.completeUploadExternal";
+/// Path of the Slack API method that reserves an upload URL for one file
+const SLACK_GET_UPLOAD_URL_PATH: &str = "/api/files.getUploadURLExternal";
+
+/// Path of the Slack API method that shares reserved, uploaded files into a
+/// channel
+const SLACK_COMPLETE_UPLOAD_PATH: &str = "/api/files.completeUploadExternal";
 
 /// Maximum age of a Slack request timestamp before rejection (5 minutes)
 const MAX_TIMESTAMP_AGE_SECS: u64 = 300;
@@ -95,6 +100,7 @@ fn log_delivery_failure(result: SlackResult, channel: &str, operation: &str) {
 #[derive(Clone)]
 pub struct SlackClient {
     http: Client,
+    api_origin: String,
     bot_token: String,
     signing_secret: Option<String>,
 }
@@ -190,13 +196,42 @@ impl fmt::Debug for SlackFile {
 }
 
 impl SlackClient {
-    /// Create a new Slack client from configuration
+    /// Create a new Slack client from configuration, calling Slack's own API
+    /// at `https://slack.com`
     pub fn new(config: &SlackConfig) -> Self {
+        Self::with_api_origin(config, SLACK_API_ORIGIN)
+    }
+
+    /// Create a Slack client that calls the Web API at `api_origin` instead of
+    /// `https://slack.com`
+    ///
+    /// `api_origin` is a scheme and authority, e.g. `http://127.0.0.1:4010`; a
+    /// trailing slash is dropped. Every method keeps its path
+    /// (`/api/chat.postMessage`, `/api/chat.update`, `/api/views.open`,
+    /// `/api/files.getUploadURLExternal`, `/api/files.completeUploadExternal`),
+    /// so a stand-in serving those paths receives exactly what Slack would:
+    /// the bot token included, as the bearer of every one of those calls. An
+    /// origin other than Slack's is one trusted with that token.
+    ///
+    /// One request is not addressed by the origin: [`upload_file`](Self::upload_file)
+    /// posts the file's bytes to the `upload_url` the reservation answered
+    /// with, so the server at `api_origin` decides where they go.
+    pub fn with_api_origin(config: &SlackConfig, api_origin: impl Into<String>) -> Self {
+        let mut api_origin = api_origin.into();
+        while api_origin.ends_with('/') {
+            api_origin.pop();
+        }
         Self {
             http: Client::new(),
+            api_origin,
             bot_token: config.bot_token.clone(),
             signing_secret: config.signing_secret.clone(),
         }
+    }
+
+    /// The URL of the API method at `path` on this client's origin
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.api_origin)
     }
 
     /// Post a Block Kit message to a channel
@@ -205,6 +240,7 @@ impl SlackClient {
     pub fn post_message(&self, channel: &str, blocks: &Value) {
         let token = self.bot_token.clone();
         let client = self.http.clone();
+        let url = self.endpoint(SLACK_POST_MESSAGE_PATH);
         let channel = channel.to_owned();
         let payload = serde_json::json!({
             "channel": channel,
@@ -212,8 +248,7 @@ impl SlackClient {
         });
 
         tokio::spawn(async move {
-            let result =
-                send_slack_request(&client, SLACK_POST_MESSAGE_URL, &token, &payload).await;
+            let result = send_slack_request(&client, &url, &token, &payload).await;
             log_delivery_failure(result, &channel, "post_message");
         });
     }
@@ -226,13 +261,8 @@ impl SlackClient {
             "channel": channel,
             "blocks": blocks,
         });
-        send_slack_request(
-            &self.http,
-            SLACK_POST_MESSAGE_URL,
-            &self.bot_token,
-            &payload,
-        )
-        .await
+        let url = self.endpoint(SLACK_POST_MESSAGE_PATH);
+        send_slack_request(&self.http, &url, &self.bot_token, &payload).await
     }
 
     /// Update an existing Slack message (replace blocks)
@@ -241,6 +271,7 @@ impl SlackClient {
     pub fn update_message(&self, channel: &str, message_ts: &str, blocks: &Value) {
         let token = self.bot_token.clone();
         let client = self.http.clone();
+        let url = self.endpoint(SLACK_CHAT_UPDATE_PATH);
         let channel = channel.to_owned();
         let payload = serde_json::json!({
             "channel": channel,
@@ -249,7 +280,7 @@ impl SlackClient {
         });
 
         tokio::spawn(async move {
-            let result = send_slack_request(&client, SLACK_CHAT_UPDATE_URL, &token, &payload).await;
+            let result = send_slack_request(&client, &url, &token, &payload).await;
             log_delivery_failure(result, &channel, "update_message");
         });
     }
@@ -262,7 +293,8 @@ impl SlackClient {
     /// answers the interaction, and learns whether it opened.
     pub async fn open_view(&self, trigger_id: &str, view: &Value) -> SlackResult {
         let payload = views_open_payload(trigger_id, view);
-        send_slack_request(&self.http, SLACK_VIEWS_OPEN_URL, &self.bot_token, &payload).await
+        let url = self.endpoint(SLACK_VIEWS_OPEN_PATH);
+        send_slack_request(&self.http, &url, &self.bot_token, &payload).await
     }
 
     /// Upload `file` and share it into `channel`, with `initial_comment` as
@@ -281,14 +313,10 @@ impl SlackClient {
         initial_comment: Option<&str>,
     ) -> SlackResult {
         let reserve = reserve_upload_form(&file);
-        let reserved = match call_slack_form(
-            &self.http,
-            SLACK_GET_UPLOAD_URL_URL,
-            &self.bot_token,
-            &reserve,
-        )
-        .await
-        .and_then(|body| reserved_upload(&body))
+        let reserve_url = self.endpoint(SLACK_GET_UPLOAD_URL_PATH);
+        let reserved = match call_slack_form(&self.http, &reserve_url, &self.bot_token, &reserve)
+            .await
+            .and_then(|body| reserved_upload(&body))
         {
             Ok(reserved) => reserved,
             Err(failure) => return failure,
@@ -301,14 +329,8 @@ impl SlackClient {
         }
 
         let complete = complete_upload_form(&reserved.file_id, &title, channel, initial_comment);
-        match call_slack_form(
-            &self.http,
-            SLACK_COMPLETE_UPLOAD_URL,
-            &self.bot_token,
-            &complete,
-        )
-        .await
-        {
+        let complete_url = self.endpoint(SLACK_COMPLETE_UPLOAD_PATH);
+        match call_slack_form(&self.http, &complete_url, &self.bot_token, &complete).await {
             Ok(_) => SlackResult::Ok,
             Err(failure) => failure,
         }
@@ -508,7 +530,213 @@ fn complete_upload_form(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+    use tokio::time::timeout;
+
     use super::*;
+
+    /// How long a test waits for the stand-in to see a request.
+    const STAND_IN_WAIT: Duration = Duration::from_secs(5);
+
+    fn test_config() -> SlackConfig {
+        SlackConfig {
+            bot_token: "xoxb-test".into(),
+            error_channel: "#errors".into(),
+            signing_secret: None,
+        }
+    }
+
+    /// Read one HTTP request off `socket`: its request line, once the whole
+    /// body the head announced has arrived.
+    async fn read_request_line(socket: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let announced = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if body.len() >= announced {
+                    return head.lines().next().unwrap_or_default().to_owned();
+                }
+            }
+            let read = socket.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                return text.lines().next().unwrap_or_default().to_owned();
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Answer one connection the way Slack would, reporting its request line.
+    ///
+    /// A reservation names an upload URL on the stand-in itself, so the bytes
+    /// of an upload stay on loopback too.
+    async fn answer_as_slack(
+        mut socket: TcpStream,
+        addr: SocketAddr,
+        seen: UnboundedSender<String>,
+    ) {
+        let request_line = read_request_line(&mut socket).await;
+        let body = if request_line.contains("files.getUploadURLExternal") {
+            json!({ "ok": true, "upload_url": format!("http://{addr}/upload/F1"), "file_id": "F1" })
+        } else {
+            json!({ "ok": true })
+        }
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap(); // Safe: test assertion
+        seen.send(request_line).unwrap(); // Safe: test assertion
+    }
+
+    /// A loopback stand-in for the Slack Web API, and the request lines it saw.
+    async fn spawn_slack_stand_in() -> (SocketAddr, UnboundedReceiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); // Safe: test assertion
+        let addr = listener.local_addr().unwrap(); // Safe: test assertion
+        let (seen, requests) = unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(answer_as_slack(socket, addr, seen.clone()));
+            }
+        });
+        (addr, requests)
+    }
+
+    /// A client told to call the stand-in at `addr`.
+    ///
+    /// Its HTTP client takes no proxy and resolves `slack.com` to loopback, so
+    /// a client that ignored the origin it was given fails to connect on this
+    /// machine instead of reaching Slack.
+    fn client_for_stand_in(addr: SocketAddr) -> SlackClient {
+        let http = Client::builder()
+            .no_proxy()
+            .resolve("slack.com", SocketAddr::from(([127, 0, 0, 1], 0)))
+            .timeout(STAND_IN_WAIT)
+            .build()
+            .unwrap(); // Safe: test assertion
+        SlackClient {
+            http,
+            ..SlackClient::with_api_origin(&test_config(), format!("http://{addr}"))
+        }
+    }
+
+    /// The next request line the stand-in saw.
+    async fn next_request(requests: &mut UnboundedReceiver<String>) -> String {
+        timeout(STAND_IN_WAIT, requests.recv())
+            .await
+            .expect("the stand-in saw no request: the client called another origin") // Safe: test assertion
+            .unwrap() // Safe: test assertion
+    }
+
+    #[test]
+    fn the_default_origin_is_slack_and_every_method_keeps_its_url() {
+        // Written out, not derived from the constants: these are the URLs
+        // every consumer of `SlackClient::new` calls.
+        let client = SlackClient::new(&test_config());
+        assert_eq!(client.api_origin, "https://slack.com");
+        assert_eq!(
+            client.endpoint(SLACK_POST_MESSAGE_PATH),
+            "https://slack.com/api/chat.postMessage"
+        );
+        assert_eq!(
+            client.endpoint(SLACK_CHAT_UPDATE_PATH),
+            "https://slack.com/api/chat.update"
+        );
+        assert_eq!(
+            client.endpoint(SLACK_VIEWS_OPEN_PATH),
+            "https://slack.com/api/views.open"
+        );
+        assert_eq!(
+            client.endpoint(SLACK_GET_UPLOAD_URL_PATH),
+            "https://slack.com/api/files.getUploadURLExternal"
+        );
+        assert_eq!(
+            client.endpoint(SLACK_COMPLETE_UPLOAD_PATH),
+            "https://slack.com/api/files.completeUploadExternal"
+        );
+    }
+
+    #[test]
+    fn a_named_origin_drops_its_trailing_slash_and_keeps_the_path() {
+        let client = SlackClient::with_api_origin(&test_config(), "http://127.0.0.1:4010/");
+        assert_eq!(
+            client.endpoint(SLACK_POST_MESSAGE_PATH),
+            "http://127.0.0.1:4010/api/chat.postMessage"
+        );
+    }
+
+    #[tokio::test]
+    async fn awaited_calls_go_to_the_origin_the_caller_named() {
+        let (addr, mut requests) = spawn_slack_stand_in().await;
+        let client = client_for_stand_in(addr);
+
+        let posted = client.post_message_await("#general", &json!([])).await;
+        assert!(matches!(posted, SlackResult::Ok), "{posted:?}");
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/chat.postMessage HTTP/1.1"
+        );
+
+        let opened = client.open_view("trigger-1", &json!({})).await;
+        assert!(matches!(opened, SlackResult::Ok), "{opened:?}");
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/views.open HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_and_forget_calls_go_to_the_origin_the_caller_named() {
+        let (addr, mut requests) = spawn_slack_stand_in().await;
+        let client = client_for_stand_in(addr);
+
+        client.post_message("#general", &json!([]));
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/chat.postMessage HTTP/1.1"
+        );
+
+        client.update_message("#general", "1700000000.000100", &json!([]));
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/chat.update HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_reserves_and_completes_at_the_origin_the_caller_named() {
+        let (addr, mut requests) = spawn_slack_stand_in().await;
+        let client = client_for_stand_in(addr);
+
+        let file = SlackFile::new("chart.png", vec![1, 2, 3]);
+        let uploaded = client.upload_file("C123", file, None).await;
+        assert!(matches!(uploaded, SlackResult::Ok), "{uploaded:?}");
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/files.getUploadURLExternal HTTP/1.1"
+        );
+        // The bytes go where the reservation said, which the stand-in made itself.
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /upload/F1 HTTP/1.1"
+        );
+        assert_eq!(
+            next_request(&mut requests).await,
+            "POST /api/files.completeUploadExternal HTTP/1.1"
+        );
+    }
 
     #[test]
     fn renamed_channel_is_a_misconfigured_target() {

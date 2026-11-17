@@ -765,12 +765,17 @@ mod tests {
     use tracing::subscriber::with_default;
     use tracing_subscriber::layer::SubscriberExt as _;
 
+    /// A client on a refused loopback port: a test that routes an event to
+    /// Slack must not ask the real `slack.com`.
     fn dummy_slack() -> Arc<SlackClient> {
-        Arc::new(SlackClient::new(&SlackConfig {
-            bot_token: "xoxb-test".into(),
-            error_channel: "#errors".into(),
-            signing_secret: None,
-        }))
+        Arc::new(SlackClient::with_api_origin(
+            &SlackConfig {
+                bot_token: "xoxb-test".into(),
+                error_channel: "#errors".into(),
+                signing_secret: None,
+            },
+            "http://127.0.0.1:1",
+        ))
     }
 
     fn build_layer(
