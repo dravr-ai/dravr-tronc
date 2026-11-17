@@ -177,19 +177,30 @@ impl Zone {
     /// shifted or chosen for the caller.
     #[must_use]
     pub fn resolve(&self, local: CivilDateTime) -> LocalResolution {
-        let instant_at = |offset: Offset| offset.to_timestamp(local.0).ok().map(Instant);
-        match self.rules.to_ambiguous_timestamp(local.0).offset() {
-            AmbiguousOffset::Unambiguous { offset } => {
-                instant_at(offset).map_or(LocalResolution::None, LocalResolution::Single)
+        let (before, after) = match self.rules.to_ambiguous_timestamp(local.0).offset() {
+            AmbiguousOffset::Unambiguous { offset } => (offset, offset),
+            AmbiguousOffset::Gap { before, after } | AmbiguousOffset::Fold { before, after } => {
+                (before, after)
             }
-            AmbiguousOffset::Gap { .. } => LocalResolution::None,
-            AmbiguousOffset::Fold { before, after } => {
-                match (instant_at(before), instant_at(after)) {
-                    (Some(earlier), Some(later)) => LocalResolution::Ambiguous(earlier, later),
-                    (Some(only), None) | (None, Some(only)) => LocalResolution::Single(only),
-                    (None, None) => LocalResolution::None,
-                }
+        };
+        // The engine reports the offsets on each side of the nearest change
+        // of rule. An offset counts only when it is the zone's own at the
+        // instant it gives, so every answer shows `local` on the zone's
+        // clocks. That is no instant in a gap, and one where the rule
+        // changed and the clocks did not move.
+        let shown_at = |offset: Offset| {
+            let instant = offset.to_timestamp(local.0).ok()?;
+            (self.rules.to_offset(instant) == offset).then_some(Instant(instant))
+        };
+        match (shown_at(before), shown_at(after)) {
+            (Some(first), Some(second)) if first < second => {
+                LocalResolution::Ambiguous(first, second)
             }
+            (Some(first), Some(second)) if second < first => {
+                LocalResolution::Ambiguous(second, first)
+            }
+            (Some(only), _) | (None, Some(only)) => LocalResolution::Single(only),
+            (None, None) => LocalResolution::None,
         }
     }
 
@@ -269,5 +280,74 @@ impl FromStr for Zone {
 
     fn from_str(name: &str) -> Result<Self, TimeError> {
         Self::from_name(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono_tz::TZ_VARIANTS;
+    use jiff::civil::date;
+    use jiff::tz::TimeZone;
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{database, Instant, LocalResolution, Zone};
+
+    fn utc_midnight(year: i16) -> Timestamp {
+        TimeZone::UTC
+            .to_timestamp(date(year, 1, 1).at(0, 0, 0, 0))
+            .unwrap()
+    }
+
+    /// Whether the reading `zone` shows at `at` resolves back to `at`, and
+    /// every instant it resolves to shows that reading.
+    fn round_trips(zone: &Zone, at: Instant) -> bool {
+        let local = zone.civil_at(at);
+        match zone.resolve(local) {
+            LocalResolution::Single(only) => only == at,
+            LocalResolution::Ambiguous(first, second) => {
+                first < second
+                    && (first == at || second == at)
+                    && zone.civil_at(first) == local
+                    && zone.civil_at(second) == local
+            }
+            LocalResolution::None => false,
+        }
+    }
+
+    /// Covers every zone of the compiled-in database and every change of
+    /// rule it lists from 1900 to 2040: each quarter hour from three hours
+    /// before the change to three hours after it. The changes are the ones
+    /// the engine lists, so this reaches years the uniform grid in
+    /// `tests/it/time_zone_test.rs` does not, and that grid reaches readings
+    /// far from any listed change.
+    #[test]
+    fn a_reading_resolves_back_to_its_instant_around_every_change_of_rule() {
+        let (from, until) = (utc_midnight(1900), utc_midnight(2040));
+        let quarter = SignedDuration::from_mins(15);
+        let (mut zones, mut changes, mut broken) = (0, 0, Vec::new());
+        for name in database().available() {
+            let Ok(zone) = Zone::from_name(name.as_str()) else {
+                continue;
+            };
+            zones += 1;
+            for change in zone
+                .rules
+                .following(from)
+                .take_while(|change| change.timestamp() < until)
+            {
+                changes += 1;
+                for step in -12..=12 {
+                    let at = Instant(change.timestamp() + quarter * step);
+                    if !round_trips(&zone, at) {
+                        let local = zone.civil_at(at);
+                        broken.push(format!("{name} {at} {local}: {:?}", zone.resolve(local)));
+                    }
+                }
+            }
+        }
+        assert_eq!(broken, Vec::<String>::new());
+        // Every zone was walked and the walk found their changes of rule.
+        assert!(zones >= TZ_VARIANTS.len(), "zones {zones}");
+        assert!(changes > 30_000, "changes {changes}");
     }
 }

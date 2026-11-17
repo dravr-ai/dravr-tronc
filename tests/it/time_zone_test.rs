@@ -5,6 +5,8 @@
 // Copyright (c) 2026 dravr.ai
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 use chrono::offset::LocalResult;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
@@ -267,6 +269,10 @@ fn gaps_and_folds_match_chrono_tz_around_every_transition() {
         ("America/Sao_Paulo", (2018, 11, 4)),
         ("America/Havana", (2024, 11, 3)),
         ("America/Havana", (2024, 3, 10)),
+        // Greenland kept its offset here and only left daylight time: no
+        // reading that night happens twice.
+        ("America/Nuuk", (2023, 10, 29)),
+        ("America/Godthab", (2023, 10, 29)),
     ];
     let (mut none, mut twice, mut once) = (0, 0, 0);
     for (name, (year, month, day)) in transitions {
@@ -288,8 +294,122 @@ fn gaps_and_folds_match_chrono_tz_around_every_transition() {
         }
     }
     // Each kind of answer was actually exercised.
-    assert_eq!(none + twice + once, 14 * 576);
+    assert_eq!(none + twice + once, 16 * 576);
     assert!(none >= 70 && twice >= 70, "gaps {none}, folds {twice}");
+}
+
+#[test]
+fn a_change_of_rule_that_keeps_the_offset_is_not_a_fold() {
+    // On 2023-10-29 at 01:00 UTC Greenland left daylight time and kept
+    // UTC-2: the clocks did not move, so 23:00 to 23:59 happened once.
+    for name in ["America/Nuuk", "America/Godthab"] {
+        let zone = Zone::from_name(name).unwrap();
+        for (minute, utc) in [
+            (0, "2023-10-29T01:00:00Z"),
+            (30, "2023-10-29T01:30:00Z"),
+            (59, "2023-10-29T01:59:00Z"),
+        ] {
+            let local = date(2023, 10, 28).and_hms(23, minute, 0).unwrap();
+            assert_eq!(
+                zone.resolve(local),
+                LocalResolution::Single(instant(utc)),
+                "{name} {local}"
+            );
+            assert_eq!(zone.civil_at(instant(utc)), local, "{name} {utc}");
+        }
+    }
+}
+
+/// What must hold for every instant in every zone: the reading the clocks
+/// show at `at` resolves back to `at`, and every instant a reading resolves
+/// to shows that reading. Returns whether the reading was a fold.
+fn assert_round_trip(zone: &Zone, at: Instant) -> bool {
+    let local = zone.civil_at(at);
+    let resolved = zone.resolve(local);
+    let name = zone.name();
+    match resolved {
+        LocalResolution::Single(only) => {
+            assert_eq!(only, at, "{name} {at} shows {local}");
+            false
+        }
+        LocalResolution::Ambiguous(first, second) => {
+            assert!(first < second, "{name} {local}: {resolved:?}");
+            assert!(
+                first == at || second == at,
+                "{name} {at} shows {local}: {resolved:?}"
+            );
+            assert_eq!(zone.civil_at(first), local, "{name} {local}: {resolved:?}");
+            assert_eq!(zone.civil_at(second), local, "{name} {local}: {resolved:?}");
+            true
+        }
+        LocalResolution::None => panic!("{name} {at} shows {local}, which resolves to nothing"),
+    }
+}
+
+/// The first and last year of the grid below.
+const GRID_YEARS: (i32, i32) = (2022, 2026);
+const GRID_STEP_MINUTES: i64 = 30;
+
+/// Walks `names` over the grid from `first` to `end`, and returns how many
+/// instants it checked and how many of them were in a fold.
+fn walk_grid(names: &[&str], first: Instant, end: Instant) -> (u64, u64) {
+    let step = Elapsed::minutes(GRID_STEP_MINUTES);
+    let (mut instants, mut folds) = (0, 0);
+    for name in names {
+        let zone = Zone::from_name(name).unwrap();
+        let (mut at, mut day) = (first, zone.date_at(first));
+        while at < end {
+            folds += u64::from(assert_round_trip(&zone, at));
+            let today = zone.date_at(at);
+            if today != day {
+                // The first instant of a day is in that day and not after
+                // any instant of it.
+                let start = zone.start_of_day(today).unwrap();
+                assert_eq!(zone.date_at(start), today, "{name} {today}");
+                assert!(start <= at, "{name} {today}: {start} after {at}");
+                day = today;
+            }
+            at = at.checked_add(step).unwrap();
+            instants += 1;
+        }
+    }
+    (instants, folds)
+}
+
+/// Covers every chrono-tz zone name, every 30 minutes from 2022 through
+/// 2026: the years around today, the 2023 Greenland change, and the 2026
+/// changes in Canada, Cuba and Morocco. The grid is uniform on purpose: a
+/// change of rule that keeps the offset would be missed by a walk that
+/// looked for offset changes. Every transition of every zone from 1900 to
+/// 2040 is covered by the unit test beside `Zone`, which can list them.
+#[test]
+fn a_reading_resolves_back_to_its_instant_in_every_zone() {
+    let first = date(GRID_YEARS.0, 1, 1).at_midnight().and_utc().unwrap();
+    let end = date(GRID_YEARS.1 + 1, 1, 1)
+        .at_midnight()
+        .and_utc()
+        .unwrap();
+    let names: Vec<&str> = TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+    let workers = thread::available_parallelism().map_or(4, usize::from);
+    let (instants, folds) = (AtomicU64::new(0), AtomicU64::new(0));
+    // The scope joins every worker, and fails the test when one of them
+    // failed an assertion.
+    thread::scope(|scope| {
+        for chunk in names.chunks(names.len().div_ceil(workers)) {
+            let (instants, folds) = (&instants, &folds);
+            scope.spawn(move || {
+                let (checked, folded) = walk_grid(chunk, first, end);
+                instants.fetch_add(checked, Ordering::Relaxed);
+                folds.fetch_add(folded, Ordering::Relaxed);
+            });
+        }
+    });
+    let (instants, folds) = (instants.into_inner(), folds.into_inner());
+    let per_zone =
+        u64::try_from(end.signed_duration_since(first).num_minutes() / GRID_STEP_MINUTES).unwrap();
+    assert_eq!(instants, per_zone * u64::try_from(names.len()).unwrap());
+    // Folds were met: the grid is not all plain readings.
+    assert!(folds > 1_000, "folds {folds}");
 }
 
 #[test]
