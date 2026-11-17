@@ -293,12 +293,12 @@ const PLATFORM_FORMATS: [&str; 20] = [
 ];
 
 /// Every specifier the date types implement, alone and with each padding.
-const SPECIFIERS: [&str; 62] = [
+const SPECIFIERS: [&str; 64] = [
     "%Y", "%-Y", "%_Y", "%0Y", "%C", "%-C", "%_C", "%y", "%-y", "%_y", "%m", "%-m", "%_m", "%d",
     "%-d", "%_d", "%0d", "%e", "%-e", "%0e", "%j", "%-j", "%_j", "%H", "%-H", "%_H", "%k", "%-k",
     "%I", "%-I", "%_I", "%l", "%M", "%-M", "%_M", "%S", "%-S", "%_S", "%f", "%-f", "%_f", "%.f",
     "%.3f", "%.6f", "%.9f", "%a", "%A", "%b", "%h", "%B", "%p", "%P", "%z", "%:z", "%Z", "%s",
-    "%-s", "%F", "%T", "%R", "%D", "%u",
+    "%-s", "%0s", "%_s", "%F", "%T", "%R", "%D", "%u",
 ];
 
 #[test]
@@ -357,7 +357,24 @@ fn format_matches_chrono_for_every_specifier_and_value() {
             compared += 1;
         }
     }
-    assert_eq!((compared, skipped), (16 * 87 - 3, 3));
+    assert_eq!((compared, skipped), (16 * 89 - 3, 3));
+}
+
+#[test]
+fn unix_seconds_pad_to_nine_places_only_when_asked() {
+    let (small, _) = pair(0, 0);
+    let (early, _) = pair(-14_182_940, 123_000_000);
+    let (today, _) = pair(1_794_909_600, 0);
+    for (value, plain, zeros, spaces) in [
+        (small, "0", "000000000", "        0"),
+        (early, "-14182940", "-14182940", "-14182940"),
+        (today, "1794909600", "1794909600", "1794909600"),
+    ] {
+        assert_eq!(value.format("%s").as_deref(), Ok(plain));
+        assert_eq!(value.format("%-s").as_deref(), Ok(plain));
+        assert_eq!(value.format("%0s").as_deref(), Ok(zeros));
+        assert_eq!(value.format("%_s").as_deref(), Ok(spaces));
+    }
 }
 
 #[test]

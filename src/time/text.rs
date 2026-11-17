@@ -237,7 +237,8 @@ fn specifier<'a>(text: &'a str, items: &mut Vec<Item<'a>>) -> Result<&'a str, Ti
         'M' => items.push(numeric(Num::Minute, Pad::Zero)),
         'S' => items.push(numeric(Num::Second, Pad::Zero)),
         'f' => items.push(numeric(Num::Nanosecond, Pad::Zero)),
-        's' => items.push(numeric(Num::Timestamp, Pad::Zero)),
+        // Unpadded unless the format asks: `%0s` and `%_s` fill nine places.
+        's' => items.push(numeric(Num::Timestamp, Pad::None)),
         'u' => items.push(numeric(Num::WeekdayFromMonday, Pad::Zero)),
         'w' => items.push(numeric(Num::DaysFromSunday, Pad::Zero)),
         _ if pad.is_some() => return Err(whole(chars.as_str())),
@@ -435,7 +436,7 @@ fn write_numeric(
             // Whole seconds rounded down, as `timestamp()` gives before 1970.
             let seconds = i64::try_from(local.as_nanos().div_euclid(1_000_000_000))
                 .map_err(|_| TimeError::OutOfRange)?;
-            write_padded(out, 1, seconds - offset, pad, false)
+            write_padded(out, 9, seconds - offset, pad, false)
         }
         Num::WeekdayFromMonday => {
             write!(out, "{}", need_date("%u")?.weekday().to_monday_one_offset())
