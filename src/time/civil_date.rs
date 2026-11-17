@@ -173,16 +173,27 @@ impl CivilDate {
     /// February. `None` outside the range.
     #[must_use]
     pub fn checked_add_months(self, months: u32) -> Option<Self> {
-        let span = Span::new().try_months(months).ok()?;
-        self.0.checked_add(span).ok().map(Self)
+        self.shifted_by_months(i64::from(months))
     }
 
     /// The same day of the month `months` months earlier, or the last day of
     /// that month when it is shorter. `None` outside the range.
     #[must_use]
     pub fn checked_sub_months(self, months: u32) -> Option<Self> {
-        let span = Span::new().try_months(months).ok()?;
-        self.0.checked_sub(span).ok().map(Self)
+        self.shifted_by_months(-i64::from(months))
+    }
+
+    /// The same day of the month `months` months away, or the last day of
+    /// that month when it is shorter. Counted in whole months from year 0,
+    /// so one end of the range reaches the other; the engine's own month
+    /// span stops short of that.
+    fn shifted_by_months(self, months: i64) -> Option<Self> {
+        let index = i64::from(self.0.year()) * 12 + i64::from(self.0.month()) - 1 + months;
+        let year = i16::try_from(index.div_euclid(12)).ok()?;
+        let month = i8::try_from(index.rem_euclid(12) + 1).ok()?;
+        let first = Date::new(year, month, 1).ok()?;
+        let day = self.0.day().min(first.days_in_month());
+        Date::new(year, month, day).ok().map(Self)
     }
 
     /// This date in another year, or `None` when that year has no such date

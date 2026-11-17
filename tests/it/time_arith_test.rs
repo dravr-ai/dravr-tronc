@@ -217,6 +217,84 @@ fn the_utc_date_turns_at_midnight() {
 }
 
 #[test]
+fn months_reach_from_one_end_of_the_range_to_the_other() {
+    // 239,987 months separate January -9999 from December 9999.
+    assert_eq!(
+        CivilDate::MIN.checked_add_months(239_987),
+        Some(date(9999, 12, 1))
+    );
+    assert_eq!(
+        date(-9999, 1, 31).checked_add_months(239_987),
+        Some(CivilDate::MAX)
+    );
+    assert_eq!(
+        CivilDate::MAX.checked_sub_months(239_987),
+        Some(date(-9999, 1, 31))
+    );
+    assert_eq!(CivilDate::MIN.checked_add_months(239_988), None);
+    assert_eq!(CivilDate::MAX.checked_sub_months(239_988), None);
+    assert_eq!(CivilDate::MIN.checked_add_months(u32::MAX), None);
+    assert_eq!(CivilDate::MAX.checked_sub_months(u32::MAX), None);
+
+    // A date wherever chrono gives one inside the range, and the same one.
+    let in_range = |day: Option<NaiveDate>| day.filter(|d| (-9999..=9999).contains(&d.year()));
+    let days = [
+        CivilDate::MIN,
+        date(-9999, 1, 31),
+        date(-9999, 12, 31),
+        date(-4800, 2, 29),
+        date(-1, 12, 31),
+        date(0, 2, 29),
+        date(1, 1, 1),
+        date(2024, 1, 31),
+        date(2024, 2, 29),
+        date(9999, 1, 31),
+        date(9999, 12, 1),
+        CivilDate::MAX,
+    ];
+    let spans = [
+        0,
+        1,
+        11,
+        12,
+        13,
+        1_200,
+        119_993,
+        119_994,
+        239_975,
+        239_976,
+        239_977,
+        239_986,
+        239_987,
+        239_988,
+        240_000,
+        3_000_000,
+        u32::MAX,
+    ];
+    let (mut compared, mut found) = (0, 0);
+    for day in days {
+        for months in spans {
+            let later = day.checked_add_months(months);
+            let earlier = day.checked_sub_months(months);
+            assert_eq!(
+                later.map(naive),
+                in_range(naive(day).checked_add_months(Months::new(months))),
+                "{day} + {months} months"
+            );
+            assert_eq!(
+                earlier.map(naive),
+                in_range(naive(day).checked_sub_months(Months::new(months))),
+                "{day} - {months} months"
+            );
+            compared += 2;
+            found += u32::from(later.is_some()) + u32::from(earlier.is_some());
+        }
+    }
+    assert_eq!(compared, 12 * 17 * 2);
+    assert!(found > 150, "found {found}");
+}
+
+#[test]
 fn a_month_from_the_31st_ends_on_the_last_day_of_the_shorter_month() {
     assert_eq!(
         date(2026, 1, 31).checked_add_months(1),
