@@ -35,14 +35,7 @@ struct WaitingTool {
 #[async_trait]
 impl McpTool<TestState> for WaitingTool {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "wait".to_owned(),
-            description: "Waits until released".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new("wait", "Waits until released", json!({"type": "object"}))
     }
 
     async fn execute(

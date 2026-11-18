@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.0.0] — 2026-11-17
+
+### Added
+
+- feat(mcp)!: a tool result carries _meta
+
+
 ## [6.9.0] — 2026-11-17
 
 ### Added

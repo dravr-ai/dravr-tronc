@@ -16,7 +16,7 @@ Building an MCP server in Rust means writing the same boilerplate every time: JS
 
 ```toml
 [dependencies]
-dravr-tronc = "6.9"
+dravr-tronc = "7.0"
 ```
 
 ### 1. Define your state and tools
@@ -24,8 +24,8 @@ dravr-tronc = "6.9"
 ```rust
 use std::sync::Arc;
 use async_trait::async_trait;
-use dravr_tronc::mcp::protocol::{CallToolResult, ToolDefinition};
-use dravr_tronc::{McpTool, McpServer, ToolRegistry};
+use dravr_tronc::mcp::schema::{Tool, ToolResponse};
+use dravr_tronc::{McpTool, McpServer, ToolContext, ToolRegistry};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -36,25 +36,34 @@ struct AppState {
 struct GreetTool;
 
 #[async_trait]
-impl McpTool<AppState> for GreetTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "greet".to_owned(),
-            description: "Greet someone by name".to_owned(),
-            input_schema: json!({
+impl McpTool<RwLock<AppState>> for GreetTool {
+    // `Tool` and `ToolResponse` are `#[non_exhaustive]`: build them with
+    // their constructors and `with_` methods, never as literals.
+    fn definition(&self) -> Tool {
+        Tool::new(
+            "greet",
+            "Greet someone by name",
+            json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" }
                 },
                 "required": ["name"]
             }),
-        }
+        )
     }
 
-    async fn execute(&self, state: &Arc<RwLock<AppState>>, args: Value) -> CallToolResult {
+    async fn execute(
+        &self,
+        state: &Arc<RwLock<AppState>>,
+        _ctx: &ToolContext,
+        args: Value,
+    ) -> ToolResponse {
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("world");
         let greeting = state.read().await.greeting.clone();
-        CallToolResult::text(format!("{greeting}, {name}!"))
+        // `with_meta` adds a result `_meta` key a host reads and a model never sees.
+        ToolResponse::text(format!("{greeting}, {name}!"))
+            .with_meta("com.example/served-by", json!("greet"))
     }
 }
 ```
@@ -220,6 +229,7 @@ once, last. See [Request guard](#request-guard).
 | Module | Purpose |
 |--------|---------|
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
+| `mcp::schema` | MCP wire types; `Tool` (`Tool::new` + `with_output_schema`/`with_annotations`/`with_execution`) and `ToolResponse` (`text`, `error`, `structured`, … + `with_structured_content`, and `with_meta` for the result's `_meta`) are `#[non_exhaustive]`, built through those, never as literals |
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `execute` refuses `ADMIN_ONLY` to a non-admin, `REQUIRES_AUTH`/`REQUIRES_TENANT` to a context without a caller/tenant, and a tool's `required_scopes` to a grant missing one (one whose `outputSchema` root is not `type: "object"`, or has a property schema that is not an object, is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |

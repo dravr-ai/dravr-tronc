@@ -45,14 +45,11 @@ struct TaskingDispatcher {
 #[async_trait]
 impl ToolDispatcher<TestState> for TaskingDispatcher {
     async fn list_tools(&self, _state: &Arc<TestState>, _ctx: &ToolContext) -> Vec<Tool> {
-        vec![Tool {
-            name: "slow".to_owned(),
-            description: "Takes a while".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }]
+        vec![Tool::new(
+            "slow",
+            "Takes a while",
+            json!({"type": "object"}),
+        )]
     }
 
     async fn call_tool(
@@ -785,16 +782,14 @@ async fn unknown_task_id_is_reported_as_absent() {
 /// reading for every pre-Tasks client.
 #[test]
 fn tool_execution_task_support_round_trips() {
-    let tool = Tool {
-        name: "long_tool".to_owned(),
-        description: "may answer with a handle".to_owned(),
-        input_schema: serde_json::json!({"type": "object"}),
-        output_schema: None,
-        annotations: None,
-        execution: Some(ToolExecution {
-            task_support: TaskSupport::Optional,
-        }),
-    };
+    let tool = Tool::new(
+        "long_tool",
+        "may answer with a handle",
+        serde_json::json!({"type": "object"}),
+    )
+    .with_execution(ToolExecution {
+        task_support: TaskSupport::Optional,
+    });
     let wire = serde_json::to_value(&tool).expect("serialize");
     assert_eq!(wire["execution"]["taskSupport"], "optional");
 
@@ -805,14 +800,11 @@ fn tool_execution_task_support_round_trips() {
     );
 
     // Absent stays absent on the wire and in the model.
-    let bare = Tool {
-        name: "sync_tool".to_owned(),
-        description: "always inline".to_owned(),
-        input_schema: serde_json::json!({"type": "object"}),
-        output_schema: None,
-        annotations: None,
-        execution: None,
-    };
+    let bare = Tool::new(
+        "sync_tool",
+        "always inline",
+        serde_json::json!({"type": "object"}),
+    );
     let wire = serde_json::to_value(&bare).expect("serialize");
     assert!(wire.get("execution").is_none());
     let back: Tool = serde_json::from_value(wire).expect("deserialize");

@@ -33,14 +33,7 @@ struct SlowTool;
 #[async_trait]
 impl McpTool<()> for SlowTool {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "slow".to_owned(),
-            description: "Answers late".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new("slow", "Answers late", json!({"type": "object"}))
     }
 
     async fn execute(&self, _state: &Arc<()>, _ctx: &ToolContext, _args: Value) -> ToolResponse {

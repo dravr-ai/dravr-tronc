@@ -56,14 +56,7 @@ struct SleepTool;
 #[async_trait]
 impl McpTool<State> for SleepTool {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "get_sleep".to_owned(),
-            description: "Last night's sleep".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new("get_sleep", "Last night's sleep", json!({"type": "object"}))
     }
 
     async fn execute(

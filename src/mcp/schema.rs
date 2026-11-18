@@ -125,7 +125,12 @@ pub enum TaskSupport {
 ///
 /// `input_schema` is a raw JSON Schema value so each tool can describe arbitrary
 /// inputs; it serializes as the spec-mandated `inputSchema`.
+///
+/// Built with [`Self::new`] and the `with_` methods, never as a literal: it
+/// is `#[non_exhaustive]`, so a field a later revision adds to a tool
+/// definition is not a breaking change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Tool {
     /// Unique tool name.
     pub name: String,
@@ -150,6 +155,48 @@ pub struct Tool {
     /// never returns one — the safe reading for every pre-Tasks client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ToolExecution>,
+}
+
+impl Tool {
+    /// A tool named `name`, described by `description`, whose arguments match
+    /// the JSON Schema `input_schema`; it declares no output schema, no
+    /// annotations and no task support.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            output_schema: None,
+            annotations: None,
+            execution: None,
+        }
+    }
+
+    /// This tool declaring `output_schema` for its `structuredContent`.
+    #[must_use]
+    pub fn with_output_schema(mut self, output_schema: serde_json::Value) -> Self {
+        self.output_schema = Some(output_schema);
+        self
+    }
+
+    /// This tool carrying the behavioral `annotations`.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: ToolAnnotations) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
+    /// This tool declaring whether a call may be answered with a task handle.
+    #[must_use]
+    pub const fn with_execution(mut self, execution: ToolExecution) -> Self {
+        self.execution = Some(execution);
+        self
+    }
 }
 
 /// Parameters for a `tools/call` request.
@@ -275,7 +322,13 @@ impl InputRequiredResult {
 }
 
 /// Result of a `tools/call` invocation.
+///
+/// Built with its constructors and the `with_` methods, never as a literal:
+/// it is `#[non_exhaustive]`, so a field a later revision adds to a tool
+/// result is not a breaking change. The fields stay public, to read and to
+/// change after construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolResponse {
     /// Response content items.
     pub content: Vec<Content>,
@@ -285,6 +338,13 @@ pub struct ToolResponse {
     /// Structured response data (MCP 2025-11-25 `structuredContent`).
     #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<serde_json::Value>,
+    /// The result's `_meta` (MCP `Result._meta`): reverse-DNS-prefixed keys
+    /// a host reads, never shown to a model.
+    ///
+    /// `default`, so a result read back from its wire form keeps the map, and
+    /// reads `None` when the wire carried none.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ToolResponse {
@@ -295,6 +355,7 @@ impl ToolResponse {
             content,
             is_error: false,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -337,6 +398,7 @@ impl ToolResponse {
             content: vec![Content::text(message)],
             is_error: true,
             structured_content: None,
+            meta: None,
         }
     }
 
@@ -368,11 +430,29 @@ impl ToolResponse {
         if !structured.is_object() {
             return Err(StructuredContentError::NotAnObject(json_kind(&structured)));
         }
-        Ok(Self {
-            content: vec![Content::text(text)],
-            is_error: false,
-            structured_content: Some(structured),
-        })
+        Ok(Self::text(text).with_structured_content(structured))
+    }
+
+    /// This result carrying `value` as its `structuredContent`, replacing any
+    /// it had. The content blocks are left as they are.
+    #[must_use]
+    pub fn with_structured_content(mut self, value: serde_json::Value) -> Self {
+        self.structured_content = Some(value);
+        self
+    }
+
+    /// This result carrying `value` under `key` in its `_meta`, replacing a
+    /// value already under that key and keeping every other key.
+    ///
+    /// `key` is a reverse-DNS-prefixed name, as the specification asks
+    /// (`ai.dravr.vault/labels`); the `io.modelcontextprotocol/` prefix is
+    /// reserved to the protocol.
+    #[must_use]
+    pub fn with_meta(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.meta
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(key.into(), value);
+        self
     }
 }
 
@@ -1655,6 +1735,39 @@ mod tests {
         assert!(json.get("inputSchema").is_some());
         assert!(json.get("input_schema").is_none());
         assert!(json.get("annotations").is_none());
+    }
+
+    #[test]
+    fn a_new_tool_declares_only_what_its_builders_add() {
+        let bare = Tool::new("t", "A test", json!({"type": "object"}));
+        let wire = serde_json::to_value(&bare).expect("serialize"); // Safe: test assertion
+        assert_eq!(wire["name"], "t");
+        assert_eq!(wire["description"], "A test");
+        assert_eq!(wire["inputSchema"], json!({"type": "object"}));
+        for absent in ["outputSchema", "annotations", "execution"] {
+            assert!(
+                wire.get(absent).is_none(),
+                "a bare tool declares no {absent}"
+            );
+        }
+
+        let full = bare
+            .with_output_schema(json!({"type": "object"}))
+            .with_annotations(ToolAnnotations {
+                title: Some("Title".to_owned()),
+                read_only_hint: Some(true),
+                destructive_hint: None,
+                idempotent_hint: None,
+                open_world_hint: None,
+            })
+            .with_execution(ToolExecution {
+                task_support: TaskSupport::Optional,
+            });
+        let wire = serde_json::to_value(&full).expect("serialize"); // Safe: test assertion
+        assert_eq!(wire["outputSchema"], json!({"type": "object"}));
+        assert_eq!(wire["annotations"]["title"], "Title");
+        assert_eq!(wire["annotations"]["readOnlyHint"], true);
+        assert_eq!(wire["execution"]["taskSupport"], "optional");
     }
 
     #[test]

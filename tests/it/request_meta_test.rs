@@ -29,14 +29,11 @@ struct ReadMeta;
 #[async_trait]
 impl McpTool<()> for ReadMeta {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "read_meta".to_owned(),
-            description: "Report the request's _meta".to_owned(),
-            input_schema: json!({ "type": "object" }),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(
+            "read_meta",
+            "Report the request's _meta",
+            json!({ "type": "object" }),
+        )
     }
 
     async fn execute(

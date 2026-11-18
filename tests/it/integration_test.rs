@@ -36,20 +36,17 @@ struct GreetTool;
 #[async_trait]
 impl McpTool<AppState> for GreetTool {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "greet".to_owned(),
-            description: "Greet a person".to_owned(),
-            input_schema: json!({
+        Tool::new(
+            "greet",
+            "Greet a person",
+            json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Person to greet" }
                 },
                 "required": ["name"]
             }),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        )
     }
 
     async fn execute(
@@ -71,19 +68,16 @@ struct UppercaseTool;
 #[async_trait]
 impl McpTool<AppState> for UppercaseTool {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "uppercase".to_owned(),
-            description: "Convert text to uppercase".to_owned(),
-            input_schema: json!({
+        Tool::new(
+            "uppercase",
+            "Convert text to uppercase",
+            json!({
                 "type": "object",
                 "properties": {
                     "text": { "type": "string" }
                 }
             }),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        )
     }
 
     async fn execute(

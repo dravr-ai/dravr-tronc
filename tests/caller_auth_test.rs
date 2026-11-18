@@ -42,14 +42,11 @@ struct MyIdentity;
 #[async_trait]
 impl McpTool<State> for MyIdentity {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "my_identity".to_owned(),
-            description: "The caller's own identity".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(
+            "my_identity",
+            "The caller's own identity",
+            json!({"type": "object"}),
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -80,14 +77,7 @@ struct Echo;
 #[async_trait]
 impl McpTool<State> for Echo {
     fn definition(&self) -> Tool {
-        Tool {
-            name: "echo".to_owned(),
-            description: "Echoes".to_owned(),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new("echo", "Echoes", json!({"type": "object"}))
     }
 
     async fn execute(&self, _state: &Arc<State>, ctx: &ToolContext, _args: Value) -> ToolResponse {

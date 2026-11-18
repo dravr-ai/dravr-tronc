@@ -53,14 +53,7 @@ struct Fixture {
 #[async_trait]
 impl McpTool<State> for Fixture {
     fn definition(&self) -> Tool {
-        Tool {
-            name: self.name.to_owned(),
-            description: self.name.to_owned(),
-            input_schema: json!({ "type": "object" }),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-        }
+        Tool::new(self.name, self.name, json!({ "type": "object" }))
     }
 
     async fn execute(&self, _state: &Arc<State>, ctx: &ToolContext, _args: Value) -> ToolResponse {
