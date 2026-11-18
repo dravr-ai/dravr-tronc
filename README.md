@@ -563,6 +563,7 @@ signature, and what they promise is what the code already relied on.
 | Contract | What the types do |
 |---|---|
 | JSON (serde) | The bytes chrono's default serde wrote: `2026-11-17T10:00:00.100Z`, `2026-11-17`, `"Mon"`. Reading keeps chrono's leniency |
+| Rejections | chrono's error kind and message for the same bad input (`input contains invalid characters`, `premature end of input`, …), in `FromStr` and in serde |
 | `to_rfc3339()` | The same name and bytes: `2026-11-17T10:00:00.100+00:00` |
 | SQLite (feature `sqlx08-sqlite`) | The text sqlx's chrono support stored, and every shape it read, including `datetime('now')` rows |
 | PostgreSQL (feature `sqlx08-postgres`) | The same binary `timestamptz`, `timestamp`, `date` and `time` values, and their arrays |

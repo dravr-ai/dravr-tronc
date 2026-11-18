@@ -169,7 +169,7 @@ impl FromStr for Weekday {
 
     /// Reads the short or the full English name, in any case.
     fn from_str(text: &str) -> Result<Self, DateError> {
-        let (head, tail) = text.split_at_checked(3).ok_or(DateError::InvalidText)?;
+        let (head, tail) = text.split_at_checked(3).ok_or(DateError::InvalidWeekday)?;
         Self::ALL
             .into_iter()
             .zip(LONG_SUFFIXES)
@@ -178,6 +178,6 @@ impl FromStr for Weekday {
                     && (tail.is_empty() || tail.eq_ignore_ascii_case(suffix))
             })
             .map(|(day, _)| day)
-            .ok_or(DateError::InvalidText)
+            .ok_or(DateError::InvalidWeekday)
     }
 }

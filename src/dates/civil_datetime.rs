@@ -126,9 +126,12 @@ impl CivilDateTime {
     ///
     /// # Errors
     ///
-    /// [`DateError::InvalidText`] when the text does not match,
-    /// [`DateError::OutOfRange`] when it is not a date and time, and
-    /// [`DateError::UnsupportedFormat`] for a specifier that cannot be read.
+    /// The kind chrono reported when the text does not match or names no
+    /// date and time ([`DateError::InvalidText`], [`DateError::TooShort`],
+    /// [`DateError::TooLong`], [`DateError::NotEnough`],
+    /// [`DateError::Impossible`]), [`DateError::OutOfRange`] when it is not a
+    /// date and time, and [`DateError::UnsupportedFormat`] for a specifier
+    /// that cannot be read.
     pub fn parse_from_str(text: &str, format: &str) -> Result<Self, DateError> {
         text::parse(text, format)?.datetime().map(Self)
     }

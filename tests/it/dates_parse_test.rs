@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
+use std::fmt::{Debug, Display};
+
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use dravr_tronc::dates::{CivilDate, CivilDateTime, CivilTime, DateError, Timestamp, Weekday};
 
@@ -109,6 +111,33 @@ fn expected(theirs: Option<DateTime<Utc>>) -> Option<Moment> {
                 .contains(&value.timestamp())
         })
         .map(of_chrono)
+}
+
+/// A timestamp chrono read, as ours must give it: `None` beyond the range of
+/// `Timestamp`.
+fn in_range(value: DateTime<Utc>) -> Option<Moment> {
+    expected(Some(value))
+}
+
+/// chrono's message for a value it accepted that the date types cannot hold.
+const OUT_OF_RANGE: &str = "input is out of range";
+
+/// A result as a client is shown it: the value, or the error's message.
+fn shown<T, E: Display>(result: Result<T, E>) -> Result<T, String> {
+    result.map_err(|error| error.to_string())
+}
+
+/// What ours must show for what chrono gave: chrono's value, or chrono's
+/// message word for word. A value chrono accepted and `keep` cannot hold is
+/// out of range.
+fn as_chrono<T, U>(
+    theirs: Result<U, chrono::ParseError>,
+    keep: impl FnOnce(U) -> Option<T>,
+) -> Result<T, String> {
+    match theirs {
+        Ok(value) => keep(value).ok_or_else(|| OUT_OF_RANGE.to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn date_in_range(date: NaiveDate) -> bool {
@@ -338,6 +367,178 @@ fn serde_rejects_what_is_not_a_string() {
 }
 
 #[test]
+fn each_rejection_reads_as_chrono_worded_it() {
+    let lenient = |text: &str| {
+        (
+            text.parse::<Timestamp>().unwrap_err().to_string(),
+            text.parse::<DateTime<Utc>>().unwrap_err().to_string(),
+        )
+    };
+    let strict = |text: &str| {
+        (
+            Timestamp::parse_from_rfc3339(text).unwrap_err().to_string(),
+            DateTime::parse_from_rfc3339(text).unwrap_err().to_string(),
+        )
+    };
+    let date = |text: &str, format: &str| {
+        (
+            CivilDate::parse_from_str(text, format)
+                .unwrap_err()
+                .to_string(),
+            NaiveDate::parse_from_str(text, format)
+                .unwrap_err()
+                .to_string(),
+        )
+    };
+    let with_offset = |text: &str, format: &str| {
+        (
+            Timestamp::parse_from_str(text, format)
+                .unwrap_err()
+                .to_string(),
+            DateTime::parse_from_str(text, format)
+                .unwrap_err()
+                .to_string(),
+        )
+    };
+    let cases = [
+        (lenient("2026-11-17T10:00"), "premature end of input"),
+        (lenient("2026-11-17T10:00:00Zx"), "trailing input"),
+        (
+            lenient("2026-11-17X10:00:00Z"),
+            "input contains invalid characters",
+        ),
+        (lenient("2026-02-30T10:00:00Z"), "input is out of range"),
+        (strict("2026-11-17"), "premature end of input"),
+        (strict("2026-02-30x10:00:00Z"), "input is out of range"),
+        (strict("2026-11-17T10:00:00+01:00 "), "trailing input"),
+        (
+            strict("2026-11-17T10:00:00+0100"),
+            "input contains invalid characters",
+        ),
+        (
+            date("Mon, 17 Nov 2026", "%a, %d %b %Y"),
+            "no possible date and time matching input",
+        ),
+        (
+            date("Nov 2026", "%b %Y"),
+            "input is not enough for unique date and time",
+        ),
+        (
+            with_offset("2026-11-17 10:00", "%Y-%m-%d %H:%M"),
+            "input is not enough for unique date and time",
+        ),
+    ];
+    for ((ours, theirs), worded) in cases {
+        assert_eq!(theirs, worded);
+        assert_eq!(ours, theirs);
+    }
+    assert_eq!(
+        "Mond".parse::<Weekday>().unwrap_err().to_string(),
+        "Mond".parse::<chrono::Weekday>().unwrap_err().to_string()
+    );
+    assert_eq!(
+        serde_json::from_str::<Weekday>("\"Mond\"")
+            .unwrap_err()
+            .to_string(),
+        "short or long weekday names expected at line 1 column 6"
+    );
+    assert_eq!(
+        serde_json::from_str::<Timestamp>("1794909600")
+            .unwrap_err()
+            .to_string(),
+        serde_json::from_str::<DateTime<Utc>>("1794909600")
+            .unwrap_err()
+            .to_string()
+    );
+}
+
+/// Compares what serde read from `json` into ours and into chrono's type:
+/// the same value, or the same message, position included. `Ok(None)` from
+/// chrono is a value it read that the date types cannot hold.
+fn same_serde<V: PartialEq + Debug>(
+    json: &str,
+    ours: Result<V, serde_json::Error>,
+    theirs: Result<Option<V>, serde_json::Error>,
+) -> bool {
+    match (ours, theirs) {
+        (Ok(ours), Ok(Some(theirs))) => {
+            assert_eq!(ours, theirs, "{json}");
+            true
+        }
+        (Err(ours), Err(theirs)) => {
+            assert_eq!(ours.to_string(), theirs.to_string(), "{json}");
+            false
+        }
+        (Err(ours), Ok(None)) => {
+            assert!(ours.to_string().starts_with(OUT_OF_RANGE), "{json}: {ours}");
+            false
+        }
+        (ours, theirs) => panic!("{json}: ours {ours:?}, chrono {theirs:?}"),
+    }
+}
+
+#[test]
+fn serde_rejections_read_like_chrono() {
+    let mut texts: Vec<String> = VERDICTS.iter().map(|row| row.0.to_owned()).collect();
+    for date in DATES {
+        texts.push(date.to_owned());
+        for time in TIMES {
+            for offset in ["", "Z", "+01:00", "x"] {
+                texts.push(format!("{date}T{time}{offset}"));
+            }
+        }
+    }
+    for time in TIMES {
+        for fraction in FRACTIONS {
+            texts.push(format!("{time}{fraction}"));
+        }
+    }
+    texts.extend(["Mon", "monday", "Mond", "", " Mon", "1"].map(String::from));
+    let mut documents: Vec<String> = texts
+        .iter()
+        .map(|text| serde_json::to_string(text).unwrap())
+        .collect();
+    documents.extend(["1794909600", "-1", "1.5", "true", "null", "[]", "{}"].map(String::from));
+    let mut accepted = 0;
+    for json in &documents {
+        let json = json.as_str();
+        let results = [
+            same_serde(
+                json,
+                serde_json::from_str::<Timestamp>(json).map(of_ours),
+                serde_json::from_str::<DateTime<Utc>>(json).map(in_range),
+            ),
+            same_serde(
+                json,
+                serde_json::from_str::<CivilDate>(json).map(ymd_ours),
+                serde_json::from_str::<NaiveDate>(json)
+                    .map(|d| date_in_range(d).then(|| ymd_chrono(d))),
+            ),
+            same_serde(
+                json,
+                serde_json::from_str::<CivilTime>(json).map(hms_ours),
+                serde_json::from_str::<NaiveTime>(json).map(|t| Some(hms_chrono(t))),
+            ),
+            same_serde(
+                json,
+                serde_json::from_str::<CivilDateTime>(json).map(reading_ours),
+                serde_json::from_str::<NaiveDateTime>(json).map(reading_chrono),
+            ),
+            same_serde(
+                json,
+                serde_json::from_str::<Weekday>(json).map(Weekday::num_days_from_monday),
+                serde_json::from_str::<chrono::Weekday>(json)
+                    .map(|day| Some(day.num_days_from_monday())),
+            ),
+        ];
+        accepted += results.into_iter().filter(|read| *read).count();
+    }
+    // Both sides of the comparison are exercised.
+    assert!(documents.len() > 800, "{} documents", documents.len());
+    assert!(accepted > 100, "accepted {accepted}");
+}
+
+#[test]
 fn timestamps_read_like_chrono_across_generated_inputs() {
     let (mut accepted, mut rejected) = (0_u32, 0_u32);
     let mut input = String::new();
@@ -350,23 +551,22 @@ fn timestamps_read_like_chrono_across_generated_inputs() {
                         for part in [date, separator, time, fraction, offset] {
                             input.push_str(part);
                         }
-                        let lenient = expected(input.parse::<DateTime<Utc>>().ok());
+                        let lenient = as_chrono(input.parse::<DateTime<Utc>>(), in_range);
                         assert_eq!(
-                            input.parse::<Timestamp>().ok().map(of_ours),
+                            shown(input.parse::<Timestamp>().map(of_ours)),
                             lenient,
                             "lenient {input:?}"
                         );
-                        let strict = expected(
-                            DateTime::parse_from_rfc3339(&input)
-                                .ok()
-                                .map(|value| value.to_utc()),
+                        let strict = as_chrono(
+                            DateTime::parse_from_rfc3339(&input).map(|value| value.to_utc()),
+                            in_range,
                         );
                         assert_eq!(
-                            Timestamp::parse_from_rfc3339(&input).ok().map(of_ours),
+                            shown(Timestamp::parse_from_rfc3339(&input).map(of_ours)),
                             strict,
                             "strict {input:?}"
                         );
-                        if lenient.is_some() {
+                        if lenient.is_ok() {
                             accepted += 1;
                         } else {
                             rejected += 1;
@@ -411,30 +611,22 @@ fn civil_dates_read_like_chrono() {
         "2026-02-30".parse::<CivilDate>(),
         Err(DateError::OutOfRange)
     );
-    assert_eq!("2026-11".parse::<CivilDate>(), Err(DateError::InvalidText));
+    assert_eq!("2026-11".parse::<CivilDate>(), Err(DateError::TooShort));
     let mut compared = 0;
     for date in DATES {
         for lead in ["", " ", "\t"] {
             for trail in ["", " ", "  ", "x", "T10:00:00", "-", "\u{e9}"] {
                 let input = format!("{lead}{date}{trail}");
-                let theirs = input
-                    .parse::<NaiveDate>()
-                    .ok()
-                    .filter(|d| date_in_range(*d))
-                    .map(ymd_chrono);
+                let keep = |d: NaiveDate| date_in_range(d).then(|| ymd_chrono(d));
+                let theirs = as_chrono(input.parse::<NaiveDate>(), keep);
                 assert_eq!(
-                    input.parse::<CivilDate>().ok().map(ymd_ours),
+                    shown(input.parse::<CivilDate>().map(ymd_ours)),
                     theirs,
                     "{input:?}"
                 );
-                let fixed = NaiveDate::parse_from_str(&input, "%Y-%m-%d")
-                    .ok()
-                    .filter(|d| date_in_range(*d))
-                    .map(ymd_chrono);
+                let fixed = as_chrono(NaiveDate::parse_from_str(&input, "%Y-%m-%d"), keep);
                 assert_eq!(
-                    CivilDate::parse_from_str(&input, "%Y-%m-%d")
-                        .ok()
-                        .map(ymd_ours),
+                    shown(CivilDate::parse_from_str(&input, "%Y-%m-%d").map(ymd_ours)),
                     fixed,
                     "%Y-%m-%d {input:?}"
                 );
@@ -456,18 +648,17 @@ fn civil_times_read_like_chrono() {
             for trail in ["", " ", "Z", "+01:00", "x"] {
                 for lead in ["", " "] {
                     let input = format!("{lead}{time}{fraction}{trail}");
-                    let theirs = input.parse::<NaiveTime>().ok().map(hms_chrono);
+                    let keep = |t: NaiveTime| Some(hms_chrono(t));
+                    let theirs = as_chrono(input.parse::<NaiveTime>(), keep);
                     assert_eq!(
-                        input.parse::<CivilTime>().ok().map(hms_ours),
+                        shown(input.parse::<CivilTime>().map(hms_ours)),
                         theirs,
                         "{input:?}"
                     );
                     for format in ["%H:%M:%S%.f", "%H:%M", "%T%.fZ", "%R%:z", "%T.f", "%H%M%S"] {
-                        let theirs = NaiveTime::parse_from_str(&input, format)
-                            .ok()
-                            .map(hms_chrono);
+                        let theirs = as_chrono(NaiveTime::parse_from_str(&input, format), keep);
                         assert_eq!(
-                            CivilTime::parse_from_str(&input, format).ok().map(hms_ours),
+                            shown(CivilTime::parse_from_str(&input, format).map(hms_ours)),
                             theirs,
                             "{format} {input:?}"
                         );
@@ -527,31 +718,35 @@ fn civil_date_times_read_like_chrono() {
                         for part in [date, separator, time, fraction, offset] {
                             input.push_str(part);
                         }
-                        let theirs = input.parse::<NaiveDateTime>().ok().and_then(reading_chrono);
+                        let theirs = as_chrono(input.parse::<NaiveDateTime>(), reading_chrono);
                         assert_eq!(
-                            input.parse::<CivilDateTime>().ok().map(reading_ours),
+                            shown(input.parse::<CivilDateTime>().map(reading_ours)),
                             theirs,
                             "{input:?}"
                         );
                         for format in READ_FORMATS {
-                            let naive = NaiveDateTime::parse_from_str(&input, format)
-                                .ok()
-                                .and_then(reading_chrono);
+                            let naive = as_chrono(
+                                NaiveDateTime::parse_from_str(&input, format),
+                                reading_chrono,
+                            );
                             assert_eq!(
-                                CivilDateTime::parse_from_str(&input, format)
-                                    .ok()
-                                    .map(reading_ours),
+                                shown(
+                                    CivilDateTime::parse_from_str(&input, format).map(reading_ours)
+                                ),
                                 naive,
                                 "{format} {input:?}"
                             );
-                            let fixed =
-                                expected_timestamp(DateTime::parse_from_str(&input, format).ok());
+                            let fixed = as_chrono(
+                                DateTime::parse_from_str(&input, format)
+                                    .map(|value| value.to_utc()),
+                                in_range,
+                            );
                             assert_eq!(
-                                Timestamp::parse_from_str(&input, format).ok().map(of_ours),
+                                shown(Timestamp::parse_from_str(&input, format).map(of_ours)),
                                 fixed,
                                 "timestamp {format} {input:?}"
                             );
-                            accepted += u32::from(naive.is_some()) + u32::from(fixed.is_some());
+                            accepted += u32::from(naive.is_ok()) + u32::from(fixed.is_ok());
                             compared += 1;
                         }
                     }
@@ -563,15 +758,11 @@ fn civil_date_times_read_like_chrono() {
     assert!(accepted > 2_000, "accepted {accepted}");
 }
 
-fn expected_timestamp(theirs: Option<DateTime<chrono::FixedOffset>>) -> Option<Moment> {
-    expected(theirs.map(|value| value.to_utc()))
-}
-
 #[test]
 fn weekdays_read_like_chrono() {
     assert_eq!("Mon".parse(), Ok(Weekday::Mon));
     assert_eq!("WEDNESDAY".parse(), Ok(Weekday::Wed));
-    assert_eq!("Mond".parse::<Weekday>(), Err(DateError::InvalidText));
+    assert_eq!("Mond".parse::<Weekday>(), Err(DateError::InvalidWeekday));
     let inputs = [
         "Mon",
         "mon",
@@ -606,24 +797,23 @@ fn weekdays_read_like_chrono() {
         "Mon\u{e9}",
     ];
     for input in inputs {
-        let theirs = input
-            .parse::<chrono::Weekday>()
-            .ok()
-            .map(|day| day.num_days_from_monday());
-        assert_eq!(
+        let theirs = shown(
             input
-                .parse::<Weekday>()
-                .ok()
-                .map(Weekday::num_days_from_monday),
+                .parse::<chrono::Weekday>()
+                .map(|day| day.num_days_from_monday()),
+        );
+        assert_eq!(
+            shown(input.parse::<Weekday>().map(Weekday::num_days_from_monday)),
             theirs,
             "{input:?}"
         );
         let quoted = serde_json::to_string(input).unwrap();
         assert_eq!(
-            serde_json::from_str::<Weekday>(&quoted)
-                .ok()
-                .map(Weekday::num_days_from_monday),
-            theirs,
+            shown(serde_json::from_str::<Weekday>(&quoted).map(Weekday::num_days_from_monday)),
+            shown(
+                serde_json::from_str::<chrono::Weekday>(&quoted)
+                    .map(|day| day.num_days_from_monday())
+            ),
             "serde {input:?}"
         );
     }
@@ -675,12 +865,12 @@ fn names_and_the_twelve_hour_clock_read_the_recorded_values() {
     // A weekday that is not the date's own is refused, as chrono refuses it.
     assert_eq!(
         CivilDate::parse_from_str("Mon, 17 Nov 2026", "%a, %d %b %Y"),
-        Err(DateError::InvalidText)
+        Err(DateError::Impossible)
     );
     // A 12-hour hour without AM or PM names no time.
     assert_eq!(
         CivilTime::parse_from_str("10:00", "%I:%M"),
-        Err(DateError::InvalidText)
+        Err(DateError::NotEnough)
     );
 }
 
@@ -762,34 +952,29 @@ fn names_and_the_twelve_hour_clock_read_like_chrono_across_generated_inputs() {
     let (mut accepted, mut compared) = (0, 0);
     for input in &inputs {
         for format in NAMED_FORMATS {
-            let date = NaiveDate::parse_from_str(input, format)
-                .ok()
-                .map(ymd_chrono);
+            let date = as_chrono(NaiveDate::parse_from_str(input, format), |d| {
+                date_in_range(d).then(|| ymd_chrono(d))
+            });
             assert_eq!(
-                CivilDate::parse_from_str(input, format).ok().map(ymd_ours),
+                shown(CivilDate::parse_from_str(input, format).map(ymd_ours)),
                 date,
                 "date {format} {input:?}"
             );
-            let time = NaiveTime::parse_from_str(input, format)
-                .ok()
-                .map(hms_chrono);
+            let time = as_chrono(NaiveTime::parse_from_str(input, format), |t| {
+                Some(hms_chrono(t))
+            });
             assert_eq!(
-                CivilTime::parse_from_str(input, format).ok().map(hms_ours),
+                shown(CivilTime::parse_from_str(input, format).map(hms_ours)),
                 time,
                 "time {format} {input:?}"
             );
-            let both = NaiveDateTime::parse_from_str(input, format)
-                .ok()
-                .and_then(reading_chrono);
+            let both = as_chrono(NaiveDateTime::parse_from_str(input, format), reading_chrono);
             assert_eq!(
-                CivilDateTime::parse_from_str(input, format)
-                    .ok()
-                    .map(reading_ours),
+                shown(CivilDateTime::parse_from_str(input, format).map(reading_ours)),
                 both,
                 "date-time {format} {input:?}"
             );
-            accepted +=
-                u32::from(date.is_some()) + u32::from(time.is_some()) + u32::from(both.is_some());
+            accepted += u32::from(date.is_ok()) + u32::from(time.is_ok()) + u32::from(both.is_ok());
             compared += 1;
         }
     }
@@ -822,7 +1007,7 @@ fn a_format_that_cannot_be_read_is_an_error() {
     // A date-time format with no offset names no timestamp.
     assert_eq!(
         Timestamp::parse_from_str("2026-11-17 10:00:00", "%Y-%m-%d %H:%M:%S"),
-        Err(DateError::InvalidText)
+        Err(DateError::NotEnough)
     );
 }
 

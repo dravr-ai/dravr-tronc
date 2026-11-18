@@ -574,7 +574,7 @@ fn set(slot: &mut Option<i64>, value: i64, range: RangeInclusive<i64>) -> Result
         return Err(DateError::OutOfRange);
     }
     match *slot {
-        Some(old) if old != value => Err(DateError::InvalidText),
+        Some(old) if old != value => Err(DateError::Impossible),
         _ => {
             *slot = Some(value);
             Ok(())
@@ -582,23 +582,68 @@ fn set(slot: &mut Option<i64>, value: i64, range: RangeInclusive<i64>) -> Result
     }
 }
 
+/// The years chrono's `NaiveDate` held. A date beyond them was out of range
+/// before chrono looked at its weekday, so it is here too.
+const CHRONO_YEARS: RangeInclusive<i64> = -262_143..=262_142;
+
+/// The days in a month of the proleptic Gregorian calendar, for any year;
+/// zero for a month that is not one.
+const fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days since Monday of a valid proleptic Gregorian date, for any year:
+/// the days-from-civil count of the date, from a Thursday 1970-01-01.
+const fn weekday_from_monday(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    (days + 3).rem_euclid(7)
+}
+
+/// A checked year, month and day as the engine's date: out of range when
+/// the year is beyond what the date types hold.
+fn engine_date((year, month, day): (i64, i64, i64)) -> Result<Date, DateError> {
+    let year = i16::try_from(year).map_err(|_| DateError::OutOfRange)?;
+    let month = i8::try_from(month).map_err(|_| DateError::OutOfRange)?;
+    let day = i8::try_from(day).map_err(|_| DateError::OutOfRange)?;
+    Date::new(year, month, day).map_err(|_| DateError::OutOfRange)
+}
+
 impl Parsed {
+    /// The year, month and day read, checked in chrono's order: all three
+    /// are required, then the date must exist, then a weekday in the text
+    /// must be the date's own. The range of the date types is checked after
+    /// this, by [`engine_date`], so a rejection chrono made is reported as
+    /// chrono reported it.
+    fn checked_ymd(&self) -> Result<(i64, i64, i64), DateError> {
+        let (Some(year), Some(month), Some(day)) = (self.year, self.month, self.day) else {
+            return Err(DateError::NotEnough);
+        };
+        if !CHRONO_YEARS.contains(&year) || !(1..=days_in_month(year, month)).contains(&day) {
+            return Err(DateError::OutOfRange);
+        }
+        match self.weekday {
+            Some(named) if named != weekday_from_monday(year, month, day) => {
+                Err(DateError::Impossible)
+            }
+            _ => Ok((year, month, day)),
+        }
+    }
+
     /// The calendar date read: year, month and day are all required.
     pub(super) fn date(&self) -> Result<Date, DateError> {
-        let (Some(year), Some(month), Some(day)) = (self.year, self.month, self.day) else {
-            return Err(DateError::InvalidText);
-        };
-        let year = i16::try_from(year).map_err(|_| DateError::OutOfRange)?;
-        let month = i8::try_from(month).map_err(|_| DateError::OutOfRange)?;
-        let day = i8::try_from(day).map_err(|_| DateError::OutOfRange)?;
-        let date = Date::new(year, month, day).map_err(|_| DateError::OutOfRange)?;
-        // A weekday in the text must be the date's own.
-        match self.weekday {
-            Some(named) if named != i64::from(date.weekday().to_monday_zero_offset()) => {
-                Err(DateError::InvalidText)
-            }
-            _ => Ok(date),
-        }
+        engine_date(self.checked_ymd()?)
     }
 
     /// The time of day read: hour and minute are required, the second
@@ -609,13 +654,13 @@ impl Parsed {
         let (Some(half), Some(hour), Some(minute)) =
             (self.hour_div_12, self.hour_mod_12, self.minute)
         else {
-            return Err(DateError::InvalidText);
+            return Err(DateError::NotEnough);
         };
         let hour = half * 12 + hour;
         let second = self.second.unwrap_or(0).min(59);
         let nanosecond = match self.nanosecond {
             Some(nanos) if self.second.is_some() => nanos,
-            Some(_) => return Err(DateError::InvalidText),
+            Some(_) => return Err(DateError::NotEnough),
             None => 0,
         };
         let hour = i8::try_from(hour).map_err(|_| DateError::OutOfRange)?;
@@ -625,28 +670,34 @@ impl Parsed {
         Time::new(hour, minute, second, nanosecond).map_err(|_| DateError::OutOfRange)
     }
 
-    /// The date and time read, with no place on the time line.
+    /// The date and time read, with no place on the time line. As in
+    /// chrono, the date's rejection comes before the time's, and both come
+    /// before the range of the date types.
     pub(super) fn datetime(&self) -> Result<DateTime, DateError> {
-        Ok(DateTime::from_parts(self.date()?, self.time()?))
+        let ymd = self.checked_ymd()?;
+        let time = self.time()?;
+        Ok(DateTime::from_parts(engine_date(ymd)?, time))
     }
 
     /// The date and time read, as the text showed them, and the offset read
     /// with them in seconds east of UTC, when the text had one. The offset
-    /// must be less than a day.
+    /// must be less than a day, which chrono checked after the date and time.
     pub(super) fn reading(&self) -> Result<(DateTime, Option<i32>), DateError> {
+        let civil = self.datetime()?;
         let offset = match self.offset {
             Some(offset) if offset.abs() >= SECONDS_PER_DAY => return Err(DateError::OutOfRange),
             Some(offset) => Some(i32::try_from(offset).map_err(|_| DateError::OutOfRange)?),
             None => None,
         };
-        Ok((self.datetime()?, offset))
+        Ok((civil, offset))
     }
 
     /// The timestamp read and its offset in seconds east of UTC. The offset is
-    /// required, and must be less than a day.
+    /// required, before anything else is looked at, and must be less than a
+    /// day.
     pub(super) fn timestamp(&self) -> Result<(EngineTimestamp, i32), DateError> {
         if self.offset.is_none() {
-            return Err(DateError::InvalidText);
+            return Err(DateError::NotEnough);
         }
         let (civil, offset) = self.reading()?;
         let seconds = offset.unwrap_or(0);
@@ -673,8 +724,12 @@ enum Colon {
     Loose,
 }
 
-/// Reads an unsigned number of `min` to `max` digits.
+/// Reads an unsigned number of `min` to `max` digits. Text shorter than
+/// `min` bytes ended too soon; fewer digits than that is a wrong character.
 fn number(text: &str, min: usize, max: usize) -> Result<(&str, i64), DateError> {
+    if text.len() < min {
+        return Err(DateError::TooShort);
+    }
     let mut value: i64 = 0;
     let mut taken = 0;
     for &byte in text.as_bytes().iter().take(max) {
@@ -723,23 +778,30 @@ fn offset(
     let negative = match chars.next() {
         Some('+') => false,
         Some('-' | '\u{2212}') => true,
-        _ => return Err(DateError::InvalidText),
+        Some(_) => return Err(DateError::InvalidText),
+        None => return Err(DateError::TooShort),
     };
-    let (rest, hours) = two_digits(chars.as_str()).ok_or(DateError::InvalidText)?;
+    let rest = chars.as_str();
+    if rest.len() < 2 {
+        return Err(DateError::TooShort);
+    }
+    let (rest, hours) = two_digits(rest).ok_or(DateError::InvalidText)?;
     let rest = match colon {
-        Colon::Required => rest.strip_prefix(':').ok_or(DateError::InvalidText)?,
+        Colon::Required => match rest.strip_prefix(':') {
+            Some(tail) => tail,
+            None if rest.is_empty() => return Err(DateError::TooShort),
+            None => return Err(DateError::InvalidText),
+        },
         Colon::Loose => rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace()),
     };
-    let (rest, minutes) = if rest.len() >= 2 {
-        let (tail, minutes) = two_digits(rest).ok_or(DateError::InvalidText)?;
-        if minutes > 59 {
-            return Err(DateError::OutOfRange);
-        }
-        (tail, minutes)
-    } else if missing_minutes && rest.is_empty() {
-        (rest, 0)
-    } else {
-        return Err(DateError::InvalidText);
+    // chrono's order: two characters are looked at when there are two, and
+    // only a missing pair falls back to the flag.
+    let (rest, minutes) = match rest.as_bytes() {
+        [b'0'..=b'5', b'0'..=b'9', ..] => two_digits(rest).ok_or(DateError::InvalidText)?,
+        [b'6'..=b'9', b'0'..=b'9', ..] => return Err(DateError::OutOfRange),
+        [_, _, ..] => return Err(DateError::InvalidText),
+        [] if missing_minutes => (rest, 0),
+        _ => return Err(DateError::TooShort),
     };
     let seconds = hours * 3600 + minutes * 60;
     Ok((rest, if negative { -seconds } else { seconds }))
@@ -753,6 +815,9 @@ fn name<'t, const N: usize>(
     short: &[&str; N],
     long: Option<&[&str; N]>,
 ) -> Result<(&'t str, i64), DateError> {
+    if text.len() < 3 {
+        return Err(DateError::TooShort);
+    }
     let (head, tail) = text.split_at_checked(3).ok_or(DateError::InvalidText)?;
     let index = short
         .iter()
@@ -790,6 +855,9 @@ pub(super) fn scan<'t>(
     for item in items {
         match *item {
             Item::Literal(literal) => {
+                if text.len() < literal.len() {
+                    return Err(DateError::TooShort);
+                }
                 text = text.strip_prefix(literal).ok_or(DateError::InvalidText)?;
             }
             Item::Space(_) => text = text.trim_start(),
@@ -843,6 +911,9 @@ pub(super) fn scan<'t>(
                 text = rest;
             }
             Item::LowerAmPm | Item::UpperAmPm => {
+                if text.len() < 2 {
+                    return Err(DateError::TooShort);
+                }
                 let half = match text.get(..2) {
                     Some(word) if word.eq_ignore_ascii_case("am") => 0,
                     Some(word) if word.eq_ignore_ascii_case("pm") => 1,
@@ -916,11 +987,7 @@ pub(super) fn parse(text: &str, format: &str) -> Result<Parsed, DateError> {
     let items = compile(format)?;
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &items)?;
-    if rest.is_empty() {
-        Ok(parsed)
-    } else {
-        Err(DateError::InvalidText)
-    }
+    finished(parsed, rest)
 }
 
 /// `Y - m - d` with optional whitespace around the dashes: the date part of
@@ -952,11 +1019,12 @@ const RELAXED_SECOND: [Item<'static>; 5] = [
     Item::Space(""),
 ];
 
+/// The fields read, when nothing is left of the text.
 fn finished(parsed: Parsed, rest: &str) -> Result<Parsed, DateError> {
     if rest.is_empty() {
         Ok(parsed)
     } else {
-        Err(DateError::InvalidText)
+        Err(DateError::TooLong)
     }
 }
 
@@ -1001,9 +1069,11 @@ pub(super) fn relaxed_datetime(text: &str) -> Result<DateTime, DateError> {
 pub(super) fn relaxed_rfc3339(text: &str) -> Result<(EngineTimestamp, i32), DateError> {
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &RELAXED_DATE)?;
-    let rest = rest
-        .strip_prefix(['t', 'T', ' '])
-        .ok_or(DateError::InvalidText)?;
+    let rest = match rest.strip_prefix(['t', 'T', ' ']) {
+        Some(tail) => tail,
+        None if rest.is_empty() => return Err(DateError::TooShort),
+        None => return Err(DateError::InvalidText),
+    };
     let rest = scan(&mut parsed, rest, &RELAXED_HOUR_MINUTE)?;
     let rest = scan(&mut parsed, rest, &RELAXED_SECOND)?.trim_start();
     let (rest, seconds) = match rest.get(..3) {
@@ -1023,42 +1093,58 @@ pub(super) fn strict_rfc3339(text: &str) -> Result<(EngineTimestamp, i32), DateE
 
 /// The fields of strict RFC 3339 text, before they are placed on the time
 /// line: for a reader that wants the date and time as written.
+///
+/// The checks run in the order chrono's `parse_rfc3339` ran them, so a text
+/// with two faults is rejected for the one chrono named: the first 19 bytes
+/// must be there, the date must exist before the `T` is looked at, and the
+/// fraction is read before the time of day is checked.
 pub(super) fn strict_rfc3339_fields(text: &str) -> Result<Parsed, DateError> {
-    let mut parsed = Parsed::default();
-    let rest = fixed(text, 4, &mut parsed.year, 0..=9999)?;
-    let rest = rest.strip_prefix('-').ok_or(DateError::InvalidText)?;
-    let rest = fixed(rest, 2, &mut parsed.month, 1..=12)?;
-    let rest = rest.strip_prefix('-').ok_or(DateError::InvalidText)?;
-    let rest = fixed(rest, 2, &mut parsed.day, 1..=31)?;
-    let rest = rest
-        .strip_prefix(['t', 'T', ' '])
-        .ok_or(DateError::InvalidText)?;
-    let mut hour = None;
-    let rest = fixed(rest, 2, &mut hour, 0..=23)?;
-    parsed.hour_div_12 = hour.map(|h| h / 12);
-    parsed.hour_mod_12 = hour.map(|h| h % 12);
-    let rest = rest.strip_prefix(':').ok_or(DateError::InvalidText)?;
-    let rest = fixed(rest, 2, &mut parsed.minute, 0..=59)?;
-    let rest = rest.strip_prefix(':').ok_or(DateError::InvalidText)?;
-    let mut rest = fixed(rest, 2, &mut parsed.second, 0..=60)?;
+    let head = text.as_bytes().get(..19).ok_or(DateError::TooShort)?;
+    let digit = |index: usize| match head.get(index) {
+        Some(&byte) if byte.is_ascii_digit() => Ok(i64::from(byte - b'0')),
+        _ => Err(DateError::InvalidText),
+    };
+    let separator = |index: usize, allowed: &[u8]| match head.get(index) {
+        Some(byte) if allowed.contains(byte) => Ok(()),
+        _ => Err(DateError::InvalidText),
+    };
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    separator(4, b"-")?;
+    let month = digit(5)? * 10 + digit(6)?;
+    separator(7, b"-")?;
+    let day = digit(8)? * 10 + digit(9)?;
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return Err(DateError::OutOfRange);
+    }
+    separator(10, b"tT ")?;
+    let hour = digit(11)? * 10 + digit(12)?;
+    separator(13, b":")?;
+    let minute = digit(14)? * 10 + digit(15)?;
+    separator(16, b":")?;
+    let second = digit(17)? * 10 + digit(18)?;
+    // The 19 bytes are ASCII digits and separators, so 19 is a boundary.
+    let mut rest = text.get(19..).ok_or(DateError::InvalidText)?;
+    let mut nanosecond = None;
     if let Some(digits) = rest.strip_prefix('.') {
         let (tail, nanos) = fraction(digits)?;
-        set(&mut parsed.nanosecond, nanos, 0..=999_999_999)?;
+        nanosecond = Some(nanos);
         rest = tail;
     }
-    let (rest, seconds) = offset(rest, Colon::Required, true, false)?;
-    set(&mut parsed.offset, seconds, i64::MIN..=i64::MAX)?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(DateError::OutOfRange);
+    }
+    let (rest, offset) = offset(rest, Colon::Required, true, false)?;
+    let parsed = Parsed {
+        year: Some(year),
+        month: Some(month),
+        day: Some(day),
+        weekday: None,
+        hour_div_12: Some(hour / 12),
+        hour_mod_12: Some(hour % 12),
+        minute: Some(minute),
+        second: Some(second),
+        nanosecond,
+        offset: Some(offset),
+    };
     finished(parsed, rest)
-}
-
-/// Reads a field of exactly `width` digits.
-fn fixed<'t>(
-    text: &'t str,
-    width: usize,
-    slot: &mut Option<i64>,
-    range: RangeInclusive<i64>,
-) -> Result<&'t str, DateError> {
-    let (rest, value) = number(text, width, width)?;
-    set(slot, value, range)?;
-    Ok(rest)
 }

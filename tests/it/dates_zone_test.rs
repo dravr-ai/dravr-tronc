@@ -78,11 +78,16 @@ fn a_zone_is_found_by_its_exact_name_only() {
         "Am\u{e9}rica/Toronto",
     ] {
         assert_eq!(Zone::from_name(name), unknown(name), "{name:?}");
-        assert!(name.parse::<Tz>().is_err(), "chrono-tz accepts {name:?}");
+        // The rejection reads as chrono-tz's, word for word.
+        assert_eq!(
+            name.parse::<Zone>().unwrap_err().to_string(),
+            name.parse::<Tz>().unwrap_err().to_string(),
+            "{name:?}"
+        );
     }
     assert_eq!(
         Zone::from_name("nowhere").unwrap_err().to_string(),
-        "unknown time zone `nowhere`"
+        "failed to parse timezone"
     );
 }
 

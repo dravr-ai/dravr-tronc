@@ -27,6 +27,9 @@
 //!   chrono support produced;
 //! - **the same text in**: serde, `FromStr`, the strict RFC 3339 parser and
 //!   the database decoders accept what chrono's accepted;
+//! - **the same rejections**: text refused is refused with chrono's error
+//!   kind and chrono's message, word for word ([`DateError`]), so an answer
+//!   a client got for bad input does not change;
 //! - **the same schemas**: `date-time`, `date`, `partial-date-time`,
 //!   `partial-time`, and the weekday enum;
 //! - **no panics**: every operation that can fail returns a `Result` or an

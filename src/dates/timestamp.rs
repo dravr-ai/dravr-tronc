@@ -324,9 +324,10 @@ impl Timestamp {
     ///
     /// # Errors
     ///
-    /// [`DateError::InvalidText`] when the text is not RFC 3339, and
-    /// [`DateError::OutOfRange`] when a component or the timestamp is out of
-    /// range.
+    /// The kind chrono's `parse_from_rfc3339` reported when the text is not
+    /// RFC 3339 ([`DateError::InvalidText`], [`DateError::TooShort`],
+    /// [`DateError::TooLong`]), and [`DateError::OutOfRange`] when a
+    /// component or the timestamp is out of range.
     pub fn parse_from_rfc3339(text: &str) -> Result<Self, DateError> {
         Self::parse_from_rfc3339_with_offset(text).map(|(timestamp, _)| timestamp)
     }
@@ -368,8 +369,9 @@ impl Timestamp {
     ///
     /// # Errors
     ///
-    /// [`DateError::InvalidText`] when the text does not match or carries no
-    /// offset, [`DateError::OutOfRange`] when it is not a timestamp in range,
+    /// The kind chrono reported when the text does not match or names no
+    /// timestamp ([`DateError::NotEnough`] when it carries no offset),
+    /// [`DateError::OutOfRange`] when it is not a timestamp in range,
     /// and [`DateError::UnsupportedFormat`] for a specifier that cannot be
     /// read.
     pub fn parse_from_str(text: &str, format: &str) -> Result<Self, DateError> {

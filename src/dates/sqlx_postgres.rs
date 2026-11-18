@@ -310,6 +310,8 @@ mod tests {
 
     #[test]
     fn timestamptz_text_is_read_with_its_short_offset() {
+        use chrono::DateTime as ChronoDateTime;
+
         assert_eq!(
             Timestamp::from_pg_text("2026-11-17 10:00:00.1+00"),
             Ok(timestamp("2026-11-17T10:00:00.100Z"))
@@ -322,9 +324,15 @@ mod tests {
             Timestamp::from_pg_text("2026-11-17 15:30:00+05:30"),
             Ok(timestamp("2026-11-17T10:00:00Z"))
         );
+        // No offset: the text ends where `%#z` wanted one, as chrono read it.
         assert_eq!(
             Timestamp::from_pg_text("2026-11-17 10:00:00"),
-            Err(DateError::InvalidText)
+            Err(DateError::TooShort)
+        );
+        assert_eq!(
+            ChronoDateTime::parse_from_str("2026-11-17 10:00:00", TIMESTAMPTZ_TEXT)
+                .map_err(|error| error.to_string()),
+            Err(DateError::TooShort.to_string())
         );
     }
 
