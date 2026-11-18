@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 
-use super::{CivilDate, CivilDateTime, CivilTime, Instant, Weekday};
+use super::{CivilDate, CivilDateTime, CivilTime, Timestamp, Weekday};
 
 macro_rules! formatted_string_schema {
     ($type:ident, $format:literal) => {
@@ -22,7 +22,7 @@ macro_rules! formatted_string_schema {
             }
 
             fn schema_id() -> Cow<'static, str> {
-                concat!("dravr_tronc::time::", stringify!($type)).into()
+                concat!("dravr_tronc::dates::", stringify!($type)).into()
             }
 
             fn json_schema(_: &mut SchemaGenerator) -> Schema {
@@ -35,7 +35,7 @@ macro_rules! formatted_string_schema {
     };
 }
 
-formatted_string_schema!(Instant, "date-time");
+formatted_string_schema!(Timestamp, "date-time");
 formatted_string_schema!(CivilDate, "date");
 formatted_string_schema!(CivilDateTime, "partial-date-time");
 formatted_string_schema!(CivilTime, "partial-time");
@@ -50,7 +50,7 @@ impl JsonSchema for Weekday {
     }
 
     fn schema_id() -> Cow<'static, str> {
-        "dravr_tronc::time::Weekday".into()
+        "dravr_tronc::dates::Weekday".into()
     }
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {

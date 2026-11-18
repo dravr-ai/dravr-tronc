@@ -5,7 +5,7 @@
 // Copyright (c) 2026 dravr.ai
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use dravr_tronc::time::{CivilDate, CivilDateTime, CivilTime, Instant, Weekday};
+use dravr_tronc::dates::{CivilDate, CivilDateTime, CivilTime, Timestamp, Weekday};
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,8 +18,8 @@ fn schema<T: JsonSchema>() -> Value {
 fn each_type_has_the_recorded_schema() {
     let draft = "https://json-schema.org/draft/2020-12/schema";
     assert_eq!(
-        schema::<Instant>(),
-        json!({"$schema": draft, "title": "Instant", "type": "string", "format": "date-time"})
+        schema::<Timestamp>(),
+        json!({"$schema": draft, "title": "Timestamp", "type": "string", "format": "date-time"})
     );
     assert_eq!(
         schema::<CivilDate>(),
@@ -48,14 +48,14 @@ fn each_type_has_the_recorded_schema() {
 #[derive(JsonSchema, Serialize, Deserialize)]
 struct Session {
     /// When the session started.
-    started_at: Instant,
-    ended_at: Option<Instant>,
+    started_at: Timestamp,
+    ended_at: Option<Timestamp>,
     day: CivilDate,
     #[serde(default)]
     wake: Option<CivilTime>,
     local_start: CivilDateTime,
     rest_day: Weekday,
-    laps: Vec<Instant>,
+    laps: Vec<Timestamp>,
 }
 
 /// The same struct on chrono, under the same name and the same doc comments

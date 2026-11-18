@@ -1,4 +1,4 @@
-// ABOUTME: Dravr-owned date and time types: Instant, CivilDate, CivilTime, CivilDateTime, Weekday, Zone, Elapsed
+// ABOUTME: Dravr-owned date and time types: Timestamp, CivilDate, CivilTime, CivilDateTime, Weekday, Zone, Elapsed
 // ABOUTME: The date library that does the work is private to this module and appears in no public signature
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -22,7 +22,7 @@
 //! names it**: replacing or upgrading it is an internal change to this
 //! crate. What the types promise instead is what the code already relied on:
 //!
-//! - **the same bytes out**: serde output, [`Instant::to_rfc3339`], the
+//! - **the same bytes out**: serde output, [`Timestamp::to_rfc3339`], the
 //!   SQLite text and the PostgreSQL binary values are what chrono and sqlx's
 //!   chrono support produced;
 //! - **the same text in**: serde, `FromStr`, the strict RFC 3339 parser and
@@ -36,7 +36,7 @@
 //!
 //! | Type | Replaces | What it is |
 //! |---|---|---|
-//! | [`Instant`] | `DateTime<Utc>` | A point on the UTC time line |
+//! | [`Timestamp`] | `DateTime<Utc>` | A point on the UTC time line |
 //! | [`CivilDate`] | `NaiveDate` | A calendar date, `YYYY-MM-DD` |
 //! | [`CivilTime`] | `NaiveTime` | A time of day |
 //! | [`CivilDateTime`] | `NaiveDateTime` | A date and a time of day, no zone |
@@ -44,9 +44,9 @@
 //! | `Zone` (feature `zones`) | `chrono_tz::Tz` | An IANA zone, found by name |
 //! | [`Elapsed`] | `Duration` / `TimeDelta` | A signed, exact length of time |
 //!
-//! `DateTime<FixedOffset>` has no counterpart: keep the [`Instant`], and
+//! `DateTime<FixedOffset>` has no counterpart: keep the [`Timestamp`], and
 //! where the sender's offset is read, keep it beside it
-//! ([`Instant::parse_from_rfc3339_with_offset`]).
+//! ([`Timestamp::parse_from_rfc3339_with_offset`]).
 //!
 //! # Features
 //!
@@ -67,14 +67,14 @@
 //! as they are.
 //!
 //! ```
-//! use dravr_tronc::time::{CivilDate, Instant};
+//! use dravr_tronc::dates::{CivilDate, Timestamp};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Goal {
-//!     created_at: Instant,        // was DateTime<Utc>
+//!     created_at: Timestamp,        // was DateTime<Utc>
 //!     target_date: CivilDate,     // was NaiveDate
-//!     achieved_at: Option<Instant>,
+//!     achieved_at: Option<Timestamp>,
 //! }
 //!
 //! let json = r#"{"created_at":"2026-11-17T10:00:00.100Z","target_date":"2027-04-25","achieved_at":null}"#;
@@ -87,15 +87,15 @@
 //!
 //! | chrono | here |
 //! |---|---|
-//! | `Utc::now()` | [`Instant::now()`] |
-//! | `.timestamp()`, `.timestamp_millis()` | [`Instant::epoch_seconds`], [`Instant::epoch_millis`] |
-//! | `DateTime::from_timestamp(s, 0)` | [`Instant::from_epoch_seconds`] (a `Result`) |
+//! | `Utc::now()` | [`Timestamp::now()`] |
+//! | `.timestamp()`, `.timestamp_millis()` | [`Timestamp::epoch_seconds`], [`Timestamp::epoch_millis`] |
+//! | `DateTime::from_timestamp(s, 0)` | [`Timestamp::from_epoch_seconds`] (a `Result`) |
 //! | `.to_rfc3339()`, `.to_rfc3339_opts(..)` | the same names, the same bytes |
-//! | `DateTime::parse_from_rfc3339(s)` | [`Instant::parse_from_rfc3339`] |
+//! | `DateTime::parse_from_rfc3339(s)` | [`Timestamp::parse_from_rfc3339`] |
 //! | `now - Duration::days(7)` | `now - Elapsed::days(7)` |
 //! | `a.signed_duration_since(b).num_days()` | the same names |
-//! | `.date_naive()` | [`Instant::utc_date`] |
-//! | `.with_timezone(&tz).date_naive()` | `zone.date_at(instant)` |
+//! | `.date_naive()` | [`Timestamp::utc_date`] |
+//! | `.with_timezone(&tz).date_naive()` | `zone.date_at(timestamp)` |
 //! | `date.and_hms_opt(h, m, s)?.and_utc()` | `date.and_hms(h, m, s)?.and_utc()?` |
 //! | `tz.from_local_datetime(&dt).earliest()` | `zone.resolve(dt).earliest()` |
 //! | `date + Months::new(1)` | [`CivilDate::checked_add_months`] |
@@ -103,7 +103,7 @@
 //!
 //! # What is deliberately different
 //!
-//! - **An instant has no calendar arithmetic.** `Instant + Elapsed` is exact
+//! - **A timestamp has no calendar arithmetic.** `Timestamp + Elapsed` is exact
 //!   seconds, and [`Elapsed::days`] is 86,400 of them, which is what
 //!   `Duration::days` always meant. Adding a month, or a day that follows
 //!   the local clock across a daylight-saving change, is done on a
@@ -123,7 +123,7 @@
 //!
 //! `format` and `parse_from_str` take `strftime` strings and implement the
 //! specifiers below with chrono's output and chrono's leniency. Any other
-//! specifier is [`TimeError::UnsupportedFormat`], never a silent difference.
+//! specifier is [`DateError::UnsupportedFormat`], never a silent difference.
 //!
 //! | Written and read | Written only |
 //! |---|---|
@@ -139,7 +139,6 @@ mod civil_datetime;
 mod civil_time;
 mod elapsed;
 mod error;
-mod instant;
 #[cfg(feature = "schemars1")]
 mod schema;
 mod serde_impls;
@@ -148,6 +147,7 @@ mod sqlx_postgres;
 #[cfg(feature = "sqlx08-sqlite")]
 mod sqlx_sqlite;
 mod text;
+mod timestamp;
 mod weekday;
 #[cfg(feature = "zones")]
 mod zone;
@@ -156,8 +156,8 @@ pub use civil_date::CivilDate;
 pub use civil_datetime::CivilDateTime;
 pub use civil_time::CivilTime;
 pub use elapsed::Elapsed;
-pub use error::TimeError;
-pub use instant::{Instant, SecondsFormat};
+pub use error::DateError;
+pub use timestamp::{SecondsFormat, Timestamp};
 pub use weekday::Weekday;
 #[cfg(feature = "zones")]
 pub use zone::{LocalResolution, Zone};

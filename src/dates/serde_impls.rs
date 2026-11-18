@@ -11,7 +11,7 @@ use std::str::FromStr;
 use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::{CivilDate, CivilDateTime, CivilTime, Instant, SecondsFormat, Weekday};
+use super::{CivilDate, CivilDateTime, CivilTime, SecondsFormat, Timestamp, Weekday};
 
 /// Reads a string and hands it to the type's `FromStr`.
 struct TextVisitor<T> {
@@ -56,9 +56,9 @@ macro_rules! text_serde {
 }
 
 text_serde!(
-    Instant,
+    Timestamp,
     "an RFC 3339 formatted date and time string",
-    |instant| instant.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    |timestamp| timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 );
 text_serde!(CivilDate, "a formatted date string", |date| date);
 text_serde!(CivilTime, "a formatted time string", |time| time);

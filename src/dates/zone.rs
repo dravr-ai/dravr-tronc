@@ -1,5 +1,5 @@
 // ABOUTME: Zone, the Dravr-owned IANA time zone that replaces chrono_tz::Tz, on a zone database compiled in
-// ABOUTME: Converts between instants and wall-clock readings and reports gaps and folds the way chrono did
+// ABOUTME: Converts between timestamps and wall-clock readings and reports gaps and folds the way chrono did
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -13,9 +13,9 @@ use jiff::tz::{AmbiguousOffset, Offset, TimeZone, TimeZoneDatabase};
 
 use super::civil_date::CivilDate;
 use super::civil_datetime::CivilDateTime;
-use super::error::TimeError;
-use super::instant::Instant;
+use super::error::DateError;
 use super::text::{self, Moment};
+use super::timestamp::Timestamp;
 
 /// The zone database compiled into the binary. Named explicitly and never
 /// the process-wide default, so the host's zone files, a `TZDIR` variable or
@@ -42,19 +42,19 @@ const PLACEHOLDER_ZONE: &str = "Factory";
 /// in.
 ///
 /// ```
-/// use dravr_tronc::time::{CivilDate, Instant, Zone};
+/// use dravr_tronc::dates::{CivilDate, Timestamp, Zone};
 ///
 /// let zone = Zone::from_name("America/Toronto")?;
-/// let instant = Instant::parse_from_rfc3339("2026-07-01T03:30:00Z")?;
+/// let timestamp = Timestamp::parse_from_rfc3339("2026-07-01T03:30:00Z")?;
 ///
 /// // The athlete's calendar day is still 30 June.
-/// assert_eq!(zone.date_at(instant), CivilDate::from_ymd(2026, 6, 30)?);
-/// assert_eq!(zone.offset_seconds_at(instant), -4 * 3600);
+/// assert_eq!(zone.date_at(timestamp), CivilDate::from_ymd(2026, 6, 30)?);
+/// assert_eq!(zone.offset_seconds_at(timestamp), -4 * 3600);
 ///
 /// // 02:30 on the night the clocks go forward does not exist.
 /// let skipped = CivilDate::from_ymd(2026, 3, 8)?.and_hms(2, 30, 0)?;
 /// assert_eq!(zone.resolve(skipped).earliest(), None);
-/// # Ok::<(), dravr_tronc::time::TimeError>(())
+/// # Ok::<(), dravr_tronc::dates::DateError>(())
 /// ```
 #[derive(Clone)]
 pub struct Zone {
@@ -62,7 +62,7 @@ pub struct Zone {
     rules: TimeZone,
 }
 
-/// What a wall-clock reading is in a zone: one instant, two, or none.
+/// What a wall-clock reading is in a zone: one timestamp, two, or none.
 ///
 /// The counterpart of chrono's `LocalResult`, with the same three cases and
 /// the same accessors, so a call site that wrote
@@ -71,39 +71,39 @@ pub struct Zone {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LocalResolution {
     /// The reading does not exist: the clocks jumped over it (a spring
-    /// "gap"), or it is outside the range of [`Instant`].
+    /// "gap"), or it is outside the range of [`Timestamp`].
     None,
     /// The reading happens exactly once.
-    Single(Instant),
+    Single(Timestamp),
     /// The reading happens twice, because the clocks were set back over it
-    /// (an autumn "fold"): the earlier instant, then the later one.
-    Ambiguous(Instant, Instant),
+    /// (an autumn "fold"): the earlier timestamp, then the later one.
+    Ambiguous(Timestamp, Timestamp),
 }
 
 impl LocalResolution {
-    /// The instant when there is exactly one.
+    /// The timestamp when there is exactly one.
     #[must_use]
-    pub const fn single(self) -> Option<Instant> {
+    pub const fn single(self) -> Option<Timestamp> {
         match self {
-            Self::Single(instant) => Some(instant),
+            Self::Single(timestamp) => Some(timestamp),
             Self::None | Self::Ambiguous(..) => None,
         }
     }
 
-    /// The only instant, or the first of two. `None` in a gap.
+    /// The only timestamp, or the first of two. `None` in a gap.
     #[must_use]
-    pub const fn earliest(self) -> Option<Instant> {
+    pub const fn earliest(self) -> Option<Timestamp> {
         match self {
-            Self::Single(instant) | Self::Ambiguous(instant, _) => Some(instant),
+            Self::Single(timestamp) | Self::Ambiguous(timestamp, _) => Some(timestamp),
             Self::None => None,
         }
     }
 
-    /// The only instant, or the second of two. `None` in a gap.
+    /// The only timestamp, or the second of two. `None` in a gap.
     #[must_use]
-    pub const fn latest(self) -> Option<Instant> {
+    pub const fn latest(self) -> Option<Timestamp> {
         match self {
-            Self::Single(instant) | Self::Ambiguous(_, instant) => Some(instant),
+            Self::Single(timestamp) | Self::Ambiguous(_, timestamp) => Some(timestamp),
             Self::None => None,
         }
     }
@@ -124,10 +124,10 @@ impl Zone {
     ///
     /// # Errors
     ///
-    /// [`TimeError::UnknownZone`] when the compiled-in database has no zone
+    /// [`DateError::UnknownZone`] when the compiled-in database has no zone
     /// of that name.
-    pub fn from_name(name: &str) -> Result<Self, TimeError> {
-        let unknown = || TimeError::UnknownZone(name.to_owned());
+    pub fn from_name(name: &str) -> Result<Self, DateError> {
+        let unknown = || DateError::UnknownZone(name.to_owned());
         let rules = database().get(name).map_err(|_| unknown())?;
         // The database matches without regard to case, and knows two
         // placeholders for "no zone was set"; chrono-tz did neither.
@@ -146,36 +146,36 @@ impl Zone {
         &self.name
     }
 
-    /// The date and time of day the zone's clocks show at `instant`. What
-    /// `instant.with_timezone(&tz).naive_local()` returned.
+    /// The date and time of day the zone's clocks show at `timestamp`. What
+    /// `timestamp.with_timezone(&tz).naive_local()` returned.
     #[must_use]
-    pub fn civil_at(&self, instant: Instant) -> CivilDateTime {
-        CivilDateTime(self.rules.to_datetime(instant.0))
+    pub fn civil_at(&self, timestamp: Timestamp) -> CivilDateTime {
+        CivilDateTime(self.rules.to_datetime(timestamp.0))
     }
 
-    /// The calendar date in the zone at `instant`: the athlete's local day.
-    /// What `instant.with_timezone(&tz).date_naive()` returned.
+    /// The calendar date in the zone at `timestamp`: the athlete's local day.
+    /// What `timestamp.with_timezone(&tz).date_naive()` returned.
     #[must_use]
-    pub fn date_at(&self, instant: Instant) -> CivilDate {
-        self.civil_at(instant).date()
+    pub fn date_at(&self, timestamp: Timestamp) -> CivilDate {
+        self.civil_at(timestamp).date()
     }
 
-    /// The zone's offset at `instant`, in seconds east of UTC.
+    /// The zone's offset at `timestamp`, in seconds east of UTC.
     #[must_use]
-    pub fn offset_seconds_at(&self, instant: Instant) -> i32 {
-        self.rules.to_offset(instant.0).seconds()
+    pub fn offset_seconds_at(&self, timestamp: Timestamp) -> i32 {
+        self.rules.to_offset(timestamp.0).seconds()
     }
 
-    /// The zone's abbreviation at `instant`, such as `EST` or `CEST`.
+    /// The zone's abbreviation at `timestamp`, such as `EST` or `CEST`.
     #[must_use]
-    pub fn abbreviation_at(&self, instant: Instant) -> String {
+    pub fn abbreviation_at(&self, timestamp: Timestamp) -> String {
         self.rules
-            .to_offset_info(instant.0)
+            .to_offset_info(timestamp.0)
             .abbreviation()
             .to_owned()
     }
 
-    /// The instant or instants at which the zone's clocks show `local`.
+    /// The timestamp or timestamps at which the zone's clocks show `local`.
     ///
     /// A reading the clocks skipped is [`LocalResolution::None`] and one
     /// they showed twice is [`LocalResolution::Ambiguous`]; nothing is
@@ -190,12 +190,12 @@ impl Zone {
         };
         // The engine reports the offsets on each side of the nearest change
         // of rule. An offset counts only when it is the zone's own at the
-        // instant it gives, so every answer shows `local` on the zone's
-        // clocks. That is no instant in a gap, and one where the rule
+        // timestamp it gives, so every answer shows `local` on the zone's
+        // clocks. That is no timestamp in a gap, and one where the rule
         // changed and the clocks did not move.
         let shown_at = |offset: Offset| {
-            let instant = offset.to_timestamp(local.0).ok()?;
-            (self.rules.to_offset(instant) == offset).then_some(Instant(instant))
+            let timestamp = offset.to_timestamp(local.0).ok()?;
+            (self.rules.to_offset(timestamp) == offset).then_some(Timestamp(timestamp))
         };
         match (shown_at(before), shown_at(after)) {
             (Some(first), Some(second)) if first < second => {
@@ -209,36 +209,36 @@ impl Zone {
         }
     }
 
-    /// The first instant of `date` in the zone.
+    /// The first timestamp of `date` in the zone.
     ///
     /// Usually local midnight. Where the clocks skip midnight (a zone that
-    /// goes forward at 00:00) it is the first instant after the gap, and
+    /// goes forward at 00:00) it is the first timestamp after the gap, and
     /// where midnight happens twice it is the first of the two. Total where
     /// `resolve(date.at_midnight())` is not.
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] at the ends of the range of [`Instant`].
-    pub fn start_of_day(&self, date: CivilDate) -> Result<Instant, TimeError> {
+    /// [`DateError::OutOfRange`] at the ends of the range of [`Timestamp`].
+    pub fn start_of_day(&self, date: CivilDate) -> Result<Timestamp, DateError> {
         self.rules
             .to_ambiguous_timestamp(date.at_midnight().0)
             .compatible()
-            .map(Instant)
-            .map_err(|_| TimeError::OutOfRange)
+            .map(Timestamp)
+            .map_err(|_| DateError::OutOfRange)
     }
 
-    /// Formats `instant` as the zone's clocks show it, with a `strftime`
+    /// Formats `timestamp` as the zone's clocks show it, with a `strftime`
     /// string. `%z` and `%:z` write the zone's offset and `%Z` its
-    /// abbreviation. The [module documentation](crate::time#format-strings)
+    /// abbreviation. The [module documentation](crate::dates#format-strings)
     /// lists the specifiers.
     ///
     /// # Errors
     ///
-    /// [`TimeError::UnsupportedFormat`] for a specifier that is not
+    /// [`DateError::UnsupportedFormat`] for a specifier that is not
     /// implemented.
-    pub fn format(&self, instant: Instant, format: &str) -> Result<String, TimeError> {
-        let info = self.rules.to_offset_info(instant.0);
-        let civil = info.offset().to_datetime(instant.0);
+    pub fn format(&self, timestamp: Timestamp, format: &str) -> Result<String, DateError> {
+        let info = self.rules.to_offset_info(timestamp.0);
+        let civil = info.offset().to_datetime(timestamp.0);
         text::format(
             &Moment {
                 date: Some(civil.date()),
@@ -281,9 +281,9 @@ impl fmt::Debug for Zone {
 }
 
 impl FromStr for Zone {
-    type Err = TimeError;
+    type Err = DateError;
 
-    fn from_str(name: &str) -> Result<Self, TimeError> {
+    fn from_str(name: &str) -> Result<Self, DateError> {
         Self::from_name(name)
     }
 }
@@ -295,19 +295,19 @@ mod tests {
     use chrono_tz::TZ_VARIANTS;
     use jiff::civil::date;
     use jiff::tz::TimeZone;
-    use jiff::{SignedDuration, Timestamp};
+    use jiff::{SignedDuration, Timestamp as EngineTimestamp};
 
-    use super::{database, Instant, LocalResolution, Zone};
+    use super::{database, LocalResolution, Timestamp, Zone};
 
-    fn utc_midnight(year: i16) -> Timestamp {
+    fn utc_midnight(year: i16) -> EngineTimestamp {
         TimeZone::UTC
             .to_timestamp(date(year, 1, 1).at(0, 0, 0, 0))
             .unwrap()
     }
 
     /// Whether the reading `zone` shows at `at` resolves back to `at`, and
-    /// every instant it resolves to shows that reading.
-    fn round_trips(zone: &Zone, at: Instant) -> bool {
+    /// every timestamp it resolves to shows that reading.
+    fn round_trips(zone: &Zone, at: Timestamp) -> bool {
         let local = zone.civil_at(at);
         match zone.resolve(local) {
             LocalResolution::Single(only) => only == at,
@@ -325,10 +325,10 @@ mod tests {
     /// rule it lists from 1900 to 2040: each quarter hour from three hours
     /// before the change to three hours after it. The changes are the ones
     /// the engine lists, so this reaches years the uniform grid in
-    /// `tests/it/time_zone_test.rs` does not, and that grid reaches readings
+    /// `tests/it/dates_zone_test.rs` does not, and that grid reaches readings
     /// far from any listed change.
     #[test]
-    fn a_reading_resolves_back_to_its_instant_around_every_change_of_rule() {
+    fn a_reading_resolves_back_to_its_timestamp_around_every_change_of_rule() {
         let (from, until) = (utc_midnight(1900), utc_midnight(2040));
         let quarter = SignedDuration::from_mins(15);
         let (mut zones, mut changes, mut broken) = (0, 0, Vec::new());
@@ -344,7 +344,7 @@ mod tests {
             {
                 changes += 1;
                 for step in -12..=12 {
-                    let at = Instant(change.timestamp() + quarter * step);
+                    let at = Timestamp(change.timestamp() + quarter * step);
                     if !round_trips(&zone, at) {
                         let local = zone.civil_at(at);
                         broken.push(format!("{name} {at} {local}: {:?}", zone.resolve(local)));

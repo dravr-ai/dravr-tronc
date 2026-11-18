@@ -11,7 +11,7 @@ use std::str::FromStr;
 use jiff::civil::Time;
 
 use super::elapsed::Elapsed;
-use super::error::TimeError;
+use super::error::DateError;
 use super::text::{self, FractionDigits, Moment};
 
 /// A time of day with no date and no zone: `07:30:00`.
@@ -22,13 +22,13 @@ use super::text::{self, FractionDigits, Moment};
 /// as `23:59:59`.
 ///
 /// ```
-/// use dravr_tronc::time::{CivilTime, Elapsed};
+/// use dravr_tronc::dates::{CivilTime, Elapsed};
 ///
 /// let time = CivilTime::from_hms(23, 30, 0)?;
 /// assert_eq!((time + Elapsed::hours(1)).to_string(), "00:30:00");
 /// assert_eq!("7:05".parse::<CivilTime>()?, CivilTime::from_hms(7, 5, 0)?);
 /// assert_eq!(CivilTime::from_hms_milli(7, 5, 0, 250)?.to_string(), "07:05:00.250");
-/// # Ok::<(), dravr_tronc::time::TimeError>(())
+/// # Ok::<(), dravr_tronc::dates::DateError>(())
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct CivilTime(pub(super) Time);
@@ -43,8 +43,8 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when a component is out of range.
-    pub fn from_hms(hour: u32, minute: u32, second: u32) -> Result<Self, TimeError> {
+    /// [`DateError::OutOfRange`] when a component is out of range.
+    pub fn from_hms(hour: u32, minute: u32, second: u32) -> Result<Self, DateError> {
         Self::from_hms_nano(hour, minute, second, 0)
     }
 
@@ -52,16 +52,16 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when a component is out of range.
+    /// [`DateError::OutOfRange`] when a component is out of range.
     pub fn from_hms_milli(
         hour: u32,
         minute: u32,
         second: u32,
         millisecond: u32,
-    ) -> Result<Self, TimeError> {
+    ) -> Result<Self, DateError> {
         let nanosecond = millisecond
             .checked_mul(1_000_000)
-            .ok_or(TimeError::OutOfRange)?;
+            .ok_or(DateError::OutOfRange)?;
         Self::from_hms_nano(hour, minute, second, nanosecond)
     }
 
@@ -69,16 +69,16 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when a component is out of range.
+    /// [`DateError::OutOfRange`] when a component is out of range.
     pub fn from_hms_micro(
         hour: u32,
         minute: u32,
         second: u32,
         microsecond: u32,
-    ) -> Result<Self, TimeError> {
+    ) -> Result<Self, DateError> {
         let nanosecond = microsecond
             .checked_mul(1_000)
-            .ok_or(TimeError::OutOfRange)?;
+            .ok_or(DateError::OutOfRange)?;
         Self::from_hms_nano(hour, minute, second, nanosecond)
     }
 
@@ -87,20 +87,20 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when a component is out of range.
+    /// [`DateError::OutOfRange`] when a component is out of range.
     pub fn from_hms_nano(
         hour: u32,
         minute: u32,
         second: u32,
         nanosecond: u32,
-    ) -> Result<Self, TimeError> {
-        let hour = i8::try_from(hour).map_err(|_| TimeError::OutOfRange)?;
-        let minute = i8::try_from(minute).map_err(|_| TimeError::OutOfRange)?;
-        let second = i8::try_from(second).map_err(|_| TimeError::OutOfRange)?;
-        let nanosecond = i32::try_from(nanosecond).map_err(|_| TimeError::OutOfRange)?;
+    ) -> Result<Self, DateError> {
+        let hour = i8::try_from(hour).map_err(|_| DateError::OutOfRange)?;
+        let minute = i8::try_from(minute).map_err(|_| DateError::OutOfRange)?;
+        let second = i8::try_from(second).map_err(|_| DateError::OutOfRange)?;
+        let nanosecond = i32::try_from(nanosecond).map_err(|_| DateError::OutOfRange)?;
         Time::new(hour, minute, second, nanosecond)
             .map(Self)
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 
     /// The time this many seconds after midnight (0 to 86,399), with a
@@ -108,11 +108,11 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when that is past the end of the day.
+    /// [`DateError::OutOfRange`] when that is past the end of the day.
     pub fn from_num_seconds_from_midnight(
         seconds: u32,
         nanosecond: u32,
-    ) -> Result<Self, TimeError> {
+    ) -> Result<Self, DateError> {
         Self::from_hms_nano(seconds / 3_600, seconds / 60 % 60, seconds % 60, nanosecond)
     }
 
@@ -154,14 +154,14 @@ impl CivilTime {
     }
 
     /// Formats with a `strftime` string, such as `"%H:%M"`. The
-    /// [module documentation](crate::time#format-strings) lists the
+    /// [module documentation](crate::dates#format-strings) lists the
     /// specifiers.
     ///
     /// # Errors
     ///
-    /// [`TimeError::UnsupportedFormat`] for a specifier that is not
+    /// [`DateError::UnsupportedFormat`] for a specifier that is not
     /// implemented or that a time has no value for, such as `%Y`.
-    pub fn format(&self, format: &str) -> Result<String, TimeError> {
+    pub fn format(&self, format: &str) -> Result<String, DateError> {
         text::format(
             &Moment {
                 date: None,
@@ -177,10 +177,10 @@ impl CivilTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::InvalidText`] when the text does not match,
-    /// [`TimeError::OutOfRange`] when it is not a time, and
-    /// [`TimeError::UnsupportedFormat`] for a specifier that cannot be read.
-    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, TimeError> {
+    /// [`DateError::InvalidText`] when the text does not match,
+    /// [`DateError::OutOfRange`] when it is not a time, and
+    /// [`DateError::UnsupportedFormat`] for a specifier that cannot be read.
+    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, DateError> {
         text::parse(text, format)?.time().map(Self)
     }
 }
@@ -238,11 +238,11 @@ impl fmt::Debug for CivilTime {
 }
 
 impl FromStr for CivilTime {
-    type Err = TimeError;
+    type Err = DateError;
 
     /// Reads `HH:MM` or `HH:MM:SS` with an optional fraction, the way chrono
     /// does: digits need no padding and whitespace may surround the colons.
-    fn from_str(text: &str) -> Result<Self, TimeError> {
+    fn from_str(text: &str) -> Result<Self, DateError> {
         text::relaxed_time(text).map(Self)
     }
 }

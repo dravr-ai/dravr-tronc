@@ -5,12 +5,12 @@
 // Copyright (c) 2026 dravr.ai
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat as ChronoSeconds, Utc};
-use dravr_tronc::time::{
-    CivilDate, CivilDateTime, CivilTime, Elapsed, Instant, SecondsFormat, TimeError, Weekday,
+use dravr_tronc::dates::{
+    CivilDate, CivilDateTime, CivilTime, DateError, Elapsed, SecondsFormat, Timestamp, Weekday,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::time_support::{pair, pairs};
+use crate::dates_support::{pair, pairs};
 
 /// The serde form and the `to_rfc3339()` form of each value, written out.
 const GOLDEN: [(i64, u32, &str, &str); 12] = [
@@ -188,21 +188,21 @@ fn display_and_debug_match_chrono_for_every_value() {
 
 #[test]
 fn each_wire_type_serializes_to_its_recorded_json() {
-    let (instant, _) = pair(1_794_909_600, 100_000_000);
-    assert_eq!(json(&instant), r#""2026-11-17T10:00:00.100Z""#);
-    assert_eq!(json(&Some(instant)), r#""2026-11-17T10:00:00.100Z""#);
-    assert_eq!(json(&None::<Instant>), "null");
-    assert_eq!(json(&instant.utc_date()), r#""2026-11-17""#);
-    assert_eq!(json(&instant.utc_time()), r#""10:00:00.100""#);
+    let (timestamp, _) = pair(1_794_909_600, 100_000_000);
+    assert_eq!(json(&timestamp), r#""2026-11-17T10:00:00.100Z""#);
+    assert_eq!(json(&Some(timestamp)), r#""2026-11-17T10:00:00.100Z""#);
+    assert_eq!(json(&None::<Timestamp>), "null");
+    assert_eq!(json(&timestamp.utc_date()), r#""2026-11-17""#);
+    assert_eq!(json(&timestamp.utc_time()), r#""10:00:00.100""#);
     assert_eq!(
         json(&CivilTime::from_hms(7, 5, 0).unwrap()),
         r#""07:05:00""#
     );
     assert_eq!(
-        json(&instant.utc_datetime()),
+        json(&timestamp.utc_datetime()),
         r#""2026-11-17T10:00:00.100""#
     );
-    assert_eq!(json(&instant.utc_date().weekday()), r#""Tue""#);
+    assert_eq!(json(&timestamp.utc_date().weekday()), r#""Tue""#);
     assert_eq!(
         json(&Weekday::ALL),
         r#"["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]"#
@@ -215,13 +215,13 @@ fn each_wire_type_serializes_to_its_recorded_json() {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct Ours {
-    created_at: Instant,
-    ended_at: Option<Instant>,
+    created_at: Timestamp,
+    ended_at: Option<Timestamp>,
     day: CivilDate,
     wake: CivilTime,
     local: CivilDateTime,
     weekday: Weekday,
-    history: Vec<Instant>,
+    history: Vec<Timestamp>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -345,7 +345,7 @@ fn format_matches_chrono_for_every_specifier_and_value() {
             // The one place chrono's output is not reproduced: the century
             // of a year before 0, where it writes two meaningless characters.
             if ["%C", "%-C", "%_C"].contains(&format) && chrono::Datelike::year(&theirs) < 0 {
-                assert_eq!(ours.format(format), Err(TimeError::OutOfRange));
+                assert_eq!(ours.format(format), Err(DateError::OutOfRange));
                 skipped += 1;
                 continue;
             }
@@ -421,19 +421,19 @@ fn civil_values_format_like_chrono_naive_values() {
 
 #[test]
 fn a_format_the_value_cannot_fill_is_an_error_not_a_panic() {
-    let (instant, _) = pair(1_794_909_600, 0);
-    let unsupported = |spec: &str| Err(TimeError::UnsupportedFormat(spec.to_owned()));
-    assert_eq!(instant.format("%Y %U"), unsupported("%U"));
-    assert_eq!(instant.format("%Y %"), unsupported("%"));
-    assert_eq!(instant.format("%-"), unsupported("%-"));
-    assert_eq!(instant.format("%-a"), unsupported("%-a"));
-    assert_eq!(instant.format("%.4f"), unsupported("%.4"));
-    assert_eq!(instant.format("%#z"), unsupported("%#z"));
-    assert_eq!(instant.format("%é"), unsupported("%é"));
-    assert_eq!(instant.utc_date().format("%H"), unsupported("%H"));
-    assert_eq!(instant.utc_time().format("%Y"), unsupported("%Y"));
-    assert_eq!(instant.utc_datetime().format("%z"), unsupported("%z"));
-    assert_eq!(instant.utc_datetime().format("%Z"), unsupported("%Z"));
+    let (timestamp, _) = pair(1_794_909_600, 0);
+    let unsupported = |spec: &str| Err(DateError::UnsupportedFormat(spec.to_owned()));
+    assert_eq!(timestamp.format("%Y %U"), unsupported("%U"));
+    assert_eq!(timestamp.format("%Y %"), unsupported("%"));
+    assert_eq!(timestamp.format("%-"), unsupported("%-"));
+    assert_eq!(timestamp.format("%-a"), unsupported("%-a"));
+    assert_eq!(timestamp.format("%.4f"), unsupported("%.4"));
+    assert_eq!(timestamp.format("%#z"), unsupported("%#z"));
+    assert_eq!(timestamp.format("%é"), unsupported("%é"));
+    assert_eq!(timestamp.utc_date().format("%H"), unsupported("%H"));
+    assert_eq!(timestamp.utc_time().format("%Y"), unsupported("%Y"));
+    assert_eq!(timestamp.utc_datetime().format("%z"), unsupported("%z"));
+    assert_eq!(timestamp.utc_datetime().format("%Z"), unsupported("%Z"));
 }
 
 #[test]

@@ -7,14 +7,14 @@
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, TimeDelta, Timelike};
-use dravr_tronc::time::{
-    CivilDate, CivilDateTime, CivilTime, Elapsed, Instant, TimeError, Weekday,
+use dravr_tronc::dates::{
+    CivilDate, CivilDateTime, CivilTime, DateError, Elapsed, Timestamp, Weekday,
 };
 
-use crate::time_support::{pair, pairs};
+use crate::dates_support::{pair, pairs};
 
-fn instant(text: &str) -> Instant {
-    Instant::parse_from_rfc3339(text).unwrap()
+fn timestamp(text: &str) -> Timestamp {
+    Timestamp::parse_from_rfc3339(text).unwrap()
 }
 
 fn date(year: i32, month: u32, day: u32) -> CivilDate {
@@ -37,10 +37,10 @@ fn run(first: CivilDate, count: i64) -> Vec<CivilDate> {
 }
 
 #[test]
-fn a_day_on_an_instant_is_86_400_seconds_also_across_a_clock_change() {
-    // 2026-03-08 is the night North American clocks go forward; an instant
+fn a_day_on_an_timestamp_is_86_400_seconds_also_across_a_clock_change() {
+    // 2026-03-08 is the night North American clocks go forward; a timestamp
     // does not care.
-    let before = instant("2026-03-08T04:00:00Z");
+    let before = timestamp("2026-03-08T04:00:00Z");
     for (days, expected) in [
         (1, "2026-03-09T04:00:00Z"),
         (7, "2026-03-15T04:00:00Z"),
@@ -48,7 +48,7 @@ fn a_day_on_an_instant_is_86_400_seconds_also_across_a_clock_change() {
         (90, "2026-06-06T04:00:00Z"),
     ] {
         let later = before + Elapsed::days(days);
-        assert_eq!(later, instant(expected));
+        assert_eq!(later, timestamp(expected));
         assert_eq!((later - before).num_seconds(), days * 86_400);
         assert_eq!(later - Elapsed::days(days), before);
     }
@@ -80,7 +80,7 @@ fn nanos(value: chrono::DateTime<chrono::Utc>) -> i128 {
 
 #[test]
 fn a_difference_in_days_is_truncated_not_rounded() {
-    let start = instant("2026-11-17T10:00:00Z");
+    let start = timestamp("2026-11-17T10:00:00Z");
     for (later, days, hours) in [
         ("2026-11-18T09:59:59Z", 0, 23),
         ("2026-11-18T10:00:00Z", 1, 24),
@@ -90,13 +90,13 @@ fn a_difference_in_days_is_truncated_not_rounded() {
         ("2026-11-10T09:00:00Z", -7, -169),
         ("2026-12-17T10:00:00Z", 30, 720),
     ] {
-        let elapsed = instant(later) - start;
+        let elapsed = timestamp(later) - start;
         assert_eq!(
             (elapsed.num_days(), elapsed.num_hours()),
             (days, hours),
             "{later}"
         );
-        assert_eq!(instant(later).signed_duration_since(start), elapsed);
+        assert_eq!(timestamp(later).signed_duration_since(start), elapsed);
     }
 }
 
@@ -154,7 +154,7 @@ fn elapsed_getters_match_chrono() {
         Elapsed::seconds(90).to_std(),
         Ok(StdDuration::from_secs(90))
     );
-    assert_eq!(Elapsed::seconds(-1).to_std(), Err(TimeError::OutOfRange));
+    assert_eq!(Elapsed::seconds(-1).to_std(), Err(DateError::OutOfRange));
     assert_eq!(
         Elapsed::from_std(StdDuration::from_millis(1_500)),
         Ok(Elapsed::milliseconds(1_500))
@@ -171,44 +171,44 @@ fn epoch_getters_round_down_like_chrono() {
         assert_eq!(ours.subsec_micros(), theirs.timestamp_subsec_micros());
         assert_eq!(ours.subsec_millis(), theirs.timestamp_subsec_millis());
         assert_eq!(
-            Instant::from_epoch_millis(theirs.timestamp_millis())
+            Timestamp::from_epoch_millis(theirs.timestamp_millis())
                 .unwrap()
                 .epoch_millis(),
             theirs.timestamp_millis()
         );
         assert_eq!(
-            Instant::from_epoch_micros(theirs.timestamp_micros()).unwrap(),
-            Instant::from_epoch_nanos(i128::from(theirs.timestamp_micros()) * 1_000).unwrap()
+            Timestamp::from_epoch_micros(theirs.timestamp_micros()).unwrap(),
+            Timestamp::from_epoch_nanos(i128::from(theirs.timestamp_micros()) * 1_000).unwrap()
         );
     }
     let (before_epoch, _) = pair(-1, 500_000_000);
     assert_eq!(before_epoch.epoch_seconds(), -1);
     assert_eq!(before_epoch.epoch_millis(), -500);
     assert_eq!(before_epoch.subsec_nanos(), 500_000_000);
-    assert_eq!(Instant::default(), Instant::UNIX_EPOCH);
-    assert_eq!(Instant::UNIX_EPOCH.epoch_nanos(), 0);
+    assert_eq!(Timestamp::default(), Timestamp::UNIX_EPOCH);
+    assert_eq!(Timestamp::UNIX_EPOCH.epoch_nanos(), 0);
 }
 
 #[test]
 fn the_utc_date_turns_at_midnight() {
-    let last = instant("2026-11-17T23:59:59.999Z");
+    let last = timestamp("2026-11-17T23:59:59.999Z");
     assert_eq!(last.utc_date(), date(2026, 11, 17));
     assert_eq!(
         last.utc_time(),
         CivilTime::from_hms_milli(23, 59, 59, 999).unwrap()
     );
-    let midnight = instant("2026-11-18T00:00:00Z");
+    let midnight = timestamp("2026-11-18T00:00:00Z");
     assert_eq!(midnight.utc_date(), date(2026, 11, 18));
     assert_eq!(midnight.utc_time(), CivilTime::MIDNIGHT);
     assert_eq!(midnight.utc_datetime(), date(2026, 11, 18).at_midnight());
     assert_eq!(date(2026, 11, 18).at_midnight().and_utc(), Ok(midnight));
     assert_eq!(
         date(2026, 11, 17).and_hms(23, 59, 59).unwrap().and_utc(),
-        Ok(instant("2026-11-17T23:59:59Z"))
+        Ok(timestamp("2026-11-17T23:59:59Z"))
     );
     assert_eq!(
         date(2026, 11, 17).and_hms(24, 0, 0),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
     for (ours, theirs) in pairs() {
         assert_eq!(naive(ours.utc_date()), theirs.date_naive());
@@ -403,7 +403,7 @@ fn calendar_fields_weeks_and_iso_weeks_match_chrono() {
     );
     assert_eq!(
         CivilDate::from_iso_week(2025, 53, Weekday::Mon),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
 
     let mut compared = 0;
@@ -560,12 +560,12 @@ fn a_time_of_day_wraps_at_midnight_like_chrono() {
     );
     assert_eq!(
         CivilTime::from_num_seconds_from_midnight(86_400, 0),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
-    assert_eq!(CivilTime::from_hms(23, 59, 60), Err(TimeError::OutOfRange));
+    assert_eq!(CivilTime::from_hms(23, 59, 60), Err(DateError::OutOfRange));
     assert_eq!(
         CivilTime::from_hms_milli(1, 2, 3, 1_000),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
     assert_eq!(
         CivilTime::from_hms_micro(1, 2, 3, 4).unwrap().nanosecond(),
@@ -606,22 +606,22 @@ fn a_date_time_moves_by_exact_time_like_chrono() {
 #[test]
 fn nothing_panics_at_the_ends_of_the_range() {
     let day = Elapsed::days(1);
-    assert_eq!(Instant::MAX + day, Instant::MAX);
-    assert_eq!(Instant::MIN - day, Instant::MIN);
-    assert_eq!(Instant::MAX - Elapsed::MIN, Instant::MAX);
-    assert_eq!(Instant::MIN + Elapsed::MIN, Instant::MIN);
-    assert_eq!(Instant::MAX.checked_add(day), None);
-    assert_eq!(Instant::MIN.checked_sub(day), None);
+    assert_eq!(Timestamp::MAX + day, Timestamp::MAX);
+    assert_eq!(Timestamp::MIN - day, Timestamp::MIN);
+    assert_eq!(Timestamp::MAX - Elapsed::MIN, Timestamp::MAX);
+    assert_eq!(Timestamp::MIN + Elapsed::MIN, Timestamp::MIN);
+    assert_eq!(Timestamp::MAX.checked_add(day), None);
+    assert_eq!(Timestamp::MIN.checked_sub(day), None);
     assert_eq!(
-        Instant::MAX.checked_sub(day).map(Instant::to_rfc3339),
+        Timestamp::MAX.checked_sub(day).map(Timestamp::to_rfc3339),
         Some("9999-12-29T22:00:00.999999999+00:00".to_owned())
     );
     assert_eq!(
-        format!("{:?} {:?}", Instant::MIN, Instant::MAX),
+        format!("{:?} {:?}", Timestamp::MIN, Timestamp::MAX),
         "-9999-01-02T01:59:59Z 9999-12-30T22:00:00.999999999Z"
     );
     // The longest difference there is fits an Elapsed.
-    assert_eq!((Instant::MAX - Instant::MIN).num_days(), 7_304_481);
+    assert_eq!((Timestamp::MAX - Timestamp::MIN).num_days(), 7_304_481);
 
     assert_eq!(Elapsed::days(i64::MAX), Elapsed::MAX);
     assert_eq!(Elapsed::weeks(i64::MIN), Elapsed::MIN);
@@ -653,28 +653,28 @@ fn nothing_panics_at_the_ends_of_the_range() {
     assert_eq!(CivilDate::MIN.start_of_week(Weekday::Sun), CivilDate::MIN);
     assert_eq!(
         CivilDate::from_ymd(10_000, 1, 1),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
-    assert_eq!(CivilDate::from_ymd(2026, 13, 1), Err(TimeError::OutOfRange));
-    assert_eq!(CivilDate::from_ymd(2026, 2, 29), Err(TimeError::OutOfRange));
+    assert_eq!(CivilDate::from_ymd(2026, 13, 1), Err(DateError::OutOfRange));
+    assert_eq!(CivilDate::from_ymd(2026, 2, 29), Err(DateError::OutOfRange));
     assert_eq!(CivilDateTime::MAX + day, CivilDateTime::MAX);
     assert_eq!(CivilDateTime::MIN - day, CivilDateTime::MIN);
     assert_eq!(CivilDateTime::MAX.checked_add(day), None);
     // The calendar reaches about a day further than the time line.
-    assert_eq!(CivilDateTime::MAX.and_utc(), Err(TimeError::OutOfRange));
-    assert_eq!(CivilDateTime::MIN.and_utc(), Err(TimeError::OutOfRange));
+    assert_eq!(CivilDateTime::MAX.and_utc(), Err(DateError::OutOfRange));
+    assert_eq!(CivilDateTime::MIN.and_utc(), Err(DateError::OutOfRange));
 }
 
 #[test]
-fn an_instant_converts_to_and_from_the_system_clock_type() {
-    let value = instant("2026-11-17T10:00:00.123456789Z");
+fn a_timestamp_converts_to_and_from_the_system_clock_type() {
+    let value = timestamp("2026-11-17T10:00:00.123456789Z");
     let system = value.to_system_time().unwrap();
-    assert_eq!(Instant::try_from(system), Ok(value));
+    assert_eq!(Timestamp::try_from(system), Ok(value));
     assert_eq!(
         system.duration_since(UNIX_EPOCH).unwrap().as_nanos(),
         1_794_909_600_123_456_789
     );
-    let now = Instant::now();
-    let reference = Instant::try_from(SystemTime::now()).unwrap();
+    let now = Timestamp::now();
+    let reference = Timestamp::try_from(SystemTime::now()).unwrap();
     assert!((reference - now).abs() < Elapsed::seconds(5));
 }

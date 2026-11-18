@@ -5,12 +5,12 @@
 // Copyright (c) 2026 dravr.ai
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use dravr_tronc::time::{CivilDate, CivilDateTime, CivilTime, Instant};
+use dravr_tronc::dates::{CivilDate, CivilDateTime, CivilTime, Timestamp};
 use sqlx::encode::IsNull;
 use sqlx::postgres::{PgArgumentBuffer, PgHasArrayType, PgTypeInfo};
 use sqlx::{Encode, Postgres, Type, TypeInfo};
 
-use crate::time_support::{pair, pairs};
+use crate::dates_support::{pair, pairs};
 
 fn bytes<'q, T: Encode<'q, Postgres>>(value: &T) -> Vec<u8> {
     let mut buffer = PgArgumentBuffer::default();
@@ -21,37 +21,37 @@ fn bytes<'q, T: Encode<'q, Postgres>>(value: &T) -> Vec<u8> {
 
 #[test]
 fn the_bytes_sent_are_the_recorded_ones() {
-    let (instant, _) = pair(1_794_909_600, 123_456_789);
+    let (timestamp, _) = pair(1_794_909_600, 123_456_789);
     // 848,224,800,123,456 microseconds since 2000-01-01, big endian; the
     // 789 nanoseconds are dropped.
     assert_eq!(
-        bytes(&instant),
+        bytes(&timestamp),
         [0x00, 0x03, 0x03, 0x74, 0xb9, 0xe6, 0xaa, 0x40]
     );
     assert_eq!(
-        bytes(&instant.utc_datetime()),
+        bytes(&timestamp.utc_datetime()),
         [0x00, 0x03, 0x03, 0x74, 0xb9, 0xe6, 0xaa, 0x40]
     );
     // Day 9,817 since 2000-01-01.
-    assert_eq!(bytes(&instant.utc_date()), [0x00, 0x00, 0x26, 0x59]);
+    assert_eq!(bytes(&timestamp.utc_date()), [0x00, 0x00, 0x26, 0x59]);
     // 36,000,123,456 microseconds since midnight.
     assert_eq!(
-        bytes(&instant.utc_time()),
+        bytes(&timestamp.utc_time()),
         [0x00, 0x00, 0x00, 0x08, 0x61, 0xc6, 0x4a, 0x40]
     );
     assert_eq!(
-        bytes(&Instant::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap()),
+        bytes(&Timestamp::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap()),
         [0; 8]
     );
     // One microsecond before the PostgreSQL epoch.
     assert_eq!(
-        bytes(&Instant::parse_from_rfc3339("1999-12-31T23:59:59.999999Z").unwrap()),
+        bytes(&Timestamp::parse_from_rfc3339("1999-12-31T23:59:59.999999Z").unwrap()),
         [0xff; 8]
     );
-    assert_eq!(bytes(&Some(instant)), bytes(&instant));
+    assert_eq!(bytes(&Some(timestamp)), bytes(&timestamp));
     let mut buffer = PgArgumentBuffer::default();
     assert!(matches!(
-        Encode::<Postgres>::encode_by_ref(&None::<Instant>, &mut buffer),
+        Encode::<Postgres>::encode_by_ref(&None::<Timestamp>, &mut buffer),
         Ok(IsNull::Yes)
     ));
 }
@@ -109,7 +109,7 @@ fn the_declared_types_are_the_ones_sqlx_chrono_declares() {
         assert_eq!(ours.oid().map(|o| o.0), Some(array_oid));
         assert!(<Vec<Ours> as Type<Postgres>>::compatible(&theirs));
     }
-    same::<Instant, DateTime<Utc>>(1184, 1185);
+    same::<Timestamp, DateTime<Utc>>(1184, 1185);
     same::<CivilDateTime, NaiveDateTime>(1114, 1115);
     same::<CivilDate, NaiveDate>(1082, 1182);
     same::<CivilTime, NaiveTime>(1083, 1183);
@@ -117,17 +117,19 @@ fn the_declared_types_are_the_ones_sqlx_chrono_declares() {
     // A column of another type is still refused.
     let text = <String as Type<Postgres>>::type_info();
     assert_eq!(text.name(), "TEXT");
-    assert!(!<Instant as Type<Postgres>>::compatible(&text));
+    assert!(!<Timestamp as Type<Postgres>>::compatible(&text));
     assert!(!<CivilDate as Type<Postgres>>::compatible(
         &<DateTime<Utc> as Type<Postgres>>::type_info()
     ));
-    assert!(!<Instant as Type<Postgres>>::type_info().type_eq(&PgTypeInfo::with_name("timestamp")));
+    assert!(
+        !<Timestamp as Type<Postgres>>::type_info().type_eq(&PgTypeInfo::with_name("timestamp"))
+    );
 }
 
 #[test]
-fn an_array_of_instants_encodes_like_an_array_of_chrono_values() {
+fn an_array_of_timestamps_encodes_like_an_array_of_chrono_values() {
     let all = pairs();
-    let ours: Vec<Instant> = all.iter().map(|(o, _)| *o).collect();
+    let ours: Vec<Timestamp> = all.iter().map(|(o, _)| *o).collect();
     let theirs: Vec<DateTime<Utc>> = all.iter().map(|(_, t)| *t).collect();
     let encoded = bytes(&ours);
     assert_eq!(encoded, bytes(&theirs));

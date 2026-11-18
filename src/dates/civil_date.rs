@@ -1,5 +1,5 @@
 // ABOUTME: CivilDate, the Dravr-owned calendar date that replaces chrono's NaiveDate
-// ABOUTME: Holds the calendar arithmetic (days, months, weeks) that an instant deliberately does not have
+// ABOUTME: Holds the calendar arithmetic (days, months, weeks) that a timestamp deliberately does not have
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -14,7 +14,7 @@ use jiff::Span;
 use super::civil_datetime::CivilDateTime;
 use super::civil_time::CivilTime;
 use super::elapsed::Elapsed;
-use super::error::TimeError;
+use super::error::DateError;
 use super::text::{self, Moment};
 use super::weekday::Weekday;
 
@@ -31,14 +31,14 @@ use super::weekday::Weekday;
 /// stops at the bound in the operators.
 ///
 /// ```
-/// use dravr_tronc::time::{CivilDate, Elapsed, Weekday};
+/// use dravr_tronc::dates::{CivilDate, Elapsed, Weekday};
 ///
 /// let date = CivilDate::from_ymd(2026, 1, 31)?;
 /// assert_eq!(date.weekday(), Weekday::Sat);
 /// assert_eq!(date.checked_add_months(1), Some(CivilDate::from_ymd(2026, 2, 28)?));
 /// assert_eq!((date + Elapsed::days(1)).to_string(), "2026-02-01");
 /// assert_eq!("2026-01-31".parse::<CivilDate>()?, date);
-/// # Ok::<(), dravr_tronc::time::TimeError>(())
+/// # Ok::<(), dravr_tronc::dates::DateError>(())
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CivilDate(pub(super) Date);
@@ -53,14 +53,14 @@ impl CivilDate {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when there is no such date.
-    pub fn from_ymd(year: i32, month: u32, day: u32) -> Result<Self, TimeError> {
-        let year = i16::try_from(year).map_err(|_| TimeError::OutOfRange)?;
-        let month = i8::try_from(month).map_err(|_| TimeError::OutOfRange)?;
-        let day = i8::try_from(day).map_err(|_| TimeError::OutOfRange)?;
+    /// [`DateError::OutOfRange`] when there is no such date.
+    pub fn from_ymd(year: i32, month: u32, day: u32) -> Result<Self, DateError> {
+        let year = i16::try_from(year).map_err(|_| DateError::OutOfRange)?;
+        let month = i8::try_from(month).map_err(|_| DateError::OutOfRange)?;
+        let day = i8::try_from(day).map_err(|_| DateError::OutOfRange)?;
         Date::new(year, month, day)
             .map(Self)
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 
     /// The date of an ISO 8601 week: the week-numbering year, the week (1 to
@@ -68,13 +68,13 @@ impl CivilDate {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when that year has no such week.
-    pub fn from_iso_week(year: i32, week: u32, weekday: Weekday) -> Result<Self, TimeError> {
-        let year = i16::try_from(year).map_err(|_| TimeError::OutOfRange)?;
-        let week = i8::try_from(week).map_err(|_| TimeError::OutOfRange)?;
+    /// [`DateError::OutOfRange`] when that year has no such week.
+    pub fn from_iso_week(year: i32, week: u32, weekday: Weekday) -> Result<Self, DateError> {
+        let year = i16::try_from(year).map_err(|_| DateError::OutOfRange)?;
+        let week = i8::try_from(week).map_err(|_| DateError::OutOfRange)?;
         ISOWeekDate::new(year, week, weekday.to_engine())
             .map(|week_date| Self(Date::from_iso_week_date(week_date)))
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 
     /// The year.
@@ -252,8 +252,8 @@ impl CivilDate {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when that is not a time of day.
-    pub fn and_hms(self, hour: u32, minute: u32, second: u32) -> Result<CivilDateTime, TimeError> {
+    /// [`DateError::OutOfRange`] when that is not a time of day.
+    pub fn and_hms(self, hour: u32, minute: u32, second: u32) -> Result<CivilDateTime, DateError> {
         Ok(self.and_time(CivilTime::from_hms(hour, minute, second)?))
     }
 
@@ -264,14 +264,14 @@ impl CivilDate {
     }
 
     /// Formats with a `strftime` string, such as `"%Y-%m-%d"` or `"%a %-d %b"`.
-    /// The [module documentation](crate::time#format-strings) lists the
+    /// The [module documentation](crate::dates#format-strings) lists the
     /// specifiers.
     ///
     /// # Errors
     ///
-    /// [`TimeError::UnsupportedFormat`] for a specifier that is not
+    /// [`DateError::UnsupportedFormat`] for a specifier that is not
     /// implemented or that a date has no value for, such as `%H`.
-    pub fn format(&self, format: &str) -> Result<String, TimeError> {
+    pub fn format(&self, format: &str) -> Result<String, DateError> {
         text::format(
             &Moment {
                 date: Some(self.0),
@@ -287,10 +287,10 @@ impl CivilDate {
     ///
     /// # Errors
     ///
-    /// [`TimeError::InvalidText`] when the text does not match,
-    /// [`TimeError::OutOfRange`] when it is not a date, and
-    /// [`TimeError::UnsupportedFormat`] for a specifier that cannot be read.
-    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, TimeError> {
+    /// [`DateError::InvalidText`] when the text does not match,
+    /// [`DateError::OutOfRange`] when it is not a date, and
+    /// [`DateError::UnsupportedFormat`] for a specifier that cannot be read.
+    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, DateError> {
         text::parse(text, format)?.date().map(Self)
     }
 }
@@ -357,11 +357,11 @@ impl fmt::Debug for CivilDate {
 }
 
 impl FromStr for CivilDate {
-    type Err = TimeError;
+    type Err = DateError;
 
     /// Reads `YYYY-MM-DD` the way chrono does: digits need no padding and
     /// whitespace may surround the dashes and follow the date.
-    fn from_str(text: &str) -> Result<Self, TimeError> {
+    fn from_str(text: &str) -> Result<Self, DateError> {
         text::relaxed_date(text).map(Self)
     }
 }

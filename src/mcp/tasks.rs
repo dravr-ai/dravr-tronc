@@ -34,9 +34,9 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::dates::{SecondsFormat, Timestamp};
 use crate::error::INTERNAL_ERROR;
 use crate::mcp::random_id::random_hex_id;
-use crate::time::{Instant, SecondsFormat};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::AbortHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -181,7 +181,7 @@ impl Task {
 /// The current ISO 8601 timestamp, millisecond precision, in UTC.
 #[must_use]
 pub fn current_timestamp() -> String {
-    Instant::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Timestamp::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Status-specific payload inlined alongside the base [`Task`] fields.
@@ -523,10 +523,10 @@ fn is_expired(task: &Task) -> bool {
     let Some(ttl_ms) = task.ttl_ms else {
         return false;
     };
-    let Ok(created) = Instant::parse_from_rfc3339(&task.created_at) else {
+    let Ok(created) = Timestamp::parse_from_rfc3339(&task.created_at) else {
         return false;
     };
-    let elapsed = Instant::now().signed_duration_since(created);
+    let elapsed = Timestamp::now().signed_duration_since(created);
     elapsed.num_milliseconds() > i64::try_from(ttl_ms).unwrap_or(i64::MAX)
 }
 

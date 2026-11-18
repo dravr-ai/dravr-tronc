@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use jiff::civil::Weekday as EngineWeekday;
 
-use super::error::TimeError;
+use super::error::DateError;
 use super::text::SHORT_WEEKDAYS;
 
 /// What follows the first three letters of each full weekday name, Monday
@@ -24,7 +24,7 @@ const LONG_SUFFIXES: [&str; 7] = ["day", "sday", "nesday", "rsday", "day", "urda
 /// chrono does.
 ///
 /// ```
-/// use dravr_tronc::time::Weekday;
+/// use dravr_tronc::dates::Weekday;
 ///
 /// assert_eq!(Weekday::Sun.succ(), Weekday::Mon);
 /// assert_eq!(Weekday::Wed.num_days_from_monday(), 2);
@@ -165,11 +165,11 @@ impl fmt::Display for Weekday {
 }
 
 impl FromStr for Weekday {
-    type Err = TimeError;
+    type Err = DateError;
 
     /// Reads the short or the full English name, in any case.
-    fn from_str(text: &str) -> Result<Self, TimeError> {
-        let (head, tail) = text.split_at_checked(3).ok_or(TimeError::InvalidText)?;
+    fn from_str(text: &str) -> Result<Self, DateError> {
+        let (head, tail) = text.split_at_checked(3).ok_or(DateError::InvalidText)?;
         Self::ALL
             .into_iter()
             .zip(LONG_SUFFIXES)
@@ -178,6 +178,6 @@ impl FromStr for Weekday {
                     && (tail.is_empty() || tail.eq_ignore_ascii_case(suffix))
             })
             .map(|(day, _)| day)
-            .ok_or(TimeError::InvalidText)
+            .ok_or(DateError::InvalidText)
     }
 }

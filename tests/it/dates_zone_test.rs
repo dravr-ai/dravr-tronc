@@ -11,8 +11,8 @@ use std::thread;
 use chrono::offset::LocalResult;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::{Tz, TZ_VARIANTS};
-use dravr_tronc::time::{
-    CivilDate, CivilDateTime, Elapsed, Instant, LocalResolution, TimeError, Zone,
+use dravr_tronc::dates::{
+    CivilDate, CivilDateTime, DateError, Elapsed, LocalResolution, Timestamp, Zone,
 };
 
 /// Zones whose rules did not change between 2025b and today, with and
@@ -30,16 +30,16 @@ const STABLE_ZONES: [&str; 9] = [
     "Asia/Tokyo",
 ];
 
-fn instant(text: &str) -> Instant {
-    Instant::parse_from_rfc3339(text).unwrap()
+fn timestamp(text: &str) -> Timestamp {
+    Timestamp::parse_from_rfc3339(text).unwrap()
 }
 
 fn date(year: i32, month: u32, day: u32) -> CivilDate {
     CivilDate::from_ymd(year, month, day).unwrap()
 }
 
-fn ours_of(value: DateTime<Utc>) -> Instant {
-    Instant::from_epoch_seconds_and_nanos(value.timestamp(), value.timestamp_subsec_nanos())
+fn ours_of(value: DateTime<Utc>) -> Timestamp {
+    Timestamp::from_epoch_seconds_and_nanos(value.timestamp(), value.timestamp_subsec_nanos())
         .unwrap()
 }
 
@@ -62,7 +62,7 @@ fn every_chrono_tz_zone_name_is_a_zone() {
 
 #[test]
 fn a_zone_is_found_by_its_exact_name_only() {
-    let unknown = |name: &str| Err(TimeError::UnknownZone(name.to_owned()));
+    let unknown = |name: &str| Err(DateError::UnknownZone(name.to_owned()));
     for name in [
         "america/toronto",
         "AMERICA/TORONTO",
@@ -109,7 +109,7 @@ fn zones_compare_and_hash_by_name() {
 fn the_local_day_and_offset_are_the_recorded_ones() {
     let toronto = Zone::from_name("America/Toronto").unwrap();
     // 03:30 UTC on 1 July is still 30 June in Toronto.
-    let summer = instant("2026-07-01T03:30:00Z");
+    let summer = timestamp("2026-07-01T03:30:00Z");
     assert_eq!(toronto.date_at(summer), date(2026, 6, 30));
     assert_eq!(
         format!("{:?}", toronto.civil_at(summer)),
@@ -117,31 +117,31 @@ fn the_local_day_and_offset_are_the_recorded_ones() {
     );
     assert_eq!(toronto.offset_seconds_at(summer), -14_400);
     assert_eq!(toronto.abbreviation_at(summer), "EDT");
-    let winter = instant("2026-01-15T03:30:00Z");
+    let winter = timestamp("2026-01-15T03:30:00Z");
     assert_eq!(toronto.date_at(winter), date(2026, 1, 14));
     assert_eq!(toronto.offset_seconds_at(winter), -18_000);
     assert_eq!(toronto.abbreviation_at(winter), "EST");
     // The local date across the spring gap and the autumn overlap.
     assert_eq!(
-        toronto.date_at(instant("2026-03-08T06:59:59Z")),
+        toronto.date_at(timestamp("2026-03-08T06:59:59Z")),
         date(2026, 3, 8)
     );
     assert_eq!(
-        format!("{:?}", toronto.civil_at(instant("2026-03-08T07:00:00Z"))),
+        format!("{:?}", toronto.civil_at(timestamp("2026-03-08T07:00:00Z"))),
         "2026-03-08T03:00:00"
     );
     assert_eq!(
-        format!("{:?}", toronto.civil_at(instant("2026-11-01T05:30:00Z"))),
+        format!("{:?}", toronto.civil_at(timestamp("2026-11-01T05:30:00Z"))),
         "2026-11-01T01:30:00"
     );
     assert_eq!(
-        format!("{:?}", toronto.civil_at(instant("2026-11-01T06:30:00Z"))),
+        format!("{:?}", toronto.civil_at(timestamp("2026-11-01T06:30:00Z"))),
         "2026-11-01T01:30:00"
     );
     let kathmandu = Zone::from_name("Asia/Kathmandu").unwrap();
     assert_eq!(kathmandu.offset_seconds_at(summer), 20_700);
     assert_eq!(
-        kathmandu.date_at(instant("2026-06-30T18:15:00Z")),
+        kathmandu.date_at(timestamp("2026-06-30T18:15:00Z")),
         date(2026, 7, 1)
     );
     assert_eq!(Zone::utc().civil_at(summer), summer.utc_datetime());
@@ -199,7 +199,7 @@ fn resolution_of(result: LocalResult<DateTime<Tz>>) -> LocalResolution {
 }
 
 #[test]
-fn gaps_and_folds_resolve_to_the_recorded_instants() {
+fn gaps_and_folds_resolve_to_the_recorded_timestamps() {
     let toronto = Zone::from_name("America/Toronto").unwrap();
     let at = |day: CivilDate, h, m| day.and_hms(h, m, 0).unwrap();
 
@@ -214,8 +214,8 @@ fn gaps_and_folds_resolve_to_the_recorded_instants() {
     // Clocks go from 02:00 back to 01:00: 01:30 happens twice.
     let fold = toronto.resolve(at(date(2026, 11, 1), 1, 30));
     let (first, second) = (
-        instant("2026-11-01T05:30:00Z"),
-        instant("2026-11-01T06:30:00Z"),
+        timestamp("2026-11-01T05:30:00Z"),
+        timestamp("2026-11-01T06:30:00Z"),
     );
     assert_eq!(fold, LocalResolution::Ambiguous(first, second));
     assert_eq!(
@@ -224,7 +224,7 @@ fn gaps_and_folds_resolve_to_the_recorded_instants() {
     );
 
     let plain = toronto.resolve(at(date(2026, 11, 17), 5, 0));
-    let only = instant("2026-11-17T10:00:00Z");
+    let only = timestamp("2026-11-17T10:00:00Z");
     assert_eq!(plain, LocalResolution::Single(only));
     assert_eq!(
         (plain.single(), plain.earliest(), plain.latest()),
@@ -233,7 +233,7 @@ fn gaps_and_folds_resolve_to_the_recorded_instants() {
     // The edges of the gap and of the fold.
     assert_eq!(
         toronto.resolve(at(date(2026, 3, 8), 1, 59)).single(),
-        Some(instant("2026-03-08T06:59:00Z"))
+        Some(timestamp("2026-03-08T06:59:00Z"))
     );
     assert_eq!(
         toronto.resolve(at(date(2026, 3, 8), 2, 0)),
@@ -241,11 +241,11 @@ fn gaps_and_folds_resolve_to_the_recorded_instants() {
     );
     assert_eq!(
         toronto.resolve(at(date(2026, 3, 8), 3, 0)).single(),
-        Some(instant("2026-03-08T07:00:00Z"))
+        Some(timestamp("2026-03-08T07:00:00Z"))
     );
     assert_eq!(
         toronto.resolve(at(date(2026, 11, 1), 2, 0)).single(),
-        Some(instant("2026-11-01T07:00:00Z"))
+        Some(timestamp("2026-11-01T07:00:00Z"))
     );
     assert_eq!(
         Zone::utc().resolve(CivilDateTime::MAX),
@@ -313,18 +313,18 @@ fn a_change_of_rule_that_keeps_the_offset_is_not_a_fold() {
             let local = date(2023, 10, 28).and_hms(23, minute, 0).unwrap();
             assert_eq!(
                 zone.resolve(local),
-                LocalResolution::Single(instant(utc)),
+                LocalResolution::Single(timestamp(utc)),
                 "{name} {local}"
             );
-            assert_eq!(zone.civil_at(instant(utc)), local, "{name} {utc}");
+            assert_eq!(zone.civil_at(timestamp(utc)), local, "{name} {utc}");
         }
     }
 }
 
-/// What must hold for every instant in every zone: the reading the clocks
-/// show at `at` resolves back to `at`, and every instant a reading resolves
+/// What must hold for every timestamp in every zone: the reading the clocks
+/// show at `at` resolves back to `at`, and every timestamp a reading resolves
 /// to shows that reading. Returns whether the reading was a fold.
-fn assert_round_trip(zone: &Zone, at: Instant) -> bool {
+fn assert_round_trip(zone: &Zone, at: Timestamp) -> bool {
     let local = zone.civil_at(at);
     let resolved = zone.resolve(local);
     let name = zone.name();
@@ -352,10 +352,10 @@ const GRID_YEARS: (i32, i32) = (2022, 2026);
 const GRID_STEP_MINUTES: i64 = 30;
 
 /// Walks `names` over the grid from `first` to `end`, and returns how many
-/// instants it checked and how many of them were in a fold.
-fn walk_grid(names: &[&str], first: Instant, end: Instant) -> (u64, u64) {
+/// timestamps it checked and how many of them were in a fold.
+fn walk_grid(names: &[&str], first: Timestamp, end: Timestamp) -> (u64, u64) {
     let step = Elapsed::minutes(GRID_STEP_MINUTES);
-    let (mut instants, mut folds) = (0, 0);
+    let (mut timestamps, mut folds) = (0, 0);
     for name in names {
         let zone = Zone::from_name(name).unwrap();
         let (mut at, mut day) = (first, zone.date_at(first));
@@ -363,18 +363,18 @@ fn walk_grid(names: &[&str], first: Instant, end: Instant) -> (u64, u64) {
             folds += u64::from(assert_round_trip(&zone, at));
             let today = zone.date_at(at);
             if today != day {
-                // The first instant of a day is in that day and not after
-                // any instant of it.
+                // The first timestamp of a day is in that day and not after
+                // any timestamp of it.
                 let start = zone.start_of_day(today).unwrap();
                 assert_eq!(zone.date_at(start), today, "{name} {today}");
                 assert!(start <= at, "{name} {today}: {start} after {at}");
                 day = today;
             }
             at = at.checked_add(step).unwrap();
-            instants += 1;
+            timestamps += 1;
         }
     }
-    (instants, folds)
+    (timestamps, folds)
 }
 
 /// Covers every chrono-tz zone name, every 30 minutes from 2022 through
@@ -384,7 +384,7 @@ fn walk_grid(names: &[&str], first: Instant, end: Instant) -> (u64, u64) {
 /// looked for offset changes. Every transition of every zone from 1900 to
 /// 2040 is covered by the unit test beside `Zone`, which can list them.
 #[test]
-fn a_reading_resolves_back_to_its_instant_in_every_zone() {
+fn a_reading_resolves_back_to_its_timestamp_in_every_zone() {
     let first = date(GRID_YEARS.0, 1, 1).at_midnight().and_utc().unwrap();
     let end = date(GRID_YEARS.1 + 1, 1, 1)
         .at_midnight()
@@ -392,37 +392,37 @@ fn a_reading_resolves_back_to_its_instant_in_every_zone() {
         .unwrap();
     let names: Vec<&str> = TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
     let workers = thread::available_parallelism().map_or(4, usize::from);
-    let (instants, folds) = (AtomicU64::new(0), AtomicU64::new(0));
+    let (timestamps, folds) = (AtomicU64::new(0), AtomicU64::new(0));
     // The scope joins every worker, and fails the test when one of them
     // failed an assertion.
     thread::scope(|scope| {
         for chunk in names.chunks(names.len().div_ceil(workers)) {
-            let (instants, folds) = (&instants, &folds);
+            let (timestamps, folds) = (&timestamps, &folds);
             scope.spawn(move || {
                 let (checked, folded) = walk_grid(chunk, first, end);
-                instants.fetch_add(checked, Ordering::Relaxed);
+                timestamps.fetch_add(checked, Ordering::Relaxed);
                 folds.fetch_add(folded, Ordering::Relaxed);
             });
         }
     });
-    let (instants, folds) = (instants.into_inner(), folds.into_inner());
+    let (timestamps, folds) = (timestamps.into_inner(), folds.into_inner());
     let per_zone =
         u64::try_from(end.signed_duration_since(first).num_minutes() / GRID_STEP_MINUTES).unwrap();
-    assert_eq!(instants, per_zone * u64::try_from(names.len()).unwrap());
+    assert_eq!(timestamps, per_zone * u64::try_from(names.len()).unwrap());
     // Folds were met: the grid is not all plain readings.
     assert!(folds > 1_000, "folds {folds}");
 }
 
 #[test]
-fn the_start_of_a_day_is_its_first_instant_even_without_a_midnight() {
+fn the_start_of_a_day_is_its_first_timestamp_even_without_a_midnight() {
     let toronto = Zone::from_name("America/Toronto").unwrap();
     assert_eq!(
         toronto.start_of_day(date(2026, 11, 17)),
-        Ok(instant("2026-11-17T05:00:00Z"))
+        Ok(timestamp("2026-11-17T05:00:00Z"))
     );
     assert_eq!(
         toronto.start_of_day(date(2026, 7, 1)),
-        Ok(instant("2026-07-01T04:00:00Z"))
+        Ok(timestamp("2026-07-01T04:00:00Z"))
     );
     // A day with a clock change is 23 or 25 hours long.
     let length = |day: CivilDate| {
@@ -433,7 +433,7 @@ fn the_start_of_a_day_is_its_first_instant_even_without_a_midnight() {
     assert_eq!(length(date(2026, 11, 17)), Elapsed::hours(24));
 
     // In 2018 Brazil went forward at midnight: 4 November had no 00:00,
-    // which chrono-tz reports as no instant at all.
+    // which chrono-tz reports as no timestamp at all.
     let sao_paulo = Zone::from_name("America/Sao_Paulo").unwrap();
     let no_midnight = date(2018, 11, 4);
     assert_eq!(
@@ -442,10 +442,13 @@ fn the_start_of_a_day_is_its_first_instant_even_without_a_midnight() {
     );
     assert_eq!(
         sao_paulo.start_of_day(no_midnight),
-        Ok(instant("2018-11-04T03:00:00Z"))
+        Ok(timestamp("2018-11-04T03:00:00Z"))
     );
     assert_eq!(
-        format!("{:?}", sao_paulo.civil_at(instant("2018-11-04T03:00:00Z"))),
+        format!(
+            "{:?}",
+            sao_paulo.civil_at(timestamp("2018-11-04T03:00:00Z"))
+        ),
         "2018-11-04T01:00:00"
     );
     // Cuba goes back at 01:00 to 00:00: midnight happens twice, and the day
@@ -454,17 +457,17 @@ fn the_start_of_a_day_is_its_first_instant_even_without_a_midnight() {
     assert_eq!(
         havana.resolve(date(2024, 11, 3).at_midnight()),
         LocalResolution::Ambiguous(
-            instant("2024-11-03T04:00:00Z"),
-            instant("2024-11-03T05:00:00Z")
+            timestamp("2024-11-03T04:00:00Z"),
+            timestamp("2024-11-03T05:00:00Z")
         )
     );
     assert_eq!(
         havana.start_of_day(date(2024, 11, 3)),
-        Ok(instant("2024-11-03T04:00:00Z"))
+        Ok(timestamp("2024-11-03T04:00:00Z"))
     );
     assert_eq!(
         Zone::utc().start_of_day(CivilDate::MIN),
-        Err(TimeError::OutOfRange)
+        Err(DateError::OutOfRange)
     );
 
     // Where midnight exists once, it is what chrono-tz resolved.
@@ -485,9 +488,9 @@ fn the_start_of_a_day_is_its_first_instant_even_without_a_midnight() {
 }
 
 #[test]
-fn a_zone_formats_an_instant_as_its_clocks_show_it() {
+fn a_zone_formats_an_timestamp_as_its_clocks_show_it() {
     let paris = Zone::from_name("Europe/Paris").unwrap();
-    let at = instant("2026-07-14T10:00:00.250Z");
+    let at = timestamp("2026-07-14T10:00:00.250Z");
     assert_eq!(
         paris.format(at, "%Y-%m-%d %H:%M:%S%.3f %Z %z %:z"),
         Ok("2026-07-14 12:00:00.250 CEST +0200 +02:00".to_owned())
@@ -498,6 +501,6 @@ fn a_zone_formats_an_instant_as_its_clocks_show_it() {
     );
     assert_eq!(
         paris.format(at, "%U"),
-        Err(TimeError::UnsupportedFormat("%U".to_owned()))
+        Err(DateError::UnsupportedFormat("%U".to_owned()))
     );
 }

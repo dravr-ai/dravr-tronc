@@ -6,7 +6,7 @@
 
 //! | Type | PostgreSQL type | Binary value |
 //! |---|---|---|
-//! | [`Instant`] | `TIMESTAMPTZ` | `i64` microseconds since 2000-01-01T00:00:00Z |
+//! | [`Timestamp`] | `TIMESTAMPTZ` | `i64` microseconds since 2000-01-01T00:00:00Z |
 //! | [`CivilDateTime`] | `TIMESTAMP` | `i64` microseconds since 2000-01-01T00:00:00 |
 //! | [`CivilDate`] | `DATE` | `i32` days since 2000-01-01 |
 //! | [`CivilTime`] | `TIME` | `i64` microseconds since midnight |
@@ -22,15 +22,15 @@ use std::mem;
 
 use jiff::civil::{Date, DateTime, Time};
 use jiff::tz::Offset;
-use jiff::{SignedDuration, Timestamp};
+use jiff::{SignedDuration, Timestamp as EngineTimestamp};
 use sqlx::encode::IsNull;
 use sqlx::error::BoxDynError;
 use sqlx::postgres::types::Oid;
 use sqlx::postgres::{PgArgumentBuffer, PgHasArrayType, PgTypeInfo, PgValueFormat, PgValueRef};
 use sqlx::{Decode, Encode, Postgres, Type};
 
-use super::error::TimeError;
-use super::{CivilDate, CivilDateTime, CivilTime, Instant};
+use super::error::DateError;
+use super::{CivilDate, CivilDateTime, CivilTime, Timestamp};
 
 const DATE: Oid = Oid(1082);
 const TIME: Oid = Oid(1083);
@@ -49,42 +49,42 @@ const TIMESTAMPTZ_TEXT: &str = "%Y-%m-%d %H:%M:%S%.f%#z";
 const TIMESTAMP_TEXT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 /// Microseconds from the PostgreSQL epoch to a date and time, toward zero.
-fn micros_since_epoch(civil: DateTime) -> Result<i64, TimeError> {
-    i64::try_from(civil.duration_since(EPOCH).as_micros()).map_err(|_| TimeError::OutOfRange)
+fn micros_since_epoch(civil: DateTime) -> Result<i64, DateError> {
+    i64::try_from(civil.duration_since(EPOCH).as_micros()).map_err(|_| DateError::OutOfRange)
 }
 
 /// The date and time `micros` microseconds from the PostgreSQL epoch.
-fn civil_at_micros(micros: i64) -> Result<DateTime, TimeError> {
+fn civil_at_micros(micros: i64) -> Result<DateTime, DateError> {
     EPOCH
         .checked_add(SignedDuration::from_micros(micros))
-        .map_err(|_| TimeError::OutOfRange)
+        .map_err(|_| DateError::OutOfRange)
 }
 
-fn utc_instant(civil: DateTime) -> Result<Timestamp, TimeError> {
+fn utc_timestamp(civil: DateTime) -> Result<EngineTimestamp, DateError> {
     Offset::UTC
         .to_timestamp(civil)
-        .map_err(|_| TimeError::OutOfRange)
+        .map_err(|_| DateError::OutOfRange)
 }
 
-impl Instant {
+impl Timestamp {
     /// The `TIMESTAMPTZ` binary value: microseconds since 2000-01-01 UTC.
-    fn to_pg_micros(self) -> Result<i64, TimeError> {
+    fn to_pg_micros(self) -> Result<i64, DateError> {
         micros_since_epoch(Offset::UTC.to_datetime(self.0))
     }
 
-    fn from_pg_micros(micros: i64) -> Result<Self, TimeError> {
-        utc_instant(civil_at_micros(micros)?).map(Self)
+    fn from_pg_micros(micros: i64) -> Result<Self, DateError> {
+        utc_timestamp(civil_at_micros(micros)?).map(Self)
     }
 
     /// The text form PostgreSQL sends outside the extended protocol:
     /// `2026-11-17 10:00:00.1+00`.
-    fn from_pg_text(value: &str) -> Result<Self, TimeError> {
+    fn from_pg_text(value: &str) -> Result<Self, DateError> {
         Self::parse_from_str(value, TIMESTAMPTZ_TEXT)
     }
 }
 
 impl CivilDateTime {
-    fn from_pg_text(value: &str) -> Result<Self, TimeError> {
+    fn from_pg_text(value: &str) -> Result<Self, DateError> {
         let format = if value.contains('+') {
             TIMESTAMPTZ_TEXT
         } else {
@@ -96,16 +96,16 @@ impl CivilDateTime {
 
 impl CivilDate {
     /// The `DATE` binary value: days since 2000-01-01.
-    fn to_pg_days(self) -> Result<i32, TimeError> {
+    fn to_pg_days(self) -> Result<i32, DateError> {
         i32::try_from(self.0.duration_since(EPOCH_DATE).as_hours() / 24)
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 
-    fn from_pg_days(days: i32) -> Result<Self, TimeError> {
+    fn from_pg_days(days: i32) -> Result<Self, DateError> {
         EPOCH_DATE
             .checked_add(SignedDuration::from_hours(i64::from(days) * 24))
             .map(Self)
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 }
 
@@ -122,19 +122,19 @@ impl CivilTime {
     }
 }
 
-impl Type<Postgres> for Instant {
+impl Type<Postgres> for Timestamp {
     fn type_info() -> PgTypeInfo {
         PgTypeInfo::with_oid(TIMESTAMPTZ)
     }
 }
 
-impl PgHasArrayType for Instant {
+impl PgHasArrayType for Timestamp {
     fn array_type_info() -> PgTypeInfo {
         PgTypeInfo::with_oid(TIMESTAMPTZ_ARRAY)
     }
 }
 
-impl Encode<'_, Postgres> for Instant {
+impl Encode<'_, Postgres> for Timestamp {
     fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Postgres>::encode(self.to_pg_micros()?, buf)
     }
@@ -144,7 +144,7 @@ impl Encode<'_, Postgres> for Instant {
     }
 }
 
-impl<'r> Decode<'r, Postgres> for Instant {
+impl<'r> Decode<'r, Postgres> for Timestamp {
     fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
         Ok(match value.format() {
             PgValueFormat::Binary => Self::from_pg_micros(Decode::<Postgres>::decode(value)?)?,
@@ -250,19 +250,19 @@ impl<'r> Decode<'r, Postgres> for CivilTime {
 mod tests {
     use super::*;
 
-    fn instant(text: &str) -> Instant {
-        Instant::parse_from_rfc3339(text).unwrap()
+    fn timestamp(text: &str) -> Timestamp {
+        Timestamp::parse_from_rfc3339(text).unwrap()
     }
 
     #[test]
     fn timestamptz_counts_microseconds_from_the_year_2000() {
-        assert_eq!(instant("2000-01-01T00:00:00Z").to_pg_micros(), Ok(0));
+        assert_eq!(timestamp("2000-01-01T00:00:00Z").to_pg_micros(), Ok(0));
         assert_eq!(
-            instant("2026-11-17T10:00:00.123456Z").to_pg_micros(),
+            timestamp("2026-11-17T10:00:00.123456Z").to_pg_micros(),
             Ok(848_224_800_123_456)
         );
         assert_eq!(
-            instant("1999-12-31T23:59:59Z").to_pg_micros(),
+            timestamp("1999-12-31T23:59:59Z").to_pg_micros(),
             Ok(-1_000_000)
         );
     }
@@ -272,15 +272,15 @@ mod tests {
         // After 2000 the remainder is cut; before 2000 it is cut toward
         // zero too, which is one microsecond later than rounding down.
         assert_eq!(
-            instant("2000-01-01T00:00:00.000001999Z").to_pg_micros(),
+            timestamp("2000-01-01T00:00:00.000001999Z").to_pg_micros(),
             Ok(1)
         );
         assert_eq!(
-            instant("1999-12-31T23:59:59.999998001Z").to_pg_micros(),
+            timestamp("1999-12-31T23:59:59.999998001Z").to_pg_micros(),
             Ok(-1)
         );
         assert_eq!(
-            instant("1969-07-20T20:17:40.123456789Z").to_pg_micros(),
+            timestamp("1969-07-20T20:17:40.123456789Z").to_pg_micros(),
             Ok(-960_867_739_876_543)
         );
     }
@@ -294,37 +294,37 @@ mod tests {
             "0001-01-01T00:00:00Z",
             "9999-12-30T21:59:59.999999Z",
         ] {
-            let value = instant(text);
+            let value = timestamp(text);
             let micros = value.to_pg_micros().unwrap();
-            assert_eq!(Instant::from_pg_micros(micros), Ok(value), "{text}");
+            assert_eq!(Timestamp::from_pg_micros(micros), Ok(value), "{text}");
         }
         assert_eq!(
-            Instant::from_pg_micros(i64::MAX),
-            Err(TimeError::OutOfRange)
+            Timestamp::from_pg_micros(i64::MAX),
+            Err(DateError::OutOfRange)
         );
         assert_eq!(
-            Instant::from_pg_micros(i64::MIN),
-            Err(TimeError::OutOfRange)
+            Timestamp::from_pg_micros(i64::MIN),
+            Err(DateError::OutOfRange)
         );
     }
 
     #[test]
     fn timestamptz_text_is_read_with_its_short_offset() {
         assert_eq!(
-            Instant::from_pg_text("2026-11-17 10:00:00.1+00"),
-            Ok(instant("2026-11-17T10:00:00.100Z"))
+            Timestamp::from_pg_text("2026-11-17 10:00:00.1+00"),
+            Ok(timestamp("2026-11-17T10:00:00.100Z"))
         );
         assert_eq!(
-            Instant::from_pg_text("2026-11-17 05:00:00-05"),
-            Ok(instant("2026-11-17T10:00:00Z"))
+            Timestamp::from_pg_text("2026-11-17 05:00:00-05"),
+            Ok(timestamp("2026-11-17T10:00:00Z"))
         );
         assert_eq!(
-            Instant::from_pg_text("2026-11-17 15:30:00+05:30"),
-            Ok(instant("2026-11-17T10:00:00Z"))
+            Timestamp::from_pg_text("2026-11-17 15:30:00+05:30"),
+            Ok(timestamp("2026-11-17T10:00:00Z"))
         );
         assert_eq!(
-            Instant::from_pg_text("2026-11-17 10:00:00"),
-            Err(TimeError::InvalidText)
+            Timestamp::from_pg_text("2026-11-17 10:00:00"),
+            Err(DateError::InvalidText)
         );
     }
 
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(CivilDate::from_pg_days(-10_957), Ok(date(1970, 1, 1)));
         assert_eq!(
             CivilDate::from_pg_days(i32::MAX),
-            Err(TimeError::OutOfRange)
+            Err(DateError::OutOfRange)
         );
     }
 

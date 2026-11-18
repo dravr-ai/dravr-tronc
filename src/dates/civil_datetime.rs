@@ -1,5 +1,5 @@
 // ABOUTME: CivilDateTime, the Dravr-owned date and time of day that replaces chrono's NaiveDateTime
-// ABOUTME: A wall-clock reading with no zone; it becomes an instant only through UTC or a Zone
+// ABOUTME: A wall-clock reading with no zone; it becomes a timestamp only through UTC or a Zone
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -14,9 +14,9 @@ use jiff::tz::Offset;
 use super::civil_date::CivilDate;
 use super::civil_time::CivilTime;
 use super::elapsed::Elapsed;
-use super::error::TimeError;
-use super::instant::Instant;
+use super::error::DateError;
 use super::text::{self, FractionDigits, Moment};
+use super::timestamp::Timestamp;
 
 /// A calendar date and a time of day, with no zone: `2026-11-17T07:30:00`.
 ///
@@ -30,14 +30,14 @@ use super::text::{self, FractionDigits, Moment};
 /// SQLite it is `YYYY-MM-DD HH:MM:SS`.
 ///
 /// ```
-/// use dravr_tronc::time::{CivilDate, CivilDateTime, Elapsed};
+/// use dravr_tronc::dates::{CivilDate, CivilDateTime, Elapsed};
 ///
 /// let local = CivilDate::from_ymd(2026, 11, 17)?.and_hms(7, 30, 0)?;
 /// assert_eq!(format!("{local:?}"), "2026-11-17T07:30:00");
 /// assert_eq!(local.to_string(), "2026-11-17 07:30:00");
 /// assert_eq!((local + Elapsed::hours(20)).date(), CivilDate::from_ymd(2026, 11, 18)?);
 /// assert_eq!(local.and_utc()?.to_rfc3339(), "2026-11-17T07:30:00+00:00");
-/// # Ok::<(), dravr_tronc::time::TimeError>(())
+/// # Ok::<(), dravr_tronc::dates::DateError>(())
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CivilDateTime(pub(super) DateTime);
@@ -67,17 +67,17 @@ impl CivilDateTime {
         CivilTime(self.0.time())
     }
 
-    /// The instant at which UTC clocks show this reading.
+    /// The timestamp at which UTC clocks show this reading.
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] within a day or two of the ends of the
-    /// range, where [`Instant`] reaches less far than the calendar.
-    pub fn and_utc(self) -> Result<Instant, TimeError> {
+    /// [`DateError::OutOfRange`] within a day or two of the ends of the
+    /// range, where [`Timestamp`] reaches less far than the calendar.
+    pub fn and_utc(self) -> Result<Timestamp, DateError> {
         Offset::UTC
             .to_timestamp(self.0)
-            .map(Instant)
-            .map_err(|_| TimeError::OutOfRange)
+            .map(Timestamp)
+            .map_err(|_| DateError::OutOfRange)
     }
 
     /// This reading `elapsed` later on the same clock, or `None` outside the
@@ -102,14 +102,14 @@ impl CivilDateTime {
     }
 
     /// Formats with a `strftime` string, such as `"%Y-%m-%d %H:%M"`. The
-    /// [module documentation](crate::time#format-strings) lists the
+    /// [module documentation](crate::dates#format-strings) lists the
     /// specifiers.
     ///
     /// # Errors
     ///
-    /// [`TimeError::UnsupportedFormat`] for a specifier that is not
+    /// [`DateError::UnsupportedFormat`] for a specifier that is not
     /// implemented or that needs a zone, such as `%z`.
-    pub fn format(&self, format: &str) -> Result<String, TimeError> {
+    pub fn format(&self, format: &str) -> Result<String, DateError> {
         text::format(
             &Moment {
                 date: Some(self.0.date()),
@@ -126,10 +126,10 @@ impl CivilDateTime {
     ///
     /// # Errors
     ///
-    /// [`TimeError::InvalidText`] when the text does not match,
-    /// [`TimeError::OutOfRange`] when it is not a date and time, and
-    /// [`TimeError::UnsupportedFormat`] for a specifier that cannot be read.
-    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, TimeError> {
+    /// [`DateError::InvalidText`] when the text does not match,
+    /// [`DateError::OutOfRange`] when it is not a date and time, and
+    /// [`DateError::UnsupportedFormat`] for a specifier that cannot be read.
+    pub fn parse_from_str(text: &str, format: &str) -> Result<Self, DateError> {
         text::parse(text, format)?.datetime().map(Self)
     }
 }
@@ -211,12 +211,12 @@ impl fmt::Debug for CivilDateTime {
 }
 
 impl FromStr for CivilDateTime {
-    type Err = TimeError;
+    type Err = DateError;
 
     /// Reads `YYYY-MM-DDTHH:MM:SS` with an optional fraction, the way chrono
     /// does: an upper-case `T`, digits that need no padding, and whitespace
     /// allowed around the separators.
-    fn from_str(text: &str) -> Result<Self, TimeError> {
+    fn from_str(text: &str) -> Result<Self, DateError> {
         text::relaxed_datetime(text).map(Self)
     }
 }

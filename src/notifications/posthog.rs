@@ -12,8 +12,8 @@ use tokio::time;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::dates::{SecondsFormat, Timestamp};
 use crate::http_client::describe_request_error;
-use crate::time::{Instant, SecondsFormat};
 
 /// Default `PostHog` capture-API host (US cloud).
 const DEFAULT_POSTHOG_HOST: &str = "https://us.i.posthog.com";
@@ -104,7 +104,7 @@ impl PostHogClient {
             "api_key": self.api_key,
             "event": event,
             "distinct_id": distinct_id,
-            "timestamp": Instant::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "timestamp": Timestamp::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             "uuid": Uuid::now_v7().to_string(),
         });
         // Moved in rather than through `json!`, which would deep-copy it.
@@ -221,7 +221,7 @@ mod tests {
         let second = sample_body(&client);
 
         let stamp = first["timestamp"].as_str().expect("timestamp is a string"); // Safe: test assertion
-        Instant::parse_from_rfc3339(stamp).expect("timestamp is RFC 3339"); // Safe: test assertion
+        Timestamp::parse_from_rfc3339(stamp).expect("timestamp is RFC 3339"); // Safe: test assertion
         let id = first["uuid"].as_str().expect("uuid is a string"); // Safe: test assertion
         let parsed = Uuid::parse_str(id).expect("uuid parses"); // Safe: test assertion
         assert_eq!(parsed.get_version_num(), 7, "the event id is a v7 uuid");

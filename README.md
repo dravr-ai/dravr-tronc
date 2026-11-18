@@ -261,7 +261,7 @@ once, last. See [Request guard](#request-guard).
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop; `init_with_ceilings` holds per-target level ceilings over `RUST_LOG` |
 | `server::log_ceiling` | `TargetCeiling` / `LevelCeilings` — a filter AND-ed with `EnvFilter` that drops a target's spans and events above its ceiling, for a dependency whose TRACE output carries secrets |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
-| `time` | Dravr-owned date types — `Instant`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date and time types](#date-and-time-types) |
+| `dates` | Dravr-owned date types — `Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date types](#date-types) |
 
 ## Choosing an auth mechanism
 
@@ -548,10 +548,10 @@ let server = McpServer::new("my-server", "0.1.0", registry, state)
   boundary with a `…(truncated)` marker. Payload attributes go to OpenTelemetry directly, never into
   a log line.
 
-## Date and time types
+## Date types
 
-`dravr_tronc::time` holds the date types every dravr service puts in its public structs:
-`Instant`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Zone` and `Elapsed`.
+`dravr_tronc::dates` holds the date types every dravr service puts in its public structs:
+`Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Zone` and `Elapsed`.
 
 They exist because the services used to expose `chrono` types, and chrono and chrono-tz are no
 longer maintained (chrono-tz's zone database stopped at 2025b). Putting another library's types in
@@ -573,24 +573,24 @@ Moving a field is a change of type; the derives, `.bind(x)`, `row.get("col")` an
 stay as they are:
 
 ```rust
-use dravr_tronc::time::{CivilDate, Elapsed, Instant};
+use dravr_tronc::dates::{CivilDate, Elapsed, Timestamp};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Goal {
-    created_at: Instant,    // was DateTime<Utc>
+    created_at: Timestamp, // was DateTime<Utc>
     target_date: CivilDate, // was NaiveDate
 }
 
-let week_ago = Instant::now() - Elapsed::days(7); // was Utc::now() - Duration::days(7)
+let week_ago = Timestamp::now() - Elapsed::days(7); // was Utc::now() - Duration::days(7)
 ```
 
-Three things are different on purpose. An `Instant` moves only by an exact `Elapsed` (a day is
+Three things are different on purpose. A `Timestamp` moves only by an exact `Elapsed` (a day is
 86,400 seconds, as `Duration::days` always was); months, and days that follow the local clock, are
 arithmetic on a `CivilDate`, brought back through a `Zone`. No operation panics: operators stop at
 the bounds of the range and the `checked_*` forms report leaving it. And the range is years −9999
 to 9999, where chrono's reached ±262,142.
 
-The [module documentation](https://docs.rs/dravr-tronc/latest/dravr_tronc/time/) has the full
+The [module documentation](https://docs.rs/dravr-tronc/latest/dravr_tronc/dates/) has the full
 table of chrono calls and their counterparts, and the list of `strftime` specifiers.
 
 ## Health checks

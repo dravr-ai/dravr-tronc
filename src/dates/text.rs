@@ -18,9 +18,9 @@ use std::ops::RangeInclusive;
 
 use jiff::civil::{Date, DateTime, Time};
 use jiff::tz::Offset;
-use jiff::Timestamp;
+use jiff::Timestamp as EngineTimestamp;
 
-use super::error::TimeError;
+use super::error::DateError;
 
 /// Seconds in a day: an offset must be strictly inside it, as chrono's
 /// `FixedOffset` requires.
@@ -98,7 +98,7 @@ pub(super) enum Num {
     /// `%f`
     Nanosecond,
     /// `%s`
-    Timestamp,
+    UnixSeconds,
     /// `%u`
     WeekdayFromMonday,
     /// `%w`
@@ -169,14 +169,14 @@ const US_DATE_ITEMS: [Item<'static>; 5] = [
     Item::Numeric(Num::YearMod100, Pad::Zero),
 ];
 
-fn unsupported(spec: &str) -> TimeError {
-    TimeError::UnsupportedFormat(spec.to_owned())
+fn unsupported(spec: &str) -> DateError {
+    DateError::UnsupportedFormat(spec.to_owned())
 }
 
 /// Compiles a `strftime` string to items, with chrono's tokenization: a run
 /// of whitespace is one [`Item::Space`], any other run up to the next `%` or
 /// whitespace is one literal.
-pub(super) fn compile(format: &str) -> Result<Vec<Item<'_>>, TimeError> {
+pub(super) fn compile(format: &str) -> Result<Vec<Item<'_>>, DateError> {
     let mut items = Vec::new();
     let mut rest = format;
     while let Some(first) = rest.chars().next() {
@@ -203,7 +203,7 @@ pub(super) fn compile(format: &str) -> Result<Vec<Item<'_>>, TimeError> {
 
 /// Reads one `%…` specifier at the start of `text`, pushes its items and
 /// returns what follows it.
-fn specifier<'a>(text: &'a str, items: &mut Vec<Item<'a>>) -> Result<&'a str, TimeError> {
+fn specifier<'a>(text: &'a str, items: &mut Vec<Item<'a>>) -> Result<&'a str, DateError> {
     let mut chars = text.chars();
     chars.next();
     let whole = |rest: &str| {
@@ -238,7 +238,7 @@ fn specifier<'a>(text: &'a str, items: &mut Vec<Item<'a>>) -> Result<&'a str, Ti
         'S' => items.push(numeric(Num::Second, Pad::Zero)),
         'f' => items.push(numeric(Num::Nanosecond, Pad::Zero)),
         // Unpadded unless the format asks: `%0s` and `%_s` fill nine places.
-        's' => items.push(numeric(Num::Timestamp, Pad::None)),
+        's' => items.push(numeric(Num::UnixSeconds, Pad::None)),
         'u' => items.push(numeric(Num::WeekdayFromMonday, Pad::Zero)),
         'w' => items.push(numeric(Num::DaysFromSunday, Pad::Zero)),
         _ if pad.is_some() => return Err(whole(chars.as_str())),
@@ -298,7 +298,7 @@ pub(super) struct Moment<'a> {
 
 /// Formats `moment` with a `strftime` string, as chrono's `format` does for
 /// the specifiers this module implements.
-pub(super) fn format(moment: &Moment<'_>, format: &str) -> Result<String, TimeError> {
+pub(super) fn format(moment: &Moment<'_>, format: &str) -> Result<String, DateError> {
     let items = compile(format)?;
     let mut out = String::with_capacity(format.len() + 16);
     for item in &items {
@@ -307,7 +307,7 @@ pub(super) fn format(moment: &Moment<'_>, format: &str) -> Result<String, TimeEr
     Ok(out)
 }
 
-fn write_item(out: &mut String, moment: &Moment<'_>, item: Item<'_>) -> Result<(), TimeError> {
+fn write_item(out: &mut String, moment: &Moment<'_>, item: Item<'_>) -> Result<(), DateError> {
     let need_date = |spec: &str| moment.date.ok_or_else(|| unsupported(spec));
     let need_time = |spec: &str| moment.time.ok_or_else(|| unsupported(spec));
     let need_offset = |spec: &str| moment.offset.ok_or_else(|| unsupported(spec));
@@ -370,7 +370,7 @@ fn write_item(out: &mut String, moment: &Moment<'_>, item: Item<'_>) -> Result<(
             Ok(())
         }
     };
-    written.map_err(|_| TimeError::OutOfRange)
+    written.map_err(|_| DateError::OutOfRange)
 }
 
 fn month_name(names: &'static [&'static str; 12], date: Date) -> &'static str {
@@ -388,7 +388,7 @@ fn write_numeric(
     moment: &Moment<'_>,
     num: Num,
     pad: Pad,
-) -> Result<(), TimeError> {
+) -> Result<(), DateError> {
     let need_date = |spec: &str| moment.date.ok_or_else(|| unsupported(spec));
     let need_time = |spec: &str| moment.time.ok_or_else(|| unsupported(spec));
     let written = match num {
@@ -401,7 +401,7 @@ fn write_numeric(
             // year 0; that is not a format to reproduce.
             let year = i64::from(need_date("%C")?.year());
             if year < 0 {
-                return Err(TimeError::OutOfRange);
+                return Err(DateError::OutOfRange);
             }
             write_two(out, year / 100, pad)
         }
@@ -429,13 +429,13 @@ fn write_numeric(
             pad,
             false,
         ),
-        Num::Timestamp => {
+        Num::UnixSeconds => {
             let civil = DateTime::from_parts(need_date("%s")?, need_time("%s")?);
             let offset = moment.offset.map_or(0, |(seconds, _)| i64::from(seconds));
             let local = civil.duration_since(DateTime::constant(1970, 1, 1, 0, 0, 0, 0));
             // Whole seconds rounded down, as `timestamp()` gives before 1970.
             let seconds = i64::try_from(local.as_nanos().div_euclid(1_000_000_000))
-                .map_err(|_| TimeError::OutOfRange)?;
+                .map_err(|_| DateError::OutOfRange)?;
             write_padded(out, 9, seconds - offset, pad, false)
         }
         Num::WeekdayFromMonday => {
@@ -447,7 +447,7 @@ fn write_numeric(
             need_date("%w")?.weekday().to_sunday_zero_offset()
         ),
     };
-    written.map_err(|_| TimeError::OutOfRange)
+    written.map_err(|_| DateError::OutOfRange)
 }
 
 /// A two-digit field: chrono writes the low two digits whatever the value.
@@ -569,12 +569,12 @@ pub(super) struct Parsed {
     offset: Option<i64>,
 }
 
-fn set(slot: &mut Option<i64>, value: i64, range: RangeInclusive<i64>) -> Result<(), TimeError> {
+fn set(slot: &mut Option<i64>, value: i64, range: RangeInclusive<i64>) -> Result<(), DateError> {
     if !range.contains(&value) {
-        return Err(TimeError::OutOfRange);
+        return Err(DateError::OutOfRange);
     }
     match *slot {
-        Some(old) if old != value => Err(TimeError::InvalidText),
+        Some(old) if old != value => Err(DateError::InvalidText),
         _ => {
             *slot = Some(value);
             Ok(())
@@ -584,18 +584,18 @@ fn set(slot: &mut Option<i64>, value: i64, range: RangeInclusive<i64>) -> Result
 
 impl Parsed {
     /// The calendar date read: year, month and day are all required.
-    pub(super) fn date(&self) -> Result<Date, TimeError> {
+    pub(super) fn date(&self) -> Result<Date, DateError> {
         let (Some(year), Some(month), Some(day)) = (self.year, self.month, self.day) else {
-            return Err(TimeError::InvalidText);
+            return Err(DateError::InvalidText);
         };
-        let year = i16::try_from(year).map_err(|_| TimeError::OutOfRange)?;
-        let month = i8::try_from(month).map_err(|_| TimeError::OutOfRange)?;
-        let day = i8::try_from(day).map_err(|_| TimeError::OutOfRange)?;
-        let date = Date::new(year, month, day).map_err(|_| TimeError::OutOfRange)?;
+        let year = i16::try_from(year).map_err(|_| DateError::OutOfRange)?;
+        let month = i8::try_from(month).map_err(|_| DateError::OutOfRange)?;
+        let day = i8::try_from(day).map_err(|_| DateError::OutOfRange)?;
+        let date = Date::new(year, month, day).map_err(|_| DateError::OutOfRange)?;
         // A weekday in the text must be the date's own.
         match self.weekday {
             Some(named) if named != i64::from(date.weekday().to_monday_zero_offset()) => {
-                Err(TimeError::InvalidText)
+                Err(DateError::InvalidText)
             }
             _ => Ok(date),
         }
@@ -605,48 +605,48 @@ impl Parsed {
     /// defaults to zero, and a fraction needs a second. A 12-hour hour needs
     /// its AM or PM. A leap second `:60` reads as `:59`: the types hold no
     /// leap seconds.
-    pub(super) fn time(&self) -> Result<Time, TimeError> {
+    pub(super) fn time(&self) -> Result<Time, DateError> {
         let (Some(half), Some(hour), Some(minute)) =
             (self.hour_div_12, self.hour_mod_12, self.minute)
         else {
-            return Err(TimeError::InvalidText);
+            return Err(DateError::InvalidText);
         };
         let hour = half * 12 + hour;
         let second = self.second.unwrap_or(0).min(59);
         let nanosecond = match self.nanosecond {
             Some(nanos) if self.second.is_some() => nanos,
-            Some(_) => return Err(TimeError::InvalidText),
+            Some(_) => return Err(DateError::InvalidText),
             None => 0,
         };
-        let hour = i8::try_from(hour).map_err(|_| TimeError::OutOfRange)?;
-        let minute = i8::try_from(minute).map_err(|_| TimeError::OutOfRange)?;
-        let second = i8::try_from(second).map_err(|_| TimeError::OutOfRange)?;
-        let nanosecond = i32::try_from(nanosecond).map_err(|_| TimeError::OutOfRange)?;
-        Time::new(hour, minute, second, nanosecond).map_err(|_| TimeError::OutOfRange)
+        let hour = i8::try_from(hour).map_err(|_| DateError::OutOfRange)?;
+        let minute = i8::try_from(minute).map_err(|_| DateError::OutOfRange)?;
+        let second = i8::try_from(second).map_err(|_| DateError::OutOfRange)?;
+        let nanosecond = i32::try_from(nanosecond).map_err(|_| DateError::OutOfRange)?;
+        Time::new(hour, minute, second, nanosecond).map_err(|_| DateError::OutOfRange)
     }
 
     /// The date and time read, with no place on the time line.
-    pub(super) fn datetime(&self) -> Result<DateTime, TimeError> {
+    pub(super) fn datetime(&self) -> Result<DateTime, DateError> {
         Ok(DateTime::from_parts(self.date()?, self.time()?))
     }
 
     /// The date and time read, as the text showed them, and the offset read
     /// with them in seconds east of UTC, when the text had one. The offset
     /// must be less than a day.
-    pub(super) fn reading(&self) -> Result<(DateTime, Option<i32>), TimeError> {
+    pub(super) fn reading(&self) -> Result<(DateTime, Option<i32>), DateError> {
         let offset = match self.offset {
-            Some(offset) if offset.abs() >= SECONDS_PER_DAY => return Err(TimeError::OutOfRange),
-            Some(offset) => Some(i32::try_from(offset).map_err(|_| TimeError::OutOfRange)?),
+            Some(offset) if offset.abs() >= SECONDS_PER_DAY => return Err(DateError::OutOfRange),
+            Some(offset) => Some(i32::try_from(offset).map_err(|_| DateError::OutOfRange)?),
             None => None,
         };
         Ok((self.datetime()?, offset))
     }
 
-    /// The instant read and its offset in seconds east of UTC. The offset is
+    /// The timestamp read and its offset in seconds east of UTC. The offset is
     /// required, and must be less than a day.
-    pub(super) fn timestamp(&self) -> Result<(Timestamp, i32), TimeError> {
+    pub(super) fn timestamp(&self) -> Result<(EngineTimestamp, i32), DateError> {
         if self.offset.is_none() {
-            return Err(TimeError::InvalidText);
+            return Err(DateError::InvalidText);
         }
         let (civil, offset) = self.reading()?;
         let seconds = offset.unwrap_or(0);
@@ -654,11 +654,14 @@ impl Parsed {
     }
 }
 
-/// The instant at which a clock `offset_seconds` east of UTC shows `civil`.
-pub(super) fn timestamp_at(civil: DateTime, offset_seconds: i32) -> Result<Timestamp, TimeError> {
+/// The timestamp at which a clock `offset_seconds` east of UTC shows `civil`.
+pub(super) fn timestamp_at(
+    civil: DateTime,
+    offset_seconds: i32,
+) -> Result<EngineTimestamp, DateError> {
     Offset::from_seconds(offset_seconds)
         .and_then(|offset| offset.to_timestamp(civil))
-        .map_err(|_| TimeError::OutOfRange)
+        .map_err(|_| DateError::OutOfRange)
 }
 
 /// How the colon between an offset's hours and minutes is read.
@@ -671,7 +674,7 @@ enum Colon {
 }
 
 /// Reads an unsigned number of `min` to `max` digits.
-fn number(text: &str, min: usize, max: usize) -> Result<(&str, i64), TimeError> {
+fn number(text: &str, min: usize, max: usize) -> Result<(&str, i64), DateError> {
     let mut value: i64 = 0;
     let mut taken = 0;
     for &byte in text.as_bytes().iter().take(max) {
@@ -681,22 +684,22 @@ fn number(text: &str, min: usize, max: usize) -> Result<(&str, i64), TimeError> 
         value = value
             .checked_mul(10)
             .and_then(|v| v.checked_add(i64::from(byte - b'0')))
-            .ok_or(TimeError::OutOfRange)?;
+            .ok_or(DateError::OutOfRange)?;
         taken += 1;
     }
     if taken < min {
-        return Err(TimeError::InvalidText);
+        return Err(DateError::InvalidText);
     }
-    let rest = text.get(taken..).ok_or(TimeError::InvalidText)?;
+    let rest = text.get(taken..).ok_or(DateError::InvalidText)?;
     Ok((rest, value))
 }
 
 /// Reads the digits after a fraction's dot, scaled to nanoseconds. Digits
 /// past the ninth are read and dropped.
-fn fraction(text: &str) -> Result<(&str, i64), TimeError> {
+fn fraction(text: &str) -> Result<(&str, i64), DateError> {
     let (rest, value) = number(text, 1, 9)?;
     let consumed = text.len() - rest.len();
-    let scale = 10_i64.pow(u32::try_from(9 - consumed).map_err(|_| TimeError::OutOfRange)?);
+    let scale = 10_i64.pow(u32::try_from(9 - consumed).map_err(|_| DateError::OutOfRange)?);
     Ok((
         rest.trim_start_matches(|c: char| c.is_ascii_digit()),
         value * scale,
@@ -710,7 +713,7 @@ fn offset(
     colon: Colon,
     zulu: bool,
     missing_minutes: bool,
-) -> Result<(&str, i64), TimeError> {
+) -> Result<(&str, i64), DateError> {
     if zulu {
         if let Some(rest) = text.strip_prefix(['Z', 'z']) {
             return Ok((rest, 0));
@@ -720,23 +723,23 @@ fn offset(
     let negative = match chars.next() {
         Some('+') => false,
         Some('-' | '\u{2212}') => true,
-        _ => return Err(TimeError::InvalidText),
+        _ => return Err(DateError::InvalidText),
     };
-    let (rest, hours) = two_digits(chars.as_str()).ok_or(TimeError::InvalidText)?;
+    let (rest, hours) = two_digits(chars.as_str()).ok_or(DateError::InvalidText)?;
     let rest = match colon {
-        Colon::Required => rest.strip_prefix(':').ok_or(TimeError::InvalidText)?,
+        Colon::Required => rest.strip_prefix(':').ok_or(DateError::InvalidText)?,
         Colon::Loose => rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace()),
     };
     let (rest, minutes) = if rest.len() >= 2 {
-        let (tail, minutes) = two_digits(rest).ok_or(TimeError::InvalidText)?;
+        let (tail, minutes) = two_digits(rest).ok_or(DateError::InvalidText)?;
         if minutes > 59 {
-            return Err(TimeError::OutOfRange);
+            return Err(DateError::OutOfRange);
         }
         (tail, minutes)
     } else if missing_minutes && rest.is_empty() {
         (rest, 0)
     } else {
-        return Err(TimeError::InvalidText);
+        return Err(DateError::InvalidText);
     };
     let seconds = hours * 3600 + minutes * 60;
     Ok((rest, if negative { -seconds } else { seconds }))
@@ -749,12 +752,12 @@ fn name<'t, const N: usize>(
     text: &'t str,
     short: &[&str; N],
     long: Option<&[&str; N]>,
-) -> Result<(&'t str, i64), TimeError> {
-    let (head, tail) = text.split_at_checked(3).ok_or(TimeError::InvalidText)?;
+) -> Result<(&'t str, i64), DateError> {
+    let (head, tail) = text.split_at_checked(3).ok_or(DateError::InvalidText)?;
     let index = short
         .iter()
         .position(|candidate| head.eq_ignore_ascii_case(candidate))
-        .ok_or(TimeError::InvalidText)?;
+        .ok_or(DateError::InvalidText)?;
     let suffix = long
         .and_then(|names| names.get(index))
         .and_then(|full| full.get(3..))
@@ -763,7 +766,7 @@ fn name<'t, const N: usize>(
         Some(found) if found.eq_ignore_ascii_case(suffix) => tail.get(suffix.len()..).unwrap_or(""),
         _ => tail,
     };
-    let index = i64::try_from(index).map_err(|_| TimeError::OutOfRange)?;
+    let index = i64::try_from(index).map_err(|_| DateError::OutOfRange)?;
     Ok((rest, index))
 }
 
@@ -783,11 +786,11 @@ pub(super) fn scan<'t>(
     parsed: &mut Parsed,
     mut text: &'t str,
     items: &[Item<'_>],
-) -> Result<&'t str, TimeError> {
+) -> Result<&'t str, DateError> {
     for item in items {
         match *item {
             Item::Literal(literal) => {
-                text = text.strip_prefix(literal).ok_or(TimeError::InvalidText)?;
+                text = text.strip_prefix(literal).ok_or(DateError::InvalidText)?;
             }
             Item::Space(_) => text = text.trim_start(),
             Item::Numeric(num, _) => text = scan_numeric(parsed, text.trim_start(), num)?,
@@ -803,7 +806,7 @@ pub(super) fn scan<'t>(
                     let (rest, value) = number(digits, width, width)?;
                     let scale = 10_i64.pow(
                         u32::try_from(9_usize.saturating_sub(width))
-                            .map_err(|_| TimeError::OutOfRange)?,
+                            .map_err(|_| DateError::OutOfRange)?,
                     );
                     set(&mut parsed.nanosecond, value * scale, 0..=999_999_999)?;
                     text = rest;
@@ -843,7 +846,7 @@ pub(super) fn scan<'t>(
                 let half = match text.get(..2) {
                     Some(word) if word.eq_ignore_ascii_case("am") => 0,
                     Some(word) if word.eq_ignore_ascii_case("pm") => 1,
-                    _ => return Err(TimeError::InvalidText),
+                    _ => return Err(DateError::InvalidText),
                 };
                 set(&mut parsed.hour_div_12, half, 0..=1)?;
                 text = text.get(2..).unwrap_or("");
@@ -854,7 +857,7 @@ pub(super) fn scan<'t>(
     Ok(text)
 }
 
-fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t str, TimeError> {
+fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t str, DateError> {
     let (slot, width, range) = match num {
         Num::Year => {
             // A signed year may have any number of digits; an unsigned one
@@ -879,7 +882,7 @@ fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t 
         Num::Hour => {
             let (rest, hour) = number(text, 1, 2)?;
             if !(0..=23).contains(&hour) {
-                return Err(TimeError::OutOfRange);
+                return Err(DateError::OutOfRange);
             }
             set(&mut parsed.hour_div_12, hour / 12, 0..=1)?;
             set(&mut parsed.hour_mod_12, hour % 12, 0..=11)?;
@@ -888,7 +891,7 @@ fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t 
         Num::Hour12 => {
             let (rest, hour) = number(text, 1, 2)?;
             if !(1..=12).contains(&hour) {
-                return Err(TimeError::OutOfRange);
+                return Err(DateError::OutOfRange);
             }
             set(&mut parsed.hour_mod_12, hour % 12, 0..=11)?;
             return Ok(rest);
@@ -899,7 +902,7 @@ fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t 
         Num::YearDiv100 => return Err(unsupported("%C")),
         Num::YearMod100 => return Err(unsupported("%y")),
         Num::Ordinal => return Err(unsupported("%j")),
-        Num::Timestamp => return Err(unsupported("%s")),
+        Num::UnixSeconds => return Err(unsupported("%s")),
         Num::WeekdayFromMonday => return Err(unsupported("%u")),
         Num::DaysFromSunday => return Err(unsupported("%w")),
     };
@@ -909,14 +912,14 @@ fn scan_numeric<'t>(parsed: &mut Parsed, text: &'t str, num: Num) -> Result<&'t 
 }
 
 /// Reads `text` against a `strftime` string; nothing may be left over.
-pub(super) fn parse(text: &str, format: &str) -> Result<Parsed, TimeError> {
+pub(super) fn parse(text: &str, format: &str) -> Result<Parsed, DateError> {
     let items = compile(format)?;
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &items)?;
     if rest.is_empty() {
         Ok(parsed)
     } else {
-        Err(TimeError::InvalidText)
+        Err(DateError::InvalidText)
     }
 }
 
@@ -949,23 +952,23 @@ const RELAXED_SECOND: [Item<'static>; 5] = [
     Item::Space(""),
 ];
 
-fn finished(parsed: Parsed, rest: &str) -> Result<Parsed, TimeError> {
+fn finished(parsed: Parsed, rest: &str) -> Result<Parsed, DateError> {
     if rest.is_empty() {
         Ok(parsed)
     } else {
-        Err(TimeError::InvalidText)
+        Err(DateError::InvalidText)
     }
 }
 
 /// What chrono's `NaiveDate: FromStr` reads.
-pub(super) fn relaxed_date(text: &str) -> Result<Date, TimeError> {
+pub(super) fn relaxed_date(text: &str) -> Result<Date, DateError> {
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &RELAXED_DATE)?;
     finished(parsed, rest.trim_start())?.date()
 }
 
 /// What chrono's `NaiveTime: FromStr` reads: the seconds are optional.
-pub(super) fn relaxed_time(text: &str) -> Result<Time, TimeError> {
+pub(super) fn relaxed_time(text: &str) -> Result<Time, DateError> {
     let mut parsed = Parsed::default();
     let after_minute = scan(&mut parsed, text, &RELAXED_HOUR_MINUTE)?;
     let mut with_seconds = Parsed {
@@ -982,7 +985,7 @@ pub(super) fn relaxed_time(text: &str) -> Result<Time, TimeError> {
 
 /// What chrono's `NaiveDateTime: FromStr` reads: an upper-case `T` between
 /// the date and a time whose seconds are required.
-pub(super) fn relaxed_datetime(text: &str) -> Result<DateTime, TimeError> {
+pub(super) fn relaxed_datetime(text: &str) -> Result<DateTime, DateError> {
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &RELAXED_DATE)?;
     let rest = scan(&mut parsed, rest, &[Item::Space(""), Item::Literal("T")])?;
@@ -995,12 +998,12 @@ pub(super) fn relaxed_datetime(text: &str) -> Result<DateTime, TimeError> {
 /// reads: RFC 3339 relaxed. Digits need no padding, the separator may be `T`,
 /// `t` or a space, whitespace may sit between components and after the
 /// value, `UTC` is an offset, and the offset's colon may be missing.
-pub(super) fn relaxed_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError> {
+pub(super) fn relaxed_rfc3339(text: &str) -> Result<(EngineTimestamp, i32), DateError> {
     let mut parsed = Parsed::default();
     let rest = scan(&mut parsed, text, &RELAXED_DATE)?;
     let rest = rest
         .strip_prefix(['t', 'T', ' '])
-        .ok_or(TimeError::InvalidText)?;
+        .ok_or(DateError::InvalidText)?;
     let rest = scan(&mut parsed, rest, &RELAXED_HOUR_MINUTE)?;
     let rest = scan(&mut parsed, rest, &RELAXED_SECOND)?.trim_start();
     let (rest, seconds) = match rest.get(..3) {
@@ -1014,29 +1017,29 @@ pub(super) fn relaxed_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError>
 /// What chrono's `DateTime::parse_from_rfc3339` reads: RFC 3339 itself.
 /// Every field has its full width, the separator is `T`, `t` or a space, and
 /// the offset is `Z`, `z` or `±hh:mm` with its colon.
-pub(super) fn strict_rfc3339(text: &str) -> Result<(Timestamp, i32), TimeError> {
+pub(super) fn strict_rfc3339(text: &str) -> Result<(EngineTimestamp, i32), DateError> {
     strict_rfc3339_fields(text)?.timestamp()
 }
 
 /// The fields of strict RFC 3339 text, before they are placed on the time
 /// line: for a reader that wants the date and time as written.
-pub(super) fn strict_rfc3339_fields(text: &str) -> Result<Parsed, TimeError> {
+pub(super) fn strict_rfc3339_fields(text: &str) -> Result<Parsed, DateError> {
     let mut parsed = Parsed::default();
     let rest = fixed(text, 4, &mut parsed.year, 0..=9999)?;
-    let rest = rest.strip_prefix('-').ok_or(TimeError::InvalidText)?;
+    let rest = rest.strip_prefix('-').ok_or(DateError::InvalidText)?;
     let rest = fixed(rest, 2, &mut parsed.month, 1..=12)?;
-    let rest = rest.strip_prefix('-').ok_or(TimeError::InvalidText)?;
+    let rest = rest.strip_prefix('-').ok_or(DateError::InvalidText)?;
     let rest = fixed(rest, 2, &mut parsed.day, 1..=31)?;
     let rest = rest
         .strip_prefix(['t', 'T', ' '])
-        .ok_or(TimeError::InvalidText)?;
+        .ok_or(DateError::InvalidText)?;
     let mut hour = None;
     let rest = fixed(rest, 2, &mut hour, 0..=23)?;
     parsed.hour_div_12 = hour.map(|h| h / 12);
     parsed.hour_mod_12 = hour.map(|h| h % 12);
-    let rest = rest.strip_prefix(':').ok_or(TimeError::InvalidText)?;
+    let rest = rest.strip_prefix(':').ok_or(DateError::InvalidText)?;
     let rest = fixed(rest, 2, &mut parsed.minute, 0..=59)?;
-    let rest = rest.strip_prefix(':').ok_or(TimeError::InvalidText)?;
+    let rest = rest.strip_prefix(':').ok_or(DateError::InvalidText)?;
     let mut rest = fixed(rest, 2, &mut parsed.second, 0..=60)?;
     if let Some(digits) = rest.strip_prefix('.') {
         let (tail, nanos) = fraction(digits)?;
@@ -1054,7 +1057,7 @@ fn fixed<'t>(
     width: usize,
     slot: &mut Option<i64>,
     range: RangeInclusive<i64>,
-) -> Result<&'t str, TimeError> {
+) -> Result<&'t str, DateError> {
     let (rest, value) = number(text, width, width)?;
     set(slot, value, range)?;
     Ok(rest)

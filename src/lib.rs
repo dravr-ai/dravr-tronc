@@ -32,6 +32,7 @@
     )
 )]
 
+pub mod dates;
 pub mod error;
 #[cfg(feature = "http-client")]
 pub mod http_client;
@@ -49,7 +50,6 @@ pub mod server;
 pub mod service_client;
 #[cfg(feature = "testkit")]
 pub mod testkit;
-pub mod time;
 
 // Convenience re-exports
 pub use mcp::auth::{AuthError, AuthHook};

@@ -36,25 +36,25 @@ mod testkit_test;
 // (building a value from a literal). cfg(test) is what tells clippy those
 // helpers are test code; it is always true in this binary.
 #[cfg(test)]
-mod time_arith_test;
+mod dates_arith_test;
 #[cfg(test)]
-mod time_format_test;
+mod dates_format_test;
 #[cfg(test)]
-mod time_parse_test;
+mod dates_parse_test;
 #[cfg(test)]
 #[cfg(feature = "schemars1")]
-mod time_schema_test;
+mod dates_schema_test;
 #[cfg(test)]
 #[cfg(feature = "sqlx08-postgres")]
-mod time_sqlx_postgres_test;
+mod dates_sqlx_postgres_test;
 #[cfg(test)]
 #[cfg(feature = "sqlx08-sqlite")]
-mod time_sqlx_sqlite_test;
+mod dates_sqlx_sqlite_test;
 #[cfg(test)]
-mod time_support;
+mod dates_support;
 #[cfg(test)]
 #[cfg(feature = "zones")]
-mod time_zone_test;
+mod dates_zone_test;
 mod tool_response_test;
 #[cfg(feature = "otel")]
 mod trace_context_test;

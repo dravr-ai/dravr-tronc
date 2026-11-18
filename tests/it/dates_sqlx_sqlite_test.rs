@@ -5,11 +5,11 @@
 // Copyright (c) 2026 dravr.ai
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use dravr_tronc::time::{CivilDate, CivilDateTime, CivilTime, Elapsed, Instant};
+use dravr_tronc::dates::{CivilDate, CivilDateTime, CivilTime, Elapsed, Timestamp};
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Connection, Row};
 
-use crate::time_support::{pair, pairs};
+use crate::dates_support::{pair, pairs};
 
 const SCHEMA: &str = "CREATE TABLE stamps (
     id INTEGER PRIMARY KEY,
@@ -65,7 +65,7 @@ async fn write_with_chrono(connection: &mut SqliteConnection, value: DateTime<Ut
         .unwrap();
 }
 
-async fn write_with_ours(connection: &mut SqliteConnection, value: Instant) {
+async fn write_with_ours(connection: &mut SqliteConnection, value: Timestamp) {
     let local = value.utc_datetime();
     sqlx::query(INSERT)
         .bind("ours")
@@ -152,9 +152,9 @@ async fn each_side_decodes_the_rows_the_other_wrote() {
     assert_eq!(rows.len(), all.len());
     for (row, (ours, _)) in rows.iter().zip(&all) {
         for column in ["at_text", "at_datetime", "at_timestamp"] {
-            let read: Instant = row.get(column);
+            let read: Timestamp = row.get(column);
             assert_eq!(read, *ours, "{column}");
-            let optional: Option<Instant> = row.get(column);
+            let optional: Option<Timestamp> = row.get(column);
             assert_eq!(optional, Some(*ours));
         }
         for column in ["local_text", "local_datetime"] {
@@ -190,13 +190,13 @@ async fn each_side_decodes_the_rows_the_other_wrote() {
     }
 
     // A tuple through FromRow, and a scalar: neither names a column type.
-    let (at, day): (Instant, CivilDate) =
+    let (at, day): (Timestamp, CivilDate) =
         sqlx::query_as("SELECT at_datetime, day_date FROM stamps WHERE id = 1")
             .fetch_one(&mut connection)
             .await
             .unwrap();
     assert_eq!((at, day), (all[0].0, all[0].0.utc_date()));
-    let latest: Instant =
+    let latest: Timestamp =
         sqlx::query_scalar("SELECT MAX(at_text) FROM stamps WHERE at_text LIKE '2026%'")
             .fetch_one(&mut connection)
             .await
@@ -208,8 +208,8 @@ async fn each_side_decodes_the_rows_the_other_wrote() {
 async fn null_columns_and_database_defaults_decode() {
     let mut connection = database().await;
     sqlx::query("INSERT INTO stamps (writer, at_text, at_datetime) VALUES ('none', ?, ?)")
-        .bind(None::<Instant>)
-        .bind(None::<Instant>)
+        .bind(None::<Timestamp>)
+        .bind(None::<Timestamp>)
         .execute(&mut connection)
         .await
         .unwrap();
@@ -218,21 +218,21 @@ async fn null_columns_and_database_defaults_decode() {
             .fetch_one(&mut connection)
             .await
             .unwrap();
-    assert_eq!(row.get::<Option<Instant>, _>("at_text"), None);
-    assert_eq!(row.get::<Option<Instant>, _>("at_datetime"), None);
+    assert_eq!(row.get::<Option<Timestamp>, _>("at_text"), None);
+    assert_eq!(row.get::<Option<Timestamp>, _>("at_datetime"), None);
     assert_eq!(row.get::<Option<CivilDate>, _>("day_date"), None);
-    assert!(row.try_get::<Instant, _>("at_datetime").is_err());
+    assert!(row.try_get::<Timestamp, _>("at_datetime").is_err());
 
     // `datetime('now')` and CURRENT_TIMESTAMP write `YYYY-MM-DD HH:MM:SS`
     // with no offset; it is read as UTC, by both.
     for column in ["created_at", "stamped_at"] {
         let raw: String = row.get(column);
         assert_eq!(raw.len(), 19, "{raw}");
-        let ours: Instant = row.get(column);
+        let ours: Timestamp = row.get(column);
         let theirs: DateTime<Utc> = row.get(column);
         assert_eq!(ours.epoch_seconds(), theirs.timestamp());
         assert_eq!(ours.format("%Y-%m-%d %H:%M:%S"), Ok(raw));
-        assert!((Instant::now() - ours).abs() < Elapsed::seconds(60));
+        assert!((Timestamp::now() - ours).abs() < Elapsed::seconds(60));
         let local: CivilDateTime = row.get(column);
         assert_eq!(local, ours.utc_datetime());
     }
@@ -290,11 +290,11 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
             .await
             .unwrap();
         let theirs = row.try_get::<DateTime<Utc>, _>("value").ok();
-        let ours = row.try_get::<Instant, _>("value").ok();
+        let ours = row.try_get::<Timestamp, _>("value").ok();
         assert_eq!(
             ours.map(|i| (i.epoch_seconds(), i.subsec_nanos())),
             theirs.map(|d| (d.timestamp(), d.timestamp_subsec_nanos() % 1_000_000_000)),
-            "instant {text:?}"
+            "timestamp {text:?}"
         );
         let naive = row.try_get::<NaiveDateTime, _>("value").ok();
         let local = row.try_get::<CivilDateTime, _>("value").ok();
@@ -312,7 +312,7 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
     assert_eq!((accepted, rejected), (27, 9));
 
     // The offset-less shape means UTC; a stored offset is applied for an
-    // instant and kept for a local reading.
+    // timestamp and kept for a local reading.
     let read = |text: &'static str| async move {
         let mut connection = database().await;
         let row = sqlx::query("SELECT ? AS value")
@@ -321,7 +321,7 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
             .await
             .unwrap();
         (
-            row.get::<Instant, _>("value").to_rfc3339(),
+            row.get::<Timestamp, _>("value").to_rfc3339(),
             format!("{:?}", row.get::<CivilDateTime, _>("value")),
         )
     };
@@ -342,7 +342,7 @@ async fn every_text_shape_decodes_as_sqlx_chrono_decodes_it() {
 }
 
 /// Local readings at the two ends of the range of `CivilDateTime`, where no
-/// instant exists: an `Instant` stops about 26 hours short of each end.
+/// timestamp exists: a `Timestamp` stops about 26 hours short of each end.
 /// Text without an offset, text with one, Unix seconds and a Julian day.
 const EDGE_READINGS: [&str; 14] = [
     "SELECT '9999-12-31 23:59:59.999999999'",
@@ -373,8 +373,8 @@ async fn a_local_reading_decodes_over_its_whole_range() {
             Some(format!("{naive:?}")),
             "{sql}"
         );
-        // No instant is that far out, so none is invented.
-        assert!(row.try_get::<Instant, _>(0).is_err(), "{sql}");
+        // No timestamp is that far out, so none is invented.
+        assert!(row.try_get::<Timestamp, _>(0).is_err(), "{sql}");
     }
     let max: CivilDateTime = sqlx::query_scalar("SELECT ?")
         .bind(CivilDateTime::MAX)
@@ -390,8 +390,8 @@ async fn a_local_reading_decodes_over_its_whole_range() {
 }
 
 #[tokio::test]
-async fn an_instant_out_of_range_is_refused_whatever_its_offset() {
-    // 21:30 at UTC-5 is 02:30 UTC the next day, past the last instant. Its
+async fn a_timestamp_out_of_range_is_refused_whatever_its_offset() {
+    // 21:30 at UTC-5 is 02:30 UTC the next day, past the last timestamp. Its
     // offset is not dropped to make it fit.
     let mut connection = database().await;
     for text in [
@@ -406,7 +406,7 @@ async fn an_instant_out_of_range_is_refused_whatever_its_offset() {
             .await
             .unwrap();
         assert!(row.try_get::<DateTime<Utc>, _>(0).is_ok(), "{text}");
-        assert!(row.try_get::<Instant, _>(0).is_err(), "{text}");
+        assert!(row.try_get::<Timestamp, _>(0).is_err(), "{text}");
         let naive = row.try_get::<NaiveDateTime, _>(0).unwrap();
         let local = row.try_get::<CivilDateTime, _>(0).ok();
         assert_eq!(
@@ -435,7 +435,7 @@ async fn integers_and_reals_decode_as_sqlx_chrono_decodes_them() {
     ] {
         let row = sqlx::query(sql).fetch_one(&mut connection).await.unwrap();
         let theirs = row.try_get::<DateTime<Utc>, _>("value").ok();
-        let ours = row.try_get::<Instant, _>("value").ok();
+        let ours = row.try_get::<Timestamp, _>("value").ok();
         assert_eq!(
             ours.map(|i| (i.epoch_seconds(), i.subsec_nanos())),
             theirs.map(|d| (d.timestamp(), d.timestamp_subsec_nanos())),
@@ -446,9 +446,9 @@ async fn integers_and_reals_decode_as_sqlx_chrono_decodes_them() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(row.get::<Instant, _>("seconds"), pair(1_794_909_600, 0).0);
-    assert!(row.try_get::<Instant, _>("blob").is_err());
-    assert!(row.try_get::<Instant, _>("huge").is_err());
+    assert_eq!(row.get::<Timestamp, _>("seconds"), pair(1_794_909_600, 0).0);
+    assert!(row.try_get::<Timestamp, _>("blob").is_err());
+    assert!(row.try_get::<Timestamp, _>("huge").is_err());
     assert!(row.try_get::<CivilDate, _>("seconds").is_err());
 }
 

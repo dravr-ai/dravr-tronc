@@ -1,11 +1,11 @@
-// ABOUTME: Shared values for the date-type tests: one table of instants, built once as ours and as chrono's
+// ABOUTME: Shared values for the date-type tests: one table of timestamps, built once as ours and as chrono's
 // ABOUTME: chrono is a dev-dependency only; it is the reference every formatter and parser is compared with
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
 
 use chrono::{DateTime, Utc};
-use dravr_tronc::time::Instant;
+use dravr_tronc::dates::Timestamp;
 
 /// Seconds and nanoseconds since the Unix epoch. The fractions cover every
 /// branch of chrono's digit rule (none, three, six, nine), and the dates
@@ -30,15 +30,15 @@ pub const VALUES: [(i64, u32); 16] = [
     (-63_600_000_000, 0),
 ];
 
-/// The same instant as ours and as chrono's.
-pub fn pair(seconds: i64, nanos: u32) -> (Instant, DateTime<Utc>) {
+/// The same timestamp as ours and as chrono's.
+pub fn pair(seconds: i64, nanos: u32) -> (Timestamp, DateTime<Utc>) {
     (
-        Instant::from_epoch_seconds_and_nanos(seconds, nanos).unwrap(),
+        Timestamp::from_epoch_seconds_and_nanos(seconds, nanos).unwrap(),
         DateTime::from_timestamp(seconds, nanos).unwrap(),
     )
 }
 
 /// Every table value, as ours and as chrono's.
-pub fn pairs() -> Vec<(Instant, DateTime<Utc>)> {
+pub fn pairs() -> Vec<(Timestamp, DateTime<Utc>)> {
     VALUES.iter().map(|&(s, n)| pair(s, n)).collect()
 }

@@ -1,5 +1,5 @@
 // ABOUTME: Elapsed, the Dravr-owned signed length of time that replaces chrono's Duration and TimeDelta
-// ABOUTME: A day is exactly 86,400 seconds here; calendar units live on CivilDate, never on an instant
+// ABOUTME: A day is exactly 86,400 seconds here; calendar units live on CivilDate, never on a timestamp
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 dravr.ai
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use jiff::SignedDuration;
 
-use super::error::TimeError;
+use super::error::DateError;
 
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 3_600;
@@ -23,14 +23,14 @@ const SECONDS_PER_WEEK: i64 = 604_800;
 /// number of seconds: [`Elapsed::days(1)`](Self::days) is 86,400 seconds
 /// whatever the calendar says, which is what `chrono::Duration::days` meant.
 /// A length in months or years is not an `Elapsed`; that arithmetic is on
-/// [`CivilDate`](crate::time::CivilDate).
+/// [`CivilDate`](crate::dates::CivilDate).
 ///
 /// Nothing here panics. The plain constructors and the operators saturate at
 /// [`Elapsed::MIN`] and [`Elapsed::MAX`] (about ±292 billion years); the
 /// `try_*` and `checked_*` forms report the overflow instead.
 ///
 /// ```
-/// use dravr_tronc::time::Elapsed;
+/// use dravr_tronc::dates::Elapsed;
 ///
 /// let week = Elapsed::days(7);
 /// assert_eq!(week, Elapsed::weeks(1));
@@ -265,20 +265,20 @@ impl Elapsed {
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when this is negative.
-    pub fn to_std(&self) -> Result<Duration, TimeError> {
-        Duration::try_from(self.0).map_err(|_| TimeError::OutOfRange)
+    /// [`DateError::OutOfRange`] when this is negative.
+    pub fn to_std(&self) -> Result<Duration, DateError> {
+        Duration::try_from(self.0).map_err(|_| DateError::OutOfRange)
     }
 
     /// From a `std::time::Duration`.
     ///
     /// # Errors
     ///
-    /// [`TimeError::OutOfRange`] when it is longer than [`Elapsed::MAX`].
-    pub fn from_std(duration: Duration) -> Result<Self, TimeError> {
+    /// [`DateError::OutOfRange`] when it is longer than [`Elapsed::MAX`].
+    pub fn from_std(duration: Duration) -> Result<Self, DateError> {
         SignedDuration::try_from(duration)
             .map(Self)
-            .map_err(|_| TimeError::OutOfRange)
+            .map_err(|_| DateError::OutOfRange)
     }
 }
 

@@ -84,11 +84,11 @@ otel = [
 # apart from `otel` because it pulls reqwest-middleware, which a service that
 # only receives traced requests has no use for.
 otel-http-client = ["otel", "http-client", "dep:reqwest-middleware"]
-# `time::Zone`: IANA time zones for the date types, with the zone database
+# `dates::Zone`: IANA time zones for the date types, with the zone database
 # compiled into the binary (jiff's `tzdb-bundle-always`), so a zone rule never
 # depends on the files of the host. Opt-in because the database is the one
 # sizeable thing the date types can link, and a service that only stamps
-# instants has no use for it.
+# timestamps has no use for it.
 zones = ["jiff/tzdb-bundle-always"]
 # sqlx 0.8 `Type`/`Encode`/`Decode` for the date types, one feature per
 # driver so a PostgreSQL-only service does not build SQLite's C library. Named
@@ -115,7 +115,7 @@ bytes = { version = "1", optional = true }
 # resolves one jsonwebtoken. rust_crypto is the platform's backend too; the
 # verifier builds its key from RSA components, so it needs no PEM parsing.
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"], optional = true }
-# The engine inside `dravr_tronc::time`, and private to it: no jiff type is in
+# The engine inside `dravr_tronc::dates`, and private to it: no jiff type is in
 # a public signature, so a jiff upgrade is a tronc patch release. No default
 # features: no system zone lookup, no platform zone files, no serde (the date
 # types carry their own). `zones` adds the bundled zone database.
@@ -193,7 +193,7 @@ opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 axum = { version = "0.8", features = ["ws"] }
 serial_test = "3"
 # The reference the date types are compared with, in tests only: every
-# formatter, parser and codec in `dravr_tronc::time` is checked against what
+# formatter, parser and codec in `dravr_tronc::dates` is checked against what
 # chrono, chrono-tz and sqlx's chrono support do today.
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
