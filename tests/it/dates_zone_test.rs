@@ -509,3 +509,66 @@ fn a_zone_formats_an_timestamp_as_its_clocks_show_it() {
         Err(DateError::UnsupportedFormat("%U".to_owned()))
     );
 }
+
+#[test]
+fn a_fixed_zone_is_what_chrono_fixed_offset_was() {
+    let offsets = (-86_399..=86_399).step_by(997).chain([
+        -86_399, -36_000, -25_200, -3_600, -1, 0, 1, 19_800, 20_700, 20_730, 36_000, 86_399,
+    ]);
+    let instants = [
+        "1969-12-31T23:59:59Z",
+        "2026-03-08T07:00:00Z",
+        "2026-11-17T10:00:00.123456789Z",
+        "2026-12-31T23:30:00Z",
+    ];
+    for seconds in offsets {
+        let theirs = chrono::FixedOffset::east_opt(seconds).unwrap();
+        let ours = Zone::fixed(seconds).unwrap();
+        assert_eq!(ours.name(), theirs.to_string(), "{seconds}");
+        for text in instants {
+            let at = DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&Utc);
+            let local = at.with_timezone(&theirs);
+            let ours_at = ours_of(at);
+            assert_eq!(ours.offset_seconds_at(ours_at), seconds);
+            assert_eq!(
+                ours.civil_at(ours_at),
+                civil_of(local.naive_local()),
+                "{seconds} {text}"
+            );
+            assert_eq!(
+                ours.date_at(ours_at).to_string(),
+                local.date_naive().to_string()
+            );
+            let format = "%Y-%m-%d %H:%M:%S%.f %z %:z %Z";
+            assert_eq!(
+                ours.format(ours_at, format),
+                Ok(local.format(format).to_string()),
+                "{seconds} {text}"
+            );
+            assert_eq!(
+                ours.resolve(ours.civil_at(ours_at)),
+                LocalResolution::Single(ours_at)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_fixed_zone_is_refused_where_chrono_refused_the_offset() {
+    for seconds in [-86_400, 86_400, 93_599, -93_599, i32::MAX, i32::MIN] {
+        assert!(
+            chrono::FixedOffset::east_opt(seconds).is_none(),
+            "{seconds}"
+        );
+        assert_eq!(
+            Zone::fixed(seconds).unwrap_err(),
+            DateError::OutOfRange,
+            "{seconds}"
+        );
+    }
+    assert_eq!(Zone::fixed(36_000).unwrap(), Zone::fixed(36_000).unwrap());
+    assert_ne!(Zone::fixed(36_000).unwrap(), Zone::fixed(-36_000).unwrap());
+    assert!(Zone::from_name(Zone::fixed(36_000).unwrap().name()).is_err());
+}

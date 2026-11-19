@@ -30,6 +30,9 @@ fn database() -> &'static TimeZoneDatabase {
 /// out, and so does [`Zone::from_name`].
 const PLACEHOLDER_ZONE: &str = "Factory";
 
+/// A [`Zone::fixed`] offset must be less than this many seconds from UTC.
+const SECONDS_PER_DAY: u32 = 86_400;
+
 /// An IANA time zone, such as `America/Toronto`.
 ///
 /// Replaces `chrono_tz::Tz`. The zone rules come from a database compiled
@@ -60,6 +63,8 @@ const PLACEHOLDER_ZONE: &str = "Factory";
 pub struct Zone {
     name: Arc<str>,
     rules: TimeZone,
+    /// Made by [`Zone::fixed`]: its name is its offset and its abbreviation.
+    fixed: bool,
 }
 
 /// What a wall-clock reading is in a zone: one timestamp, two, or none.
@@ -116,6 +121,7 @@ impl Zone {
         Self {
             name: Arc::from("UTC"),
             rules: TimeZone::UTC,
+            fixed: false,
         }
     }
 
@@ -137,10 +143,44 @@ impl Zone {
         Ok(Self {
             name: Arc::from(name),
             rules,
+            fixed: false,
         })
     }
 
-    /// The IANA name this zone was found by.
+    /// A zone whose offset never changes, `offset_seconds` east of UTC: what
+    /// chrono's `FixedOffset` was, for a sender that states an offset and no
+    /// zone.
+    ///
+    /// It is named as chrono wrote the offset: `+10:00`, `-07:00`, and
+    /// `+05:45:30` when the offset has seconds. That is not an IANA name, so
+    /// [`Zone::from_name`] does not find it again.
+    ///
+    /// # Errors
+    ///
+    /// [`DateError::OutOfRange`] unless `offset_seconds` is less than a day
+    /// from UTC, the range chrono's `FixedOffset::east_opt` accepted.
+    pub fn fixed(offset_seconds: i32) -> Result<Self, DateError> {
+        if offset_seconds.unsigned_abs() >= SECONDS_PER_DAY {
+            return Err(DateError::OutOfRange);
+        }
+        let offset = Offset::from_seconds(offset_seconds).map_err(|_| DateError::OutOfRange)?;
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let magnitude = offset_seconds.unsigned_abs();
+        let (hours, minutes, seconds) = (magnitude / 3600, magnitude / 60 % 60, magnitude % 60);
+        let name = if seconds == 0 {
+            format!("{sign}{hours:02}:{minutes:02}")
+        } else {
+            format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+        };
+        Ok(Self {
+            name: Arc::from(name),
+            rules: TimeZone::fixed(offset),
+            fixed: true,
+        })
+    }
+
+    /// The name this zone was made with: the IANA name it was found by, or
+    /// the offset of a [`Zone::fixed`] zone.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -166,13 +206,22 @@ impl Zone {
         self.rules.to_offset(timestamp.0).seconds()
     }
 
-    /// The zone's abbreviation at `timestamp`, such as `EST` or `CEST`.
+    /// The zone's abbreviation at `timestamp`, such as `EST` or `CEST`; a
+    /// [`Zone::fixed`] zone's is its name.
     #[must_use]
     pub fn abbreviation_at(&self, timestamp: Timestamp) -> String {
-        self.rules
-            .to_offset_info(timestamp.0)
-            .abbreviation()
-            .to_owned()
+        let info = self.rules.to_offset_info(timestamp.0);
+        self.abbreviation(info.abbreviation()).to_owned()
+    }
+
+    /// The abbreviation the rules give, or for a [`Zone::fixed`] zone its
+    /// name, which is what chrono's `%Z` wrote for a `FixedOffset`.
+    fn abbreviation<'a>(&'a self, from_rules: &'a str) -> &'a str {
+        if self.fixed {
+            &self.name
+        } else {
+            from_rules
+        }
     }
 
     /// The timestamp or timestamps at which the zone's clocks show `local`.
@@ -243,7 +292,10 @@ impl Zone {
             &Moment {
                 date: Some(civil.date()),
                 time: Some(civil.time()),
-                offset: Some((info.offset().seconds(), info.abbreviation())),
+                offset: Some((
+                    info.offset().seconds(),
+                    self.abbreviation(info.abbreviation()),
+                )),
             },
             format,
         )

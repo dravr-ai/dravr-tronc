@@ -103,6 +103,7 @@
 //! | `tz.from_local_datetime(&dt).earliest()` | `zone.resolve(dt).earliest()` |
 //! | `date + Months::new(1)` | [`CivilDate::checked_add_months`] |
 //! | `"America/Toronto".parse::<Tz>()` | `"America/Toronto".parse::<Zone>()` |
+//! | `FixedOffset::east_opt(s)` as a zone | `Zone::fixed(s)` (a `Result`) |
 //!
 //! # What is deliberately different
 //!
