@@ -261,6 +261,7 @@ once, last. See [Request guard](#request-guard).
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop; `init_with_ceilings` holds per-target level ceilings over `RUST_LOG` |
 | `server::log_ceiling` | `TargetCeiling` / `LevelCeilings` — a filter AND-ed with `EnvFilter` that drops a target's spans and events above its ceiling, for a dependency whose TRACE output carries secrets |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
+| `dates` | Dravr-owned date types — `Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date types](#date-types) |
 
 ## Choosing an auth mechanism
 
@@ -546,6 +547,52 @@ let server = McpServer::new("my-server", "0.1.0", registry, state)
   returning `None` keeps nothing — and the text is cut to `max_bytes` (default 4096) on a UTF-8
   boundary with a `…(truncated)` marker. Payload attributes go to OpenTelemetry directly, never into
   a log line.
+
+## Date types
+
+`dravr_tronc::dates` holds the date types every dravr service puts in its public structs:
+`Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Zone` and `Elapsed`.
+
+They exist because the services used to expose `chrono` types, and chrono and chrono-tz are no
+longer maintained (chrono-tz's zone database stopped at 2025b). Putting another library's types in
+those structs would have changed the JSON clients read, the values stored in the databases and the
+tool schemas, and would have made that library's next major release a breaking release of every
+service. So the types are ours: a date library does the work inside them and appears in no public
+signature, and what they promise is what the code already relied on.
+
+| Contract | What the types do |
+|---|---|
+| JSON (serde) | The bytes chrono's default serde wrote: `2026-11-17T10:00:00.100Z`, `2026-11-17`, `"Mon"`. Reading keeps chrono's leniency |
+| Rejections | chrono's error kind and message for the same bad input (`input contains invalid characters`, `premature end of input`, …), in `FromStr` and in serde |
+| `to_rfc3339()` | The same name and bytes: `2026-11-17T10:00:00.100+00:00` |
+| SQLite (feature `sqlx08-sqlite`) | The text sqlx's chrono support stored, and every shape it read, including `datetime('now')` rows |
+| PostgreSQL (feature `sqlx08-postgres`) | The same binary `timestamptz`, `timestamp`, `date` and `time` values, and their arrays |
+| JSON schema (feature `schemars1`) | `date-time`, `date`, `partial-date-time`, `partial-time`, the weekday enum |
+| Zones (feature `zones`) | IANA zones by exact name, on a zone database compiled into the binary; gaps and folds reported as chrono-tz reported them |
+
+Moving a field is a change of type; the derives, `.bind(x)`, `row.get("col")` and the stored rows
+stay as they are:
+
+```rust
+use dravr_tronc::dates::{CivilDate, Elapsed, Timestamp};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Goal {
+    created_at: Timestamp, // was DateTime<Utc>
+    target_date: CivilDate, // was NaiveDate
+}
+
+let week_ago = Timestamp::now() - Elapsed::days(7); // was Utc::now() - Duration::days(7)
+```
+
+Three things are different on purpose. A `Timestamp` moves only by an exact `Elapsed` (a day is
+86,400 seconds, as `Duration::days` always was); months, and days that follow the local clock, are
+arithmetic on a `CivilDate`, brought back through a `Zone`. No operation panics: operators stop at
+the bounds of the range and the `checked_*` forms report leaving it. And the range is years −9999
+to 9999, where chrono's reached ±262,142.
+
+The [module documentation](https://docs.rs/dravr-tronc/latest/dravr_tronc/dates/) has the full
+table of chrono calls and their counterparts, and the list of `strftime` specifiers.
 
 ## Health checks
 

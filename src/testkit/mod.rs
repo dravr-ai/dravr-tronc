@@ -23,7 +23,7 @@
 //!   authorization server: a fresh RSA key, its JWK set served on loopback,
 //!   and a minter of caller tokens, so a server gated by
 //!   `mcp::caller::CallerAuthHook` is tested end to end.
-//! - [`assert`] holds assertions on tool results and JSON-RPC responses, and
+//! - [`mod@assert`] holds assertions on tool results and JSON-RPC responses, and
 //!   [`assert::assert_tools_snapshot`], which pins a server's whole
 //!   `tools/list` to a committed file.
 //!

@@ -32,6 +32,7 @@
     )
 )]
 
+pub mod dates;
 pub mod error;
 #[cfg(feature = "http-client")]
 pub mod http_client;

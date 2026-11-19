@@ -32,6 +32,29 @@ mod ssrf_guard_test;
 mod task_signal_test;
 mod tasks_extension_test;
 mod testkit_test;
+// The date-type suites share helpers that unwrap outside a #[test] function
+// (building a value from a literal). cfg(test) is what tells clippy those
+// helpers are test code; it is always true in this binary.
+#[cfg(test)]
+mod dates_arith_test;
+#[cfg(test)]
+mod dates_format_test;
+#[cfg(test)]
+mod dates_parse_test;
+#[cfg(test)]
+#[cfg(feature = "schemars1")]
+mod dates_schema_test;
+#[cfg(test)]
+#[cfg(feature = "sqlx08-postgres")]
+mod dates_sqlx_postgres_test;
+#[cfg(test)]
+#[cfg(feature = "sqlx08-sqlite")]
+mod dates_sqlx_sqlite_test;
+#[cfg(test)]
+mod dates_support;
+#[cfg(test)]
+#[cfg(feature = "zones")]
+mod dates_zone_test;
 mod tool_response_test;
 #[cfg(feature = "otel")]
 mod trace_context_test;
