@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.1.0] — 2026-11-20
+
+### Added
+
+- feat(dates): Zone::fixed, a zone at a constant offset from UTC
+- feat(dates): Dravr-owned date types, with the engine private
+
+
 ## [7.0.0] — 2026-11-17
 
 ### Added
