@@ -15,6 +15,7 @@ use super::civil_date::CivilDate;
 use super::civil_time::CivilTime;
 use super::elapsed::Elapsed;
 use super::error::DateError;
+use super::pattern::Pattern;
 use super::text::{self, FractionDigits, Moment};
 use super::timestamp::Timestamp;
 
@@ -99,6 +100,14 @@ impl CivilDateTime {
     #[must_use]
     pub fn signed_duration_since(self, earlier: Self) -> Elapsed {
         Elapsed(self.0.duration_since(earlier.0))
+    }
+
+    /// Formats with a [`Pattern`] checked when it was compiled, so the
+    /// formatting cannot fail. The bytes are what [`format`](Self::format)
+    /// writes for the same string.
+    #[must_use]
+    pub fn format_with(&self, pattern: &Pattern<Self>) -> String {
+        pattern.render(&self.0)
     }
 
     /// Formats with a `strftime` string, such as `"%Y-%m-%d %H:%M"`. The

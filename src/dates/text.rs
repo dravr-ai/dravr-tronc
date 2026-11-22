@@ -156,9 +156,14 @@ const HOUR_MINUTE_ITEMS: [Item<'static>; 3] = [
     Item::Numeric(Num::Minute, Pad::Zero),
 ];
 
-/// `:%S`
-const SECOND_ITEMS: [Item<'static>; 2] =
-    [Item::Literal(":"), Item::Numeric(Num::Second, Pad::Zero)];
+/// `%H:%M:%S`
+const CLOCK_ITEMS: [Item<'static>; 5] = [
+    Item::Numeric(Num::Hour, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Num::Minute, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Num::Second, Pad::Zero),
+];
 
 /// `%m/%d/%y`
 const US_DATE_ITEMS: [Item<'static>; 5] = [
@@ -204,85 +209,350 @@ pub(super) fn compile(format: &str) -> Result<Vec<Item<'_>>, DateError> {
 /// Reads one `%…` specifier at the start of `text`, pushes its items and
 /// returns what follows it.
 fn specifier<'a>(text: &'a str, items: &mut Vec<Item<'a>>) -> Result<&'a str, DateError> {
-    let mut chars = text.chars();
-    chars.next();
-    let whole = |rest: &str| {
-        let len = text.len() - rest.len();
-        unsupported(text.get(..len).unwrap_or(text))
-    };
-    let mut letter = chars.next().ok_or_else(|| unsupported("%"))?;
+    match lookup(text.as_bytes()) {
+        Ok((Specifier::One(item), used)) => {
+            items.push(item);
+            text.get(used..).ok_or_else(|| unsupported(text))
+        }
+        Ok((Specifier::Many(expansion), used)) => {
+            items.extend_from_slice(expansion);
+            text.get(used..).ok_or_else(|| unsupported(text))
+        }
+        Err(used) => Err(unsupported(text.get(..used).unwrap_or(text))),
+    }
+}
+
+/// What one `%…` specifier compiles to.
+pub(super) enum Specifier {
+    /// A single item.
+    One(Item<'static>),
+    /// A shorthand for several: `%F`, `%T`, `%R`, `%D`.
+    Many(&'static [Item<'static>]),
+}
+
+/// How many bytes the character that starts with `byte` takes in UTF-8.
+const fn char_width(byte: u8) -> usize {
+    match byte {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// A numeric item padded as the format asks, or as the specifier does by
+/// default.
+const fn numeric(num: Num, pad: Option<Pad>, default: Pad) -> Specifier {
+    Specifier::One(Item::Numeric(
+        num,
+        match pad {
+            Some(pad) => pad,
+            None => default,
+        },
+    ))
+}
+
+/// The specifier table, shared by [`compile`] and the compile-time patterns
+/// of [`Pattern`](super::Pattern). `bytes` starts with `%`.
+///
+/// Returns the items and how many bytes the specifier took, or, for one
+/// that is not implemented, how many bytes of it the error names: chrono's
+/// tokenization decides where a broken specifier ends.
+pub(super) const fn lookup(bytes: &[u8]) -> Result<(Specifier, usize), usize> {
+    let len = bytes.len();
+    if len < 2 {
+        return Err(len);
+    }
+    let mut letter = bytes[1];
+    let mut at = 2;
     let pad = match letter {
-        '-' => Some(Pad::None),
-        '0' => Some(Pad::Zero),
-        '_' => Some(Pad::Space),
+        b'-' => Some(Pad::None),
+        b'0' => Some(Pad::Zero),
+        b'_' => Some(Pad::Space),
         _ => None,
     };
     if pad.is_some() {
-        letter = chars.next().ok_or_else(|| whole(chars.as_str()))?;
+        if len < 3 {
+            return Err(len);
+        }
+        letter = bytes[2];
+        at = 3;
     }
-    let numeric = |num, default| Item::Numeric(num, pad.unwrap_or(default));
-    let before = items.len();
-    match letter {
-        'Y' => items.push(numeric(Num::Year, Pad::Zero)),
-        'C' => items.push(numeric(Num::YearDiv100, Pad::Zero)),
-        'y' => items.push(numeric(Num::YearMod100, Pad::Zero)),
-        'm' => items.push(numeric(Num::Month, Pad::Zero)),
-        'd' => items.push(numeric(Num::Day, Pad::Zero)),
-        'e' => items.push(numeric(Num::Day, Pad::Space)),
-        'j' => items.push(numeric(Num::Ordinal, Pad::Zero)),
-        'H' => items.push(numeric(Num::Hour, Pad::Zero)),
-        'k' => items.push(numeric(Num::Hour, Pad::Space)),
-        'I' => items.push(numeric(Num::Hour12, Pad::Zero)),
-        'l' => items.push(numeric(Num::Hour12, Pad::Space)),
-        'M' => items.push(numeric(Num::Minute, Pad::Zero)),
-        'S' => items.push(numeric(Num::Second, Pad::Zero)),
-        'f' => items.push(numeric(Num::Nanosecond, Pad::Zero)),
+    let spec = match letter {
+        b'Y' => numeric(Num::Year, pad, Pad::Zero),
+        b'C' => numeric(Num::YearDiv100, pad, Pad::Zero),
+        b'y' => numeric(Num::YearMod100, pad, Pad::Zero),
+        b'm' => numeric(Num::Month, pad, Pad::Zero),
+        b'd' => numeric(Num::Day, pad, Pad::Zero),
+        b'e' => numeric(Num::Day, pad, Pad::Space),
+        b'j' => numeric(Num::Ordinal, pad, Pad::Zero),
+        b'H' => numeric(Num::Hour, pad, Pad::Zero),
+        b'k' => numeric(Num::Hour, pad, Pad::Space),
+        b'I' => numeric(Num::Hour12, pad, Pad::Zero),
+        b'l' => numeric(Num::Hour12, pad, Pad::Space),
+        b'M' => numeric(Num::Minute, pad, Pad::Zero),
+        b'S' => numeric(Num::Second, pad, Pad::Zero),
+        b'f' => numeric(Num::Nanosecond, pad, Pad::Zero),
         // Unpadded unless the format asks: `%0s` and `%_s` fill nine places.
-        's' => items.push(numeric(Num::UnixSeconds, Pad::None)),
-        'u' => items.push(numeric(Num::WeekdayFromMonday, Pad::Zero)),
-        'w' => items.push(numeric(Num::DaysFromSunday, Pad::Zero)),
-        _ if pad.is_some() => return Err(whole(chars.as_str())),
-        'a' => items.push(Item::ShortWeekday),
-        'A' => items.push(Item::LongWeekday),
-        'b' | 'h' => items.push(Item::ShortMonth),
-        'B' => items.push(Item::LongMonth),
-        'p' => items.push(Item::UpperAmPm),
-        'P' => items.push(Item::LowerAmPm),
-        'z' => items.push(Item::Offset),
-        'Z' => items.push(Item::ZoneName),
-        'F' => items.extend(DATE_ITEMS),
-        'R' => items.extend(HOUR_MINUTE_ITEMS),
-        'T' => {
-            items.extend(HOUR_MINUTE_ITEMS);
-            items.extend(SECOND_ITEMS);
-        }
-        'D' => items.extend(US_DATE_ITEMS),
-        'n' => items.push(Item::Space("\n")),
-        't' => items.push(Item::Space("\t")),
-        '%' => items.push(Item::Literal("%")),
-        '.' => match (chars.next(), chars.clone().next()) {
-            (Some('f'), _) => items.push(Item::Fraction),
-            (Some(digits @ ('3' | '6' | '9')), Some('f')) => {
-                chars.next();
-                let width = digits.to_digit(10).map_or(3, |d| d as usize);
-                items.push(Item::FractionFixed(width));
+        b's' => numeric(Num::UnixSeconds, pad, Pad::None),
+        b'u' => numeric(Num::WeekdayFromMonday, pad, Pad::Zero),
+        b'w' => numeric(Num::DaysFromSunday, pad, Pad::Zero),
+        _ if pad.is_some() => return Err(at - 1 + char_width(letter)),
+        b'a' => Specifier::One(Item::ShortWeekday),
+        b'A' => Specifier::One(Item::LongWeekday),
+        b'b' | b'h' => Specifier::One(Item::ShortMonth),
+        b'B' => Specifier::One(Item::LongMonth),
+        b'p' => Specifier::One(Item::UpperAmPm),
+        b'P' => Specifier::One(Item::LowerAmPm),
+        b'z' => Specifier::One(Item::Offset),
+        b'Z' => Specifier::One(Item::ZoneName),
+        b'F' => Specifier::Many(&DATE_ITEMS),
+        b'R' => Specifier::Many(&HOUR_MINUTE_ITEMS),
+        b'T' => Specifier::Many(&CLOCK_ITEMS),
+        b'D' => Specifier::Many(&US_DATE_ITEMS),
+        b'n' => Specifier::One(Item::Space("\n")),
+        b't' => Specifier::One(Item::Space("\t")),
+        b'%' => Specifier::One(Item::Literal("%")),
+        b'.' => {
+            // chrono reads the character after the dot whatever it is, and
+            // looks at the one after that only to find an `f`.
+            if at >= len {
+                return Err(at);
             }
-            _ => {}
+            let next = bytes[at];
+            let after = if at + 1 < len { bytes[at + 1] } else { 0 };
+            match (next, after) {
+                (b'f', _) => return Ok((Specifier::One(Item::Fraction), at + 1)),
+                (b'3' | b'6' | b'9', b'f') => {
+                    let width = (next - b'0') as usize;
+                    return Ok((Specifier::One(Item::FractionFixed(width)), at + 2));
+                }
+                _ => return Err(at + char_width(next)),
+            }
+        }
+        b':' if at < len && bytes[at] == b'z' => {
+            return Ok((Specifier::One(Item::OffsetColon), at + 1));
+        }
+        b'#' if at < len && bytes[at] == b'z' => {
+            return Ok((Specifier::One(Item::OffsetPermissive), at + 1));
+        }
+        b':' | b'#' => return Err(at),
+        _ => return Err(at - 1 + char_width(letter)),
+    };
+    Ok((spec, at))
+}
+
+/// A component of a calendar date, written from the date alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DateField {
+    /// `%Y`
+    Year(Pad),
+    /// `%y`
+    YearMod100(Pad),
+    /// `%m`
+    Month(Pad),
+    /// `%d`, `%e`
+    Day(Pad),
+    /// `%j`
+    Ordinal(Pad),
+    /// `%u`
+    WeekdayFromMonday,
+    /// `%w`
+    DaysFromSunday,
+    /// `%b`
+    ShortMonth,
+    /// `%B`
+    LongMonth,
+    /// `%a`
+    ShortWeekday,
+    /// `%A`
+    LongWeekday,
+}
+
+impl DateField {
+    /// The specifier an error names when the value has no date.
+    const fn spec(self) -> &'static str {
+        match self {
+            Self::Year(_) => "%Y",
+            Self::YearMod100(_) => "%y",
+            Self::Month(_) => "%m",
+            Self::Day(_) => "%d",
+            Self::Ordinal(_) => "%j",
+            Self::WeekdayFromMonday => "%u",
+            Self::DaysFromSunday => "%w",
+            Self::ShortMonth => "%b",
+            Self::LongMonth => "%B",
+            Self::ShortWeekday => "%a",
+            Self::LongWeekday => "%A",
+        }
+    }
+
+    /// Writes the component of `date`; fails only when `out` does.
+    pub(super) fn write(self, out: &mut impl Write, date: Date) -> fmt::Result {
+        match self {
+            Self::Year(pad) => {
+                let year = i64::from(date.year());
+                write_padded(out, 4, year, pad, !(0..10_000).contains(&year))
+            }
+            Self::YearMod100(pad) => write_two(out, i64::from(date.year()).rem_euclid(100), pad),
+            Self::Month(pad) => write_two(out, i64::from(date.month()), pad),
+            Self::Day(pad) => write_two(out, i64::from(date.day()), pad),
+            Self::Ordinal(pad) => write_padded(out, 3, i64::from(date.day_of_year()), pad, false),
+            Self::WeekdayFromMonday => write!(out, "{}", date.weekday().to_monday_one_offset()),
+            Self::DaysFromSunday => write!(out, "{}", date.weekday().to_sunday_zero_offset()),
+            Self::ShortMonth => out.write_str(month_name(&SHORT_MONTHS, date)),
+            Self::LongMonth => out.write_str(month_name(&LONG_MONTHS, date)),
+            Self::ShortWeekday => out.write_str(weekday_name(&SHORT_WEEKDAYS, date)),
+            Self::LongWeekday => out.write_str(weekday_name(&LONG_WEEKDAYS, date)),
+        }
+    }
+}
+
+/// A component of a time of day, written from the time alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimeField {
+    /// `%H`, `%k`
+    Hour(Pad),
+    /// `%I`, `%l`
+    Hour12(Pad),
+    /// `%M`
+    Minute(Pad),
+    /// `%S`
+    Second(Pad),
+    /// `%f`
+    Nanosecond(Pad),
+    /// `%.f`, `%.3f`, `%.6f`, `%.9f`
+    Fraction(FractionDigits),
+    /// `%P`
+    LowerAmPm,
+    /// `%p`
+    UpperAmPm,
+}
+
+impl TimeField {
+    /// The specifier an error names when the value has no time of day.
+    const fn spec(self) -> &'static str {
+        match self {
+            Self::Hour(_) => "%H",
+            Self::Hour12(_) => "%I",
+            Self::Minute(_) => "%M",
+            Self::Second(_) => "%S",
+            Self::Nanosecond(_) => "%f",
+            Self::Fraction(FractionDigits::Auto) => "%.f",
+            Self::Fraction(_) => "%.3f",
+            Self::LowerAmPm => "%P",
+            Self::UpperAmPm => "%p",
+        }
+    }
+
+    /// Writes the component of `time`; fails only when `out` does.
+    pub(super) fn write(self, out: &mut impl Write, time: Time) -> fmt::Result {
+        match self {
+            Self::Hour(pad) => write_two(out, i64::from(time.hour()), pad),
+            Self::Hour12(pad) => {
+                let hour = i64::from(time.hour()) % 12;
+                write_two(out, if hour == 0 { 12 } else { hour }, pad)
+            }
+            Self::Minute(pad) => write_two(out, i64::from(time.minute()), pad),
+            Self::Second(pad) => write_two(out, i64::from(time.second()), pad),
+            Self::Nanosecond(pad) => {
+                write_padded(out, 9, i64::from(time.subsec_nanosecond()), pad, false)
+            }
+            Self::Fraction(digits) => write_fraction(out, time.subsec_nanosecond(), digits),
+            Self::LowerAmPm => out.write_str(if time.hour() >= 12 { "pm" } else { "am" }),
+            Self::UpperAmPm => out.write_str(if time.hour() >= 12 { "PM" } else { "AM" }),
+        }
+    }
+}
+
+/// A component of a value's place on the time line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OffsetField {
+    /// `%z`: `+0000`.
+    Compact,
+    /// `%:z`: `+00:00`.
+    Colon,
+    /// `%Z`: the zone's abbreviation, `UTC` for a timestamp.
+    Name,
+}
+
+impl OffsetField {
+    /// The specifier an error names when the value has no offset.
+    const fn spec(self) -> &'static str {
+        match self {
+            Self::Compact => "%z",
+            Self::Colon => "%:z",
+            Self::Name => "%Z",
+        }
+    }
+
+    /// Writes the offset `seconds` east of UTC, or the zone's `name`.
+    pub(super) fn write(self, out: &mut impl Write, seconds: i32, name: &str) -> fmt::Result {
+        match self {
+            Self::Compact => write_offset(out, seconds, false),
+            Self::Colon => write_offset(out, seconds, true),
+            Self::Name => out.write_str(name),
+        }
+    }
+}
+
+/// What an item needs from the value to be written.
+#[derive(Clone, Copy)]
+pub(super) enum Writes<'a> {
+    /// Text written as it is.
+    Text(&'a str),
+    /// A component of the date.
+    Date(DateField),
+    /// A component of the time of day.
+    Time(TimeField),
+    /// The offset or zone name.
+    Offset(OffsetField),
+    /// `%s`: seconds since the epoch, from the date, the time and, when
+    /// there is one, the offset.
+    Unix(Pad),
+    /// `%C`: a century, which chrono wrote as two meaningless characters
+    /// before year 0, so it can fail on the value.
+    Century(Pad),
+    /// `%#z`, which is read and never written.
+    ReadOnly,
+}
+
+/// What `item` needs from the value to be written: the one table both
+/// [`format`] and the compile-time patterns write by.
+pub(super) const fn writes(item: Item<'_>) -> Writes<'_> {
+    match item {
+        Item::Literal(text) | Item::Space(text) => Writes::Text(text),
+        Item::Numeric(num, pad) => match num {
+            Num::Year => Writes::Date(DateField::Year(pad)),
+            Num::YearDiv100 => Writes::Century(pad),
+            Num::YearMod100 => Writes::Date(DateField::YearMod100(pad)),
+            Num::Month => Writes::Date(DateField::Month(pad)),
+            Num::Day => Writes::Date(DateField::Day(pad)),
+            Num::Ordinal => Writes::Date(DateField::Ordinal(pad)),
+            Num::Hour => Writes::Time(TimeField::Hour(pad)),
+            Num::Hour12 => Writes::Time(TimeField::Hour12(pad)),
+            Num::Minute => Writes::Time(TimeField::Minute(pad)),
+            Num::Second => Writes::Time(TimeField::Second(pad)),
+            Num::Nanosecond => Writes::Time(TimeField::Nanosecond(pad)),
+            Num::UnixSeconds => Writes::Unix(pad),
+            Num::WeekdayFromMonday => Writes::Date(DateField::WeekdayFromMonday),
+            Num::DaysFromSunday => Writes::Date(DateField::DaysFromSunday),
         },
-        ':' if chars.clone().next() == Some('z') => {
-            chars.next();
-            items.push(Item::OffsetColon);
-        }
-        '#' if chars.clone().next() == Some('z') => {
-            chars.next();
-            items.push(Item::OffsetPermissive);
-        }
-        _ => {}
+        Item::Fraction => Writes::Time(TimeField::Fraction(FractionDigits::Auto)),
+        Item::FractionFixed(3) => Writes::Time(TimeField::Fraction(FractionDigits::Millis)),
+        Item::FractionFixed(6) => Writes::Time(TimeField::Fraction(FractionDigits::Micros)),
+        Item::FractionFixed(_) => Writes::Time(TimeField::Fraction(FractionDigits::Nanos)),
+        Item::ShortMonth => Writes::Date(DateField::ShortMonth),
+        Item::LongMonth => Writes::Date(DateField::LongMonth),
+        Item::ShortWeekday => Writes::Date(DateField::ShortWeekday),
+        Item::LongWeekday => Writes::Date(DateField::LongWeekday),
+        Item::LowerAmPm => Writes::Time(TimeField::LowerAmPm),
+        Item::UpperAmPm => Writes::Time(TimeField::UpperAmPm),
+        Item::Offset => Writes::Offset(OffsetField::Compact),
+        Item::OffsetColon => Writes::Offset(OffsetField::Colon),
+        Item::OffsetPermissive => Writes::ReadOnly,
+        Item::ZoneName => Writes::Offset(OffsetField::Name),
     }
-    if items.len() == before {
-        return Err(whole(chars.as_str()));
-    }
-    Ok(chars.as_str())
 }
 
 /// What a format string is applied to: the components the value has.
@@ -308,69 +578,54 @@ pub(super) fn format(moment: &Moment<'_>, format: &str) -> Result<String, DateEr
 }
 
 fn write_item(out: &mut String, moment: &Moment<'_>, item: Item<'_>) -> Result<(), DateError> {
-    let need_date = |spec: &str| moment.date.ok_or_else(|| unsupported(spec));
-    let need_time = |spec: &str| moment.time.ok_or_else(|| unsupported(spec));
-    let need_offset = |spec: &str| moment.offset.ok_or_else(|| unsupported(spec));
-    let written = match item {
-        Item::Literal(text) | Item::Space(text) => {
-            out.push_str(text);
-            Ok(())
+    let written = match writes(item) {
+        Writes::Text(text) => out.write_str(text),
+        Writes::Date(field) => {
+            field.write(out, moment.date.ok_or_else(|| unsupported(field.spec()))?)
         }
-        Item::Numeric(num, pad) => return write_numeric(out, moment, num, pad),
-        Item::Fraction => write_fraction(
-            out,
-            need_time("%.f")?.subsec_nanosecond(),
-            FractionDigits::Auto,
-        ),
-        Item::FractionFixed(width) => {
-            let digits = match width {
-                3 => FractionDigits::Millis,
-                6 => FractionDigits::Micros,
-                _ => FractionDigits::Nanos,
-            };
-            write_fraction(out, need_time("%.3f")?.subsec_nanosecond(), digits)
+        Writes::Time(field) => {
+            field.write(out, moment.time.ok_or_else(|| unsupported(field.spec()))?)
         }
-        Item::ShortMonth => {
-            out.push_str(month_name(&SHORT_MONTHS, need_date("%b")?));
-            Ok(())
+        Writes::Offset(field) => {
+            let (seconds, name) = moment.offset.ok_or_else(|| unsupported(field.spec()))?;
+            field.write(out, seconds, name)
         }
-        Item::LongMonth => {
-            out.push_str(month_name(&LONG_MONTHS, need_date("%B")?));
-            Ok(())
+        Writes::Unix(pad) => {
+            let date = moment.date.ok_or_else(|| unsupported("%s"))?;
+            let time = moment.time.ok_or_else(|| unsupported("%s"))?;
+            let offset = moment.offset.map_or(0, |(seconds, _)| seconds);
+            write_unix(out, DateTime::from_parts(date, time), offset, pad)
         }
-        Item::ShortWeekday => {
-            out.push_str(weekday_name(&SHORT_WEEKDAYS, need_date("%a")?));
-            Ok(())
+        Writes::Century(pad) => {
+            // chrono writes two meaningless characters for a century before
+            // year 0; that is not a format to reproduce.
+            let year = i64::from(moment.date.ok_or_else(|| unsupported("%C"))?.year());
+            if year < 0 {
+                return Err(DateError::OutOfRange);
+            }
+            write_two(out, year / 100, pad)
         }
-        Item::LongWeekday => {
-            out.push_str(weekday_name(&LONG_WEEKDAYS, need_date("%A")?));
-            Ok(())
-        }
-        Item::LowerAmPm => {
-            out.push_str(if need_time("%P")?.hour() >= 12 {
-                "pm"
-            } else {
-                "am"
-            });
-            Ok(())
-        }
-        Item::UpperAmPm => {
-            out.push_str(if need_time("%p")?.hour() >= 12 {
-                "PM"
-            } else {
-                "AM"
-            });
-            Ok(())
-        }
-        Item::Offset => write_offset(out, need_offset("%z")?.0, false),
-        Item::OffsetColon => write_offset(out, need_offset("%:z")?.0, true),
-        Item::OffsetPermissive => return Err(unsupported("%#z")),
-        Item::ZoneName => {
-            out.push_str(need_offset("%Z")?.1);
-            Ok(())
-        }
+        Writes::ReadOnly => return Err(unsupported("%#z")),
     };
     written.map_err(|_| DateError::OutOfRange)
+}
+
+/// `%s`: the whole seconds from the epoch to `civil` on a clock
+/// `offset_seconds` east of UTC, rounded down as `timestamp()` gives before
+/// 1970.
+pub(super) fn write_unix(
+    out: &mut impl Write,
+    civil: DateTime,
+    offset_seconds: i32,
+    pad: Pad,
+) -> fmt::Result {
+    let local = civil.duration_since(DateTime::constant(1970, 1, 1, 0, 0, 0, 0));
+    let seconds = if local.subsec_nanos() < 0 {
+        local.as_secs() - 1
+    } else {
+        local.as_secs()
+    };
+    write_padded(out, 9, seconds - i64::from(offset_seconds), pad, false)
 }
 
 fn month_name(names: &'static [&'static str; 12], date: Date) -> &'static str {
@@ -383,75 +638,8 @@ fn weekday_name(names: &'static [&'static str; 7], date: Date) -> &'static str {
     names.get(index).copied().unwrap_or("")
 }
 
-fn write_numeric(
-    out: &mut String,
-    moment: &Moment<'_>,
-    num: Num,
-    pad: Pad,
-) -> Result<(), DateError> {
-    let need_date = |spec: &str| moment.date.ok_or_else(|| unsupported(spec));
-    let need_time = |spec: &str| moment.time.ok_or_else(|| unsupported(spec));
-    let written = match num {
-        Num::Year => {
-            let year = i64::from(need_date("%Y")?.year());
-            write_padded(out, 4, year, pad, !(0..10_000).contains(&year))
-        }
-        Num::YearDiv100 => {
-            // chrono writes two meaningless characters for a century before
-            // year 0; that is not a format to reproduce.
-            let year = i64::from(need_date("%C")?.year());
-            if year < 0 {
-                return Err(DateError::OutOfRange);
-            }
-            write_two(out, year / 100, pad)
-        }
-        Num::YearMod100 => write_two(out, i64::from(need_date("%y")?.year()).rem_euclid(100), pad),
-        Num::Month => write_two(out, i64::from(need_date("%m")?.month()), pad),
-        Num::Day => write_two(out, i64::from(need_date("%d")?.day()), pad),
-        Num::Ordinal => write_padded(
-            out,
-            3,
-            i64::from(need_date("%j")?.day_of_year()),
-            pad,
-            false,
-        ),
-        Num::Hour => write_two(out, i64::from(need_time("%H")?.hour()), pad),
-        Num::Hour12 => {
-            let hour = i64::from(need_time("%I")?.hour()) % 12;
-            write_two(out, if hour == 0 { 12 } else { hour }, pad)
-        }
-        Num::Minute => write_two(out, i64::from(need_time("%M")?.minute()), pad),
-        Num::Second => write_two(out, i64::from(need_time("%S")?.second()), pad),
-        Num::Nanosecond => write_padded(
-            out,
-            9,
-            i64::from(need_time("%f")?.subsec_nanosecond()),
-            pad,
-            false,
-        ),
-        Num::UnixSeconds => {
-            let civil = DateTime::from_parts(need_date("%s")?, need_time("%s")?);
-            let offset = moment.offset.map_or(0, |(seconds, _)| i64::from(seconds));
-            let local = civil.duration_since(DateTime::constant(1970, 1, 1, 0, 0, 0, 0));
-            // Whole seconds rounded down, as `timestamp()` gives before 1970.
-            let seconds = i64::try_from(local.as_nanos().div_euclid(1_000_000_000))
-                .map_err(|_| DateError::OutOfRange)?;
-            write_padded(out, 9, seconds - offset, pad, false)
-        }
-        Num::WeekdayFromMonday => {
-            write!(out, "{}", need_date("%u")?.weekday().to_monday_one_offset())
-        }
-        Num::DaysFromSunday => write!(
-            out,
-            "{}",
-            need_date("%w")?.weekday().to_sunday_zero_offset()
-        ),
-    };
-    written.map_err(|_| DateError::OutOfRange)
-}
-
 /// A two-digit field: chrono writes the low two digits whatever the value.
-fn write_two(out: &mut String, value: i64, pad: Pad) -> fmt::Result {
+fn write_two(out: &mut impl Write, value: i64, pad: Pad) -> fmt::Result {
     let value = value.rem_euclid(100);
     match (value / 10, pad) {
         (0, Pad::None) => write!(out, "{value}"),
@@ -460,7 +648,13 @@ fn write_two(out: &mut String, value: i64, pad: Pad) -> fmt::Result {
     }
 }
 
-fn write_padded(out: &mut String, width: usize, value: i64, pad: Pad, sign: bool) -> fmt::Result {
+fn write_padded(
+    out: &mut impl Write,
+    width: usize,
+    value: i64,
+    pad: Pad,
+    sign: bool,
+) -> fmt::Result {
     match (sign, pad) {
         (true, Pad::None) => write!(out, "{value:+}"),
         (true, Pad::Zero) => write!(out, "{value:+0w$}", w = width + 1),
@@ -472,7 +666,7 @@ fn write_padded(out: &mut String, width: usize, value: i64, pad: Pad, sign: bool
 }
 
 /// `+hhmm` or `+hh:mm`, rounded to the minute as chrono's `%z` does.
-fn write_offset(out: &mut String, seconds: i32, colon: bool) -> fmt::Result {
+fn write_offset(out: &mut impl Write, seconds: i32, colon: bool) -> fmt::Result {
     let sign = if seconds < 0 { '-' } else { '+' };
     let minutes = (seconds.unsigned_abs() + 30) / 60;
     let (hours, minutes) = (minutes / 60, minutes % 60);
@@ -805,6 +999,14 @@ fn offset(
     };
     let seconds = hours * 3600 + minutes * 60;
     Ok((rest, if negative { -seconds } else { seconds }))
+}
+
+/// What chrono's `FixedOffset::from_str` reads: an offset with its minutes,
+/// a colon or whitespace or nothing between, no `Z`, nothing skipped before
+/// it, and nothing looked at after it. Seconds east of UTC, not yet checked
+/// against the day.
+pub(super) fn offset_alone(text: &str) -> Result<i64, DateError> {
+    offset(text, Colon::Loose, false, false).map(|(_, seconds)| seconds)
 }
 
 /// Reads a month or weekday name: its first three letters in any case, and

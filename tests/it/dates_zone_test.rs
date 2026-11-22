@@ -12,7 +12,8 @@ use chrono::offset::LocalResult;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::{Tz, TZ_VARIANTS};
 use dravr_tronc::dates::{
-    CivilDate, CivilDateTime, DateError, Elapsed, LocalResolution, Timestamp, Zone,
+    CivilDate, CivilDateTime, DateError, Elapsed, LocalResolution, Offset as UtcOffset, Timestamp,
+    Zone,
 };
 
 /// Zones whose rules did not change between 2025b and today, with and
@@ -571,4 +572,35 @@ fn a_fixed_zone_is_refused_where_chrono_refused_the_offset() {
     assert_eq!(Zone::fixed(36_000).unwrap(), Zone::fixed(36_000).unwrap());
     assert_ne!(Zone::fixed(36_000).unwrap(), Zone::fixed(-36_000).unwrap());
     assert!(Zone::from_name(Zone::fixed(36_000).unwrap().name()).is_err());
+}
+
+/// The release compiled in, pinned: a tronc release that moves the zone rules
+/// moves this row, and is reviewed as the change it is (carnet#1620).
+#[test]
+fn the_zone_database_release_is_the_one_compiled_in() {
+    let release = Zone::database_release();
+    assert_eq!(release, "2026f");
+    // An IANA release name: a four-digit year and a letter.
+    assert_eq!(release.len(), 5);
+    assert!(release[..4].bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(release[4..].bytes().all(|byte| byte.is_ascii_lowercase()));
+    // Newer than the release chrono-tz stopped at.
+    assert!(
+        release > chrono_tz::IANA_TZDB_VERSION,
+        "{}",
+        chrono_tz::IANA_TZDB_VERSION
+    );
+}
+
+/// A zone made from an `Offset` is the `Zone::fixed` zone of its seconds.
+#[test]
+fn a_zone_from_an_offset_is_the_fixed_zone() {
+    for seconds in [0, 36_000, -25_200, 20_730, -86_399, 86_399] {
+        let offset = UtcOffset::from_seconds(seconds).unwrap();
+        let zone = Zone::from(offset);
+        assert_eq!(zone, Zone::fixed(seconds).unwrap());
+        assert_eq!(zone.name(), offset.to_string());
+        let at = timestamp("2026-11-17T10:00:00Z");
+        assert_eq!(zone.offset_seconds_at(at), seconds);
+    }
 }

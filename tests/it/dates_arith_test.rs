@@ -161,6 +161,49 @@ fn elapsed_getters_match_chrono() {
     );
 }
 
+/// `Elapsed::from_std` refuses what `TimeDelta::from_std` refused: past
+/// `i64::MAX` milliseconds, 9,223,372,036,854,775.807 seconds.
+#[test]
+fn from_std_refuses_what_chrono_refused() {
+    const LONGEST_SECONDS: u64 = 9_223_372_036_854_775;
+    let durations = [
+        StdDuration::ZERO,
+        StdDuration::from_nanos(1),
+        StdDuration::from_millis(1_500),
+        StdDuration::from_secs(31_536_000_000_123),
+        StdDuration::new(LONGEST_SECONDS, 806_999_999),
+        StdDuration::new(LONGEST_SECONDS, 807_000_000),
+        StdDuration::new(LONGEST_SECONDS, 807_000_001),
+        StdDuration::new(LONGEST_SECONDS, 999_999_999),
+        StdDuration::from_secs(LONGEST_SECONDS + 1),
+        StdDuration::from_secs(i64::MAX.unsigned_abs()),
+        StdDuration::from_secs(u64::MAX),
+        StdDuration::MAX,
+    ];
+    let mut accepted = 0;
+    for duration in durations {
+        let ours = Elapsed::from_std(duration);
+        match TimeDelta::from_std(duration) {
+            Ok(theirs) => {
+                let ours = ours.unwrap_or_else(|error| panic!("{duration:?}: {error}"));
+                assert_eq!(ours.num_seconds(), theirs.num_seconds(), "{duration:?}");
+                assert_eq!(ours.subsec_nanos(), theirs.subsec_nanos(), "{duration:?}");
+                assert_eq!(ours.to_std(), Ok(duration), "{duration:?}");
+                accepted += 1;
+            }
+            Err(_) => assert_eq!(ours, Err(DateError::OutOfRange), "{duration:?}"),
+        }
+    }
+    // The boundary is where chrono put it: the last accepted row is chrono's
+    // TimeDelta::MAX itself.
+    assert_eq!(accepted, 6);
+    assert_eq!(
+        Elapsed::from_std(StdDuration::new(LONGEST_SECONDS, 807_000_000))
+            .map(|e| e.num_milliseconds()),
+        Ok(i64::MAX)
+    );
+}
+
 #[test]
 fn epoch_getters_round_down_like_chrono() {
     for (ours, theirs) in pairs() {

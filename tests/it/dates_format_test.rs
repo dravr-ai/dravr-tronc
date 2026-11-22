@@ -269,7 +269,7 @@ fn a_struct_of_date_fields_serializes_like_its_chrono_twin() {
 }
 
 /// Every format string the platform passes to `.format(..)` today.
-const PLATFORM_FORMATS: [&str; 20] = [
+pub(super) const PLATFORM_FORMATS: [&str; 20] = [
     "%Y-%m-%d",
     "%Y-%m-%d %H:%M UTC",
     "%Y%m%d_%H%M%S",
@@ -293,7 +293,7 @@ const PLATFORM_FORMATS: [&str; 20] = [
 ];
 
 /// Every specifier the date types implement, alone and with each padding.
-const SPECIFIERS: [&str; 64] = [
+pub(super) const SPECIFIERS: [&str; 64] = [
     "%Y", "%-Y", "%_Y", "%0Y", "%C", "%-C", "%_C", "%y", "%-y", "%_y", "%m", "%-m", "%_m", "%d",
     "%-d", "%_d", "%0d", "%e", "%-e", "%0e", "%j", "%-j", "%_j", "%H", "%-H", "%_H", "%k", "%-k",
     "%I", "%-I", "%_I", "%l", "%M", "%-M", "%_M", "%S", "%-S", "%_S", "%f", "%-f", "%_f", "%.f",

@@ -9,7 +9,7 @@ use std::fmt::{Debug, Display};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use dravr_tronc::dates::{CivilDate, CivilDateTime, CivilTime, DateError, Timestamp, Weekday};
 
-const DATES: [&str; 17] = [
+pub(super) const DATES: [&str; 17] = [
     "2026-11-17",
     "2026-1-7",
     "2026-02-30",
@@ -29,9 +29,9 @@ const DATES: [&str; 17] = [
     "2026/11/17",
 ];
 
-const SEPARATORS: [&str; 6] = ["T", "t", " ", "  ", "_", ""];
+pub(super) const SEPARATORS: [&str; 6] = ["T", "t", " ", "  ", "_", ""];
 
-const TIMES: [&str; 11] = [
+pub(super) const TIMES: [&str; 11] = [
     "10:00:00",
     "1:2:3",
     "10:00",
@@ -45,7 +45,7 @@ const TIMES: [&str; 11] = [
     "10:00:0x",
 ];
 
-const FRACTIONS: [&str; 11] = [
+pub(super) const FRACTIONS: [&str; 11] = [
     "",
     ".1",
     ".12",
@@ -59,7 +59,7 @@ const FRACTIONS: [&str; 11] = [
     ",5",
 ];
 
-const OFFSETS: [&str; 26] = [
+pub(super) const OFFSETS: [&str; 26] = [
     "Z",
     "z",
     "+00:00",
@@ -89,22 +89,22 @@ const OFFSETS: [&str; 26] = [
 ];
 
 /// Seconds and nanoseconds since the epoch; a leap second reads as `:59`.
-type Moment = (i64, u32);
+pub(super) type Moment = (i64, u32);
 
-fn of_chrono(value: DateTime<Utc>) -> Moment {
+pub(super) fn of_chrono(value: DateTime<Utc>) -> Moment {
     (
         value.timestamp(),
         value.timestamp_subsec_nanos() % 1_000_000_000,
     )
 }
 
-fn of_ours(value: Timestamp) -> Moment {
+pub(super) fn of_ours(value: Timestamp) -> Moment {
     (value.epoch_seconds(), value.subsec_nanos())
 }
 
 /// What ours must give for what chrono gave: the same timestamp, or an error
 /// where chrono errs or where the timestamp is outside the range of `Timestamp`.
-fn expected(theirs: Option<DateTime<Utc>>) -> Option<Moment> {
+pub(super) fn expected(theirs: Option<DateTime<Utc>>) -> Option<Moment> {
     theirs
         .filter(|value| {
             (Timestamp::MIN.epoch_seconds()..=Timestamp::MAX.epoch_seconds())
@@ -115,22 +115,22 @@ fn expected(theirs: Option<DateTime<Utc>>) -> Option<Moment> {
 
 /// A timestamp chrono read, as ours must give it: `None` beyond the range of
 /// `Timestamp`.
-fn in_range(value: DateTime<Utc>) -> Option<Moment> {
+pub(super) fn in_range(value: DateTime<Utc>) -> Option<Moment> {
     expected(Some(value))
 }
 
 /// chrono's message for a value it accepted that the date types cannot hold.
-const OUT_OF_RANGE: &str = "input is out of range";
+pub(super) const OUT_OF_RANGE: &str = "input is out of range";
 
 /// A result as a client is shown it: the value, or the error's message.
-fn shown<T, E: Display>(result: Result<T, E>) -> Result<T, String> {
+pub(super) fn shown<T, E: Display>(result: Result<T, E>) -> Result<T, String> {
     result.map_err(|error| error.to_string())
 }
 
 /// What ours must show for what chrono gave: chrono's value, or chrono's
 /// message word for word. A value chrono accepted and `keep` cannot hold is
 /// out of range.
-fn as_chrono<T, U>(
+pub(super) fn as_chrono<T, U>(
     theirs: Result<U, chrono::ParseError>,
     keep: impl FnOnce(U) -> Option<T>,
 ) -> Result<T, String> {

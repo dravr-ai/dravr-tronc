@@ -14,6 +14,8 @@ use jiff::tz::{AmbiguousOffset, Offset, TimeZone, TimeZoneDatabase};
 use super::civil_date::CivilDate;
 use super::civil_datetime::CivilDateTime;
 use super::error::DateError;
+use super::offset::Offset as UtcOffset;
+use super::pattern::{OnClock, Pattern};
 use super::text::{self, Moment};
 use super::timestamp::Timestamp;
 
@@ -29,9 +31,6 @@ fn database() -> &'static TimeZoneDatabase {
 /// is in the compiled-in database and it is not a place: chrono-tz left it
 /// out, and so does [`Zone::from_name`].
 const PLACEHOLDER_ZONE: &str = "Factory";
-
-/// A [`Zone::fixed`] offset must be less than this many seconds from UTC.
-const SECONDS_PER_DAY: u32 = 86_400;
 
 /// An IANA time zone, such as `America/Toronto`.
 ///
@@ -160,23 +159,16 @@ impl Zone {
     /// [`DateError::OutOfRange`] unless `offset_seconds` is less than a day
     /// from UTC, the range chrono's `FixedOffset::east_opt` accepted.
     pub fn fixed(offset_seconds: i32) -> Result<Self, DateError> {
-        if offset_seconds.unsigned_abs() >= SECONDS_PER_DAY {
-            return Err(DateError::OutOfRange);
-        }
-        let offset = Offset::from_seconds(offset_seconds).map_err(|_| DateError::OutOfRange)?;
-        let sign = if offset_seconds < 0 { '-' } else { '+' };
-        let magnitude = offset_seconds.unsigned_abs();
-        let (hours, minutes, seconds) = (magnitude / 3600, magnitude / 60 % 60, magnitude % 60);
-        let name = if seconds == 0 {
-            format!("{sign}{hours:02}:{minutes:02}")
-        } else {
-            format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
-        };
-        Ok(Self {
-            name: Arc::from(name),
-            rules: TimeZone::fixed(offset),
-            fixed: true,
-        })
+        UtcOffset::from_seconds(offset_seconds).map(Self::from)
+    }
+
+    /// The release of the IANA zone database compiled into the binary, such
+    /// as `2026f`: the rules every `Zone` uses. A service can report it, and
+    /// a test can pin it so that a tronc release moving the zone rules is
+    /// seen and reviewed.
+    #[must_use]
+    pub fn database_release() -> &'static str {
+        jiff_tzdb::VERSION
     }
 
     /// The name this zone was made with: the IANA name it was found by, or
@@ -299,6 +291,42 @@ impl Zone {
             },
             format,
         )
+    }
+
+    /// Formats `timestamp` as the zone's clocks show it, with a [`Pattern`]
+    /// checked when it was compiled, so the formatting cannot fail. The
+    /// bytes are what [`format`](Self::format) writes for the same string.
+    ///
+    /// ```
+    /// use dravr_tronc::date_pattern;
+    /// use dravr_tronc::dates::{Timestamp, Zone};
+    ///
+    /// let toronto = Zone::from_name("America/Toronto")?;
+    /// let at = Timestamp::parse_from_rfc3339("2026-11-17T15:30:00Z")?;
+    /// assert_eq!(toronto.format_with(at, &date_pattern!(Timestamp, "%Y-%m-%d %H:%M")), "2026-11-17 10:30");
+    /// # Ok::<(), dravr_tronc::dates::DateError>(())
+    /// ```
+    #[must_use]
+    pub fn format_with(&self, timestamp: Timestamp, pattern: &Pattern<Timestamp>) -> String {
+        let info = self.rules.to_offset_info(timestamp.0);
+        pattern.render(&OnClock {
+            civil: info.offset().to_datetime(timestamp.0),
+            offset: info.offset().seconds(),
+            name: self.abbreviation(info.abbreviation()),
+        })
+    }
+}
+
+impl From<UtcOffset> for Zone {
+    /// The zone that keeps this offset all year: [`Zone::fixed`] for an
+    /// offset already checked. It is named as chrono wrote the offset,
+    /// `+05:30` or `+05:45:30`.
+    fn from(offset: UtcOffset) -> Self {
+        Self {
+            name: Arc::from(offset.to_string()),
+            rules: TimeZone::fixed(offset.0),
+            fixed: true,
+        }
     }
 }
 

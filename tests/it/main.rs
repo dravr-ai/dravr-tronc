@@ -40,7 +40,11 @@ mod dates_arith_test;
 #[cfg(test)]
 mod dates_format_test;
 #[cfg(test)]
+mod dates_offset_test;
+#[cfg(test)]
 mod dates_parse_test;
+#[cfg(test)]
+mod dates_pattern_test;
 #[cfg(test)]
 #[cfg(feature = "schemars1")]
 mod dates_schema_test;

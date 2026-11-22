@@ -12,6 +12,7 @@ use jiff::civil::Time;
 
 use super::elapsed::Elapsed;
 use super::error::DateError;
+use super::pattern::Pattern;
 use super::text::{self, FractionDigits, Moment};
 
 /// A time of day with no date and no zone: `07:30:00`.
@@ -151,6 +152,14 @@ impl CivilTime {
     #[must_use]
     pub fn signed_duration_since(self, earlier: Self) -> Elapsed {
         Elapsed(self.0.duration_since(earlier.0))
+    }
+
+    /// Formats with a [`Pattern`] checked when it was compiled, so the
+    /// formatting cannot fail. The bytes are what [`format`](Self::format)
+    /// writes for the same string.
+    #[must_use]
+    pub fn format_with(&self, pattern: &Pattern<Self>) -> String {
+        pattern.render(&self.0)
     }
 
     /// Formats with a `strftime` string, such as `"%H:%M"`. The

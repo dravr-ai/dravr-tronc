@@ -89,7 +89,7 @@ otel-http-client = ["otel", "http-client", "dep:reqwest-middleware"]
 # depends on the files of the host. Opt-in because the database is the one
 # sizeable thing the date types can link, and a service that only stamps
 # timestamps has no use for it.
-zones = ["jiff/tzdb-bundle-always"]
+zones = ["jiff/tzdb-bundle-always", "dep:jiff-tzdb"]
 # sqlx 0.8 `Type`/`Encode`/`Decode` for the date types, one feature per
 # driver so a PostgreSQL-only service does not build SQLite's C library. Named
 # after the sqlx line they implement: sqlx 0.9 support is a new feature beside
@@ -120,6 +120,10 @@ jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_c
 # features: no system zone lookup, no platform zone files, no serde (the date
 # types carry their own). `zones` adds the bundled zone database.
 jiff = { version = "1", default-features = false, features = ["std"] }
+# The zone database jiff bundles under `zones`, named here only to read its
+# release (`Zone::database_release`); jiff does not expose it. Cargo resolves
+# it to the one copy jiff links, so the release reported is the one in use.
+jiff-tzdb = { version = "1", optional = true }
 # No default features: they resolve remote and file $refs over the network and
 # disk, which a tool's own schema never needs and a server must not do.
 jsonschema = { version = "0.58", default-features = false, optional = true }

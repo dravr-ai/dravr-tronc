@@ -15,6 +15,7 @@ use super::civil_datetime::CivilDateTime;
 use super::civil_time::CivilTime;
 use super::elapsed::Elapsed;
 use super::error::DateError;
+use super::pattern::Pattern;
 use super::text::{self, Moment};
 use super::weekday::Weekday;
 
@@ -261,6 +262,14 @@ impl CivilDate {
     #[must_use]
     pub const fn at_midnight(self) -> CivilDateTime {
         self.and_time(CivilTime::MIDNIGHT)
+    }
+
+    /// Formats with a [`Pattern`] checked when it was compiled, so the
+    /// formatting cannot fail. The bytes are what [`format`](Self::format)
+    /// writes for the same string.
+    #[must_use]
+    pub fn format_with(&self, pattern: &Pattern<Self>) -> String {
+        pattern.render(&self.0)
     }
 
     /// Formats with a `strftime` string, such as `"%Y-%m-%d"` or `"%a %-d %b"`.

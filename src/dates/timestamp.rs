@@ -18,6 +18,8 @@ use super::civil_datetime::CivilDateTime;
 use super::civil_time::CivilTime;
 use super::elapsed::Elapsed;
 use super::error::DateError;
+use super::offset::Offset as UtcOffset;
+use super::pattern::{OnClock, Pattern};
 use super::text::{self, FractionDigits, Moment};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
@@ -341,6 +343,81 @@ impl Timestamp {
     /// As [`parse_from_rfc3339`](Self::parse_from_rfc3339).
     pub fn parse_from_rfc3339_with_offset(text: &str) -> Result<(Self, i32), DateError> {
         text::strict_rfc3339(text).map(|(timestamp, offset)| (Self(timestamp), offset))
+    }
+
+    /// Reads RFC 3339 with chrono's leniency, as `FromStr` and serde do, and
+    /// also returns the offset the text carried: what
+    /// `text.parse::<DateTime<FixedOffset>>()` and a `DateTime<FixedOffset>`
+    /// field read. `Z`, `UTC`, `+00:00` and `-00:00` all keep a zero offset.
+    ///
+    /// The leniency is chrono's: digits need no padding, the separator may be
+    /// `T`, `t` or a space, whitespace may sit between components and around
+    /// the value, `UTC` in any case is an offset, and the offset may lack its
+    /// colon. The seconds are required, and so are the offset's minutes.
+    ///
+    /// ```
+    /// use dravr_tronc::dates::{Offset, Timestamp};
+    ///
+    /// let (at, offset) = Timestamp::parse_with_offset("2026-11-17 05:00:05-0500")?;
+    /// assert_eq!(at, Timestamp::parse_from_rfc3339("2026-11-17T10:00:05Z")?);
+    /// assert_eq!(offset, Offset::from_seconds(-5 * 3600)?);
+    /// # Ok::<(), dravr_tronc::dates::DateError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// What `FromStr` returns for the same text: chrono's kind, word for word.
+    pub fn parse_with_offset(text: &str) -> Result<(Self, UtcOffset), DateError> {
+        let (timestamp, seconds) = text::relaxed_rfc3339(text)?;
+        Ok((Self(timestamp), UtcOffset::from_seconds(seconds)?))
+    }
+
+    /// Reads a timestamp written in a `strftime` format that includes an
+    /// offset (`%z`, `%:z` or `%#z`) and also returns that offset: what
+    /// `DateTime::<FixedOffset>::parse_from_str` returned. The text is read
+    /// exactly as [`parse_from_str`](Self::parse_from_str) reads it.
+    ///
+    /// ```
+    /// use dravr_tronc::dates::Timestamp;
+    ///
+    /// // The text form PostgreSQL gives a TIMESTAMPTZ.
+    /// let (at, offset) =
+    ///     Timestamp::parse_from_str_with_offset("2026-11-13 05:04:05-05", "%Y-%m-%d %H:%M:%S%.f%#z")?;
+    /// assert_eq!(at.to_rfc3339(), "2026-11-13T10:04:05+00:00");
+    /// assert_eq!(offset.seconds(), -18_000);
+    /// # Ok::<(), dravr_tronc::dates::DateError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`parse_from_str`](Self::parse_from_str).
+    pub fn parse_from_str_with_offset(
+        text: &str,
+        format: &str,
+    ) -> Result<(Self, UtcOffset), DateError> {
+        let (timestamp, seconds) = text::parse(text, format)?.timestamp()?;
+        Ok((Self(timestamp), UtcOffset::from_seconds(seconds)?))
+    }
+
+    /// Formats the UTC date and time with a [`Pattern`] checked when it was
+    /// compiled, so the formatting cannot fail. The bytes are what
+    /// [`format`](Self::format) writes for the same string.
+    ///
+    /// ```
+    /// use dravr_tronc::date_pattern;
+    /// use dravr_tronc::dates::Timestamp;
+    ///
+    /// let at = Timestamp::from_epoch_seconds(1_794_909_605)?;
+    /// assert_eq!(at.format_with(&date_pattern!(Timestamp, "%Y-%m-%d %H:%M:%S UTC")), "2026-11-17 10:00:05 UTC");
+    /// # Ok::<(), dravr_tronc::dates::DateError>(())
+    /// ```
+    #[must_use]
+    pub fn format_with(&self, pattern: &Pattern<Self>) -> String {
+        pattern.render(&OnClock {
+            civil: self.utc(),
+            offset: 0,
+            name: "UTC",
+        })
     }
 
     /// Formats the UTC date and time with a `strftime` string, such as

@@ -261,7 +261,7 @@ once, last. See [Request guard](#request-guard).
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop; `init_with_ceilings` holds per-target level ceilings over `RUST_LOG` |
 | `server::log_ceiling` | `TargetCeiling` / `LevelCeilings` — a filter AND-ed with `EnvFilter` that drops a target's spans and events above its ceiling, for a dependency whose TRACE output carries secrets |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
-| `dates` | Dravr-owned date types — `Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date types](#date-types) |
+| `dates` | Dravr-owned date types — `Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, `Offset`, compile-time-checked `Pattern`s (`date_pattern!`), and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date types](#date-types) |
 
 ## Choosing an auth mechanism
 
@@ -551,7 +551,7 @@ let server = McpServer::new("my-server", "0.1.0", registry, state)
 ## Date types
 
 `dravr_tronc::dates` holds the date types every dravr service puts in its public structs:
-`Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Zone` and `Elapsed`.
+`Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Zone`, `Elapsed` and `Offset`.
 
 They exist because the services used to expose `chrono` types, and chrono and chrono-tz are no
 longer maintained (chrono-tz's zone database stopped at 2025b). Putting another library's types in
@@ -568,7 +568,8 @@ signature, and what they promise is what the code already relied on.
 | SQLite (feature `sqlx08-sqlite`) | The text sqlx's chrono support stored, and every shape it read, including `datetime('now')` rows |
 | PostgreSQL (feature `sqlx08-postgres`) | The same binary `timestamptz`, `timestamp`, `date` and `time` values, and their arrays |
 | JSON schema (feature `schemars1`) | `date-time`, `date`, `partial-date-time`, `partial-time`, the weekday enum |
-| Zones (feature `zones`) | IANA zones by exact name, on a zone database compiled into the binary; gaps and folds reported as chrono-tz reported them |
+| Zones (feature `zones`) | IANA zones by exact name, on a zone database compiled into the binary (`Zone::database_release()` names it); gaps and folds reported as chrono-tz reported them |
+| Offsets | What a `DateTime<FixedOffset>` kept: `Timestamp::parse_with_offset` (serde's leniency) and `parse_from_str_with_offset` (`%z`, `%:z`, `%#z`) return the instant and the `Offset` it was written in; `"+05:30".parse::<Offset>()` reads what `FixedOffset::from_str` read |
 
 Moving a field is a change of type; the derives, `.bind(x)`, `row.get("col")` and the stored rows
 stay as they are:
@@ -590,6 +591,17 @@ Three things are different on purpose. A `Timestamp` moves only by an exact `Ela
 arithmetic on a `CivilDate`, brought back through a `Zone`. No operation panics: operators stop at
 the bounds of the range and the `checked_*` forms report leaving it. And the range is years −9999
 to 9999, where chrono's reached ±262,142.
+
+A format string fixed in the source is a `Pattern`, checked when the crate is built, so
+formatting with it cannot fail and returns the `String` itself:
+
+```rust
+use dravr_tronc::date_pattern;
+use dravr_tronc::dates::{Pattern, Timestamp};
+
+const MINUTE_UTC: Pattern<Timestamp> = date_pattern!(Timestamp, "%Y-%m-%d %H:%M UTC");
+let shown: String = Timestamp::now().format_with(&MINUTE_UTC); // was .format(..).unwrap_or_default()
+```
 
 The [module documentation](https://docs.rs/dravr-tronc/latest/dravr_tronc/dates/) has the full
 table of chrono calls and their counterparts, and the list of `strftime` specifiers.

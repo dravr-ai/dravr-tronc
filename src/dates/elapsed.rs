@@ -17,6 +17,9 @@ const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 const SECONDS_PER_WEEK: i64 = 604_800;
 
+/// chrono's `TimeDelta::MAX`: `i64::MAX` milliseconds.
+const CHRONO_LONGEST: Duration = Duration::from_millis(i64::MAX.unsigned_abs());
+
 /// A signed, exact length of time with nanosecond precision.
 ///
 /// Replaces `chrono::Duration` / `chrono::TimeDelta`. Every unit is a fixed
@@ -270,12 +273,21 @@ impl Elapsed {
         Duration::try_from(self.0).map_err(|_| DateError::OutOfRange)
     }
 
-    /// From a `std::time::Duration`.
+    /// From a `std::time::Duration`, refusing what chrono's
+    /// `TimeDelta::from_std` refused: a duration longer than `i64::MAX`
+    /// milliseconds (about 292 million years), chrono's longest `TimeDelta`.
+    ///
+    /// That is shorter than [`Elapsed::MAX`]: a length read from a
+    /// `std::time::Duration` is accepted where chrono accepted it, and
+    /// nowhere else.
     ///
     /// # Errors
     ///
-    /// [`DateError::OutOfRange`] when it is longer than [`Elapsed::MAX`].
+    /// [`DateError::OutOfRange`] past 9,223,372,036,854,775.807 seconds.
     pub fn from_std(duration: Duration) -> Result<Self, DateError> {
+        if duration > CHRONO_LONGEST {
+            return Err(DateError::OutOfRange);
+        }
         SignedDuration::try_from(duration)
             .map(Self)
             .map_err(|_| DateError::OutOfRange)

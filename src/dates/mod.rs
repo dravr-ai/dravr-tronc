@@ -46,10 +46,15 @@
 //! | [`Weekday`] | `Weekday` | A day of the week, `"Mon"` on the wire |
 //! | `Zone` (feature `zones`) | `chrono_tz::Tz` | An IANA zone, found by name |
 //! | [`Elapsed`] | `Duration` / `TimeDelta` | A signed, exact length of time |
+//! | [`Offset`] | `FixedOffset` as a value | A fixed offset from UTC, less than a day |
+//! | [`Pattern`] | a constant `strftime` string | A format checked when the crate is built |
 //!
-//! `DateTime<FixedOffset>` has no counterpart: keep the [`Timestamp`], and
-//! where the sender's offset is read, keep it beside it
-//! ([`Timestamp::parse_from_rfc3339_with_offset`]).
+//! `DateTime<FixedOffset>` has no single counterpart: keep the [`Timestamp`],
+//! and where the sender's offset matters, the [`Offset`] beside it. The
+//! readers that return both are [`Timestamp::parse_with_offset`] (serde's
+//! leniency, what `DateTime<FixedOffset>: FromStr` and its serde read),
+//! [`Timestamp::parse_from_str_with_offset`] (a `%z`, `%:z` or `%#z`
+//! format) and [`Timestamp::parse_from_rfc3339_with_offset`] (strict).
 //!
 //! # Features
 //!
@@ -103,7 +108,14 @@
 //! | `tz.from_local_datetime(&dt).earliest()` | `zone.resolve(dt).earliest()` |
 //! | `date + Months::new(1)` | [`CivilDate::checked_add_months`] |
 //! | `"America/Toronto".parse::<Tz>()` | `"America/Toronto".parse::<Zone>()` |
-//! | `FixedOffset::east_opt(s)` as a zone | `Zone::fixed(s)` (a `Result`) |
+//! | `FixedOffset::east_opt(s)` as a zone | `Zone::fixed(s)` (a `Result`), or `Zone::from(offset)` |
+//! | `FixedOffset::east_opt(s)` as a value | [`Offset::from_seconds`] |
+//! | `"+05:30".parse::<FixedOffset>()` | `"+05:30".parse::<Offset>()` |
+//! | `s.parse::<DateTime<FixedOffset>>()` | [`Timestamp::parse_with_offset`] |
+//! | `DateTime::<FixedOffset>::parse_from_str(s, f)` | [`Timestamp::parse_from_str_with_offset`] |
+//! | `TimeDelta::from_std(d)` | [`Elapsed::from_std`] (same range) |
+//! | `chrono_tz::IANA_TZDB_VERSION` | `Zone::database_release()` |
+//! | `at.format(F).to_string()` with a constant `F` | `at.format_with(&date_pattern!(Timestamp, F))` |
 //!
 //! # What is deliberately different
 //!
@@ -121,7 +133,10 @@
 //!   accepted it and reads as `23:59:59`; chrono kept it and wrote `:60`
 //!   back.
 //! - **`format` returns a `Result`.** chrono panicked when a format string
-//!   was wrong, at the moment the result was displayed.
+//!   was wrong, at the moment the result was displayed. A string fixed in
+//!   the source is a [`Pattern`] instead: [`date_pattern!`](crate::date_pattern)
+//!   checks it when the crate is built, against the kind of value it formats,
+//!   and `format_with` returns the `String` with nothing to unwrap.
 //!
 //! # Format strings
 //!
@@ -133,7 +148,9 @@
 //! |---|---|
 //! | `%Y` `%m` `%d` `%e` `%H` `%k` `%I` `%l` `%M` `%S` `%f` `%.f` `%.3f` `%.6f` `%.9f` `%p` `%P` `%a` `%A` `%b` `%h` `%B` `%z` `%:z` `%F` `%T` `%R` `%n` `%t` `%%` | `%C` `%y` `%j` `%u` `%w` `%s` `%D` `%Z` |
 //!
-//! `%#z` is read only. `%-d`, `%_d` and `%0d` change the padding of a
+//! `%#z` is read only. A [`Pattern`] takes every written specifier the
+//! value has a component for, except `%C`, which cannot write a century
+//! before year 0. `%-d`, `%_d` and `%0d` change the padding of a
 //! numeric specifier. When read, a month or weekday name is matched in any
 //! case, a weekday must be the date's own, and a 12-hour `%I` needs its
 //! `%p`.
@@ -143,6 +160,8 @@ mod civil_datetime;
 mod civil_time;
 mod elapsed;
 mod error;
+mod offset;
+mod pattern;
 #[cfg(feature = "schemars1")]
 mod schema;
 mod serde_impls;
@@ -161,7 +180,16 @@ pub use civil_datetime::CivilDateTime;
 pub use civil_time::CivilTime;
 pub use elapsed::Elapsed;
 pub use error::DateError;
+pub use offset::Offset;
+pub use pattern::{Formattable, Pattern, PatternError, MAX_PATTERN_PARTS};
 pub use timestamp::{SecondsFormat, Timestamp};
 pub use weekday::Weekday;
 #[cfg(feature = "zones")]
 pub use zone::{LocalResolution, Zone};
+
+/// What [`date_pattern!`](crate::date_pattern) expands to. Not an API: the
+/// macro is.
+#[doc(hidden)]
+pub mod __pattern {
+    pub use super::pattern::{compile, Compiled, Holds, Valid};
+}
