@@ -11,7 +11,7 @@ use dravr_tronc::dates::{
     CivilDate, CivilDateTime, CivilTime, DateError, Elapsed, Timestamp, Weekday,
 };
 
-use crate::dates_support::{pair, pairs};
+use crate::dates_support::{pair, pairs, VALUES};
 
 fn timestamp(text: &str) -> Timestamp {
     Timestamp::parse_from_rfc3339(text).unwrap()
@@ -720,4 +720,100 @@ fn a_timestamp_converts_to_and_from_the_system_clock_type() {
     let now = Timestamp::now();
     let reference = Timestamp::try_from(SystemTime::now()).unwrap();
     assert!((reference - now).abs() < Elapsed::seconds(5));
+}
+
+#[test]
+fn a_fraction_is_cut_like_chrono_also_before_the_epoch() {
+    use chrono::SubsecRound;
+    // Whole seconds on both sides of the epoch and near both ends of the
+    // range, each with fractions at, just below and just past every span.
+    let mut fractions = vec![0_u32, 1, 999_999_999, 500_000_000, 123_456_789];
+    for digits in 0..9_u32 {
+        let span = 10_u32.pow(9 - digits);
+        fractions.extend([span - 1, span, span + 1, span / 2 + 3]);
+    }
+    fractions.retain(|fraction| *fraction < 1_000_000_000);
+    let seconds = [
+        1_794_909_600_i64,
+        0,
+        -1,
+        -2,
+        -14_182_940,
+        -62_135_596_800,
+        -377_705_023_201,
+        253_402_207_199,
+    ];
+    let digit_counts: Vec<u16> = (0..=12).chain([u16::MAX]).collect();
+    let (mut compared, mut moved) = (0_u32, 0_u32);
+    let mut inputs = VALUES.to_vec();
+    for second in seconds {
+        inputs.extend(fractions.iter().map(|fraction| (second, *fraction)));
+    }
+    for (second, fraction) in inputs {
+        let (ours, theirs) = pair(second, fraction);
+        for digits in digit_counts.iter().copied() {
+            let cut = ours.trunc_subsecs(digits);
+            assert_eq!(
+                cut.epoch_nanos(),
+                nanos(theirs.trunc_subsecs(digits)),
+                "{second}s {fraction}ns to {digits} digits"
+            );
+            assert_eq!(
+                cut.trunc_subsecs(digits),
+                cut,
+                "a cut value is kept as it is"
+            );
+            assert!(cut <= ours, "a cut never moves forward");
+            compared += 1;
+            if cut != ours {
+                moved += 1;
+            }
+        }
+    }
+    // Both outcomes are exercised, so neither side of the comparison is vacuous.
+    assert!(compared > 3_000, "compared {compared}");
+    assert!(moved > 1_000, "moved {moved}");
+    assert!(compared - moved > 1_000, "kept {}", compared - moved);
+}
+
+#[test]
+fn a_fraction_cut_to_six_or_zero_digits_drops_exactly_the_digits_past_them() {
+    for (text, micros, seconds) in [
+        (
+            "2026-11-17T10:00:00.123456789Z",
+            "2026-11-17T10:00:00.123456Z",
+            "2026-11-17T10:00:00Z",
+        ),
+        (
+            "2026-11-17T10:00:00.999999999Z",
+            "2026-11-17T10:00:00.999999Z",
+            "2026-11-17T10:00:00Z",
+        ),
+        (
+            "1969-12-31T23:59:59.000000500Z",
+            "1969-12-31T23:59:59Z",
+            "1969-12-31T23:59:59Z",
+        ),
+        (
+            "1969-12-31T23:59:59.500000001Z",
+            "1969-12-31T23:59:59.500Z",
+            "1969-12-31T23:59:59Z",
+        ),
+        (
+            "2026-11-17T10:00:00Z",
+            "2026-11-17T10:00:00Z",
+            "2026-11-17T10:00:00Z",
+        ),
+    ] {
+        let at = timestamp(text);
+        assert_eq!(at.trunc_subsecs(6), timestamp(micros), "{text}");
+        assert_eq!(at.trunc_subsecs(6).subsec_nanos() % 1_000, 0, "{text}");
+        assert_eq!(at.trunc_subsecs(0), timestamp(seconds), "{text}");
+        assert_eq!(at.trunc_subsecs(0).subsec_nanos(), 0, "{text}");
+    }
+    assert_eq!(Timestamp::MIN.trunc_subsecs(0), Timestamp::MIN);
+    assert_eq!(
+        Timestamp::MAX.trunc_subsecs(0),
+        timestamp("9999-12-30T22:00:00Z")
+    );
 }

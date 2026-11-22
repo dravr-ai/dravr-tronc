@@ -102,6 +102,7 @@
 //! | `DateTime::parse_from_rfc3339(s)` | [`Timestamp::parse_from_rfc3339`] |
 //! | `now - Duration::days(7)` | `now - Elapsed::days(7)` |
 //! | `a.signed_duration_since(b).num_days()` | the same names |
+//! | `at.trunc_subsecs(6)` (`SubsecRound`) | [`Timestamp::trunc_subsecs`], the same digits |
 //! | `.date_naive()` | [`Timestamp::utc_date`] |
 //! | `.with_timezone(&tz).date_naive()` | `zone.date_at(timestamp)` |
 //! | `date.and_hms_opt(h, m, s)?.and_utc()` | `date.and_hms(h, m, s)?.and_utc()?` |

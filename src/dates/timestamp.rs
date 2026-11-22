@@ -233,6 +233,41 @@ impl Timestamp {
         self.subsec_nanos() / 1_000
     }
 
+    /// This timestamp with its fraction cut to `digits` decimal digits, as
+    /// chrono's `SubsecRound::trunc_subsecs` cuts it.
+    ///
+    /// The cut always moves back in time, also before the epoch:
+    /// `1969-12-31T23:59:59.5Z` cut to 0 digits is `1969-12-31T23:59:59Z`,
+    /// because the fraction counts forward from the whole second (see
+    /// [`subsec_nanos`](Self::subsec_nanos)). 9 or more digits keep the
+    /// timestamp as it is.
+    ///
+    /// It is how an instant is made to match what a store keeps of it: 6
+    /// digits for a PostgreSQL `TIMESTAMPTZ`, 0 for a column of whole seconds.
+    ///
+    /// ```
+    /// use dravr_tronc::dates::Timestamp;
+    ///
+    /// let at = Timestamp::parse_from_rfc3339("2026-11-17T10:00:00.123456789Z")?;
+    /// assert_eq!(at.trunc_subsecs(6).to_rfc3339(), "2026-11-17T10:00:00.123456+00:00");
+    /// assert_eq!(at.trunc_subsecs(3).to_rfc3339(), "2026-11-17T10:00:00.123+00:00");
+    /// assert_eq!(at.trunc_subsecs(0).to_rfc3339(), "2026-11-17T10:00:00+00:00");
+    /// assert_eq!(at.trunc_subsecs(9), at);
+    ///
+    /// let before_epoch = Timestamp::from_epoch_millis(-500)?;
+    /// assert_eq!(before_epoch.trunc_subsecs(0), Timestamp::from_epoch_seconds(-1)?);
+    /// # Ok::<(), dravr_tronc::dates::DateError>(())
+    /// ```
+    #[must_use]
+    pub fn trunc_subsecs(self, digits: u16) -> Self {
+        let span = 10_u32.pow(9 - u32::from(digits.min(9)));
+        let cut = self.subsec_nanos() % span;
+        // The result lies between MIN, a whole second, and this timestamp, so
+        // the engine always accepts it.
+        EngineTimestamp::from_nanosecond(self.0.as_nanosecond() - i128::from(cut))
+            .map_or(self, Self)
+    }
+
     fn floor_units(self, nanos_per_unit: i128) -> i64 {
         // The whole range in nanoseconds divided by a thousand or more fits
         // an i64 with room to spare.
