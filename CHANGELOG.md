@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.2.0] — 2026-11-22
+
+### Added
+
+- feat(dates): offsets kept, checked patterns, the zone release
+
+
 ## [7.1.0] — 2026-11-20
 
 ### Added
