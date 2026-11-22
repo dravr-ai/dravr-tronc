@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.3.0] — 2026-11-22
+
+### Added
+
+- feat(mcp): every tools/list definition carries its def_hash
+
+
 ## [7.2.0] — 2026-11-22
 
 ### Added
