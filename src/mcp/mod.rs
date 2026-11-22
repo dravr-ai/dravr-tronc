@@ -8,6 +8,7 @@ pub mod auth;
 #[cfg(feature = "google-iam")]
 pub mod caller;
 pub(crate) mod cancellation;
+pub mod canonical;
 pub mod client_channel;
 #[cfg(feature = "computation")]
 pub mod computation;

@@ -17,7 +17,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::mcp::protocol::JsonRpcResponse;
-use crate::mcp::schema::{Tool, ToolResponse};
+use crate::mcp::schema::{Tool, ToolResponse, DEF_HASH_FIELD, TOOL_META_KEY};
 
 /// Environment variable that makes [`assert_tools_snapshot`] write the
 /// snapshot instead of comparing against it.
@@ -170,10 +170,33 @@ pub fn assert_tools_snapshot(tools: &[Tool], path: impl AsRef<Path>) {
 }
 
 /// The snapshot text of `tools`: sorted by name, pretty JSON, a final newline.
+///
+/// Each definition's `def_hash` is left out. It is a function of the
+/// definition the snapshot already pins in full, so it can only change when
+/// something else in the file does; kept, it would make every consumer's
+/// snapshot differ the day its server started publishing hashes, with no
+/// tool changed.
 fn render_tools(tools: &[Tool]) -> String {
-    let mut sorted: Vec<&Tool> = tools.iter().collect();
+    let mut sorted: Vec<Tool> = tools.iter().cloned().map(without_def_hash).collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let rendered = serde_json::to_string_pretty(&sorted)
         .unwrap_or_else(|e| format!("tools/list could not be rendered: {e}"));
     format!("{rendered}\n")
+}
+
+/// `tool` without its `def_hash`, and without the `_meta` entries that held
+/// nothing else.
+fn without_def_hash(mut tool: Tool) -> Tool {
+    if let Some(meta) = tool.meta.as_mut() {
+        if let Some(Value::Object(claims)) = meta.get_mut(TOOL_META_KEY) {
+            claims.remove(DEF_HASH_FIELD);
+            if claims.is_empty() {
+                meta.remove(TOOL_META_KEY);
+            }
+        }
+        if meta.is_empty() {
+            tool.meta = None;
+        }
+    }
+    tool
 }

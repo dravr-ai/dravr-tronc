@@ -175,6 +175,10 @@ itself, an `initialize`-era client can hold a session (`with_http_sessions`); a 
 which never has one, needs an auth hook resolving a principal per client, each with its own
 credential.
 
+Every definition `tools/list` serves carries its hash at `_meta["ai.dravr.vault/tool"].def_hash`
+(`Tool::def_hash`: `sha256:` over the definition's canonical JSON, `_meta` aside), so a client that
+pins tool definitions can tell when one changed; `assert_tools_snapshot` leaves the hash out.
+
 `tools/list` pages when the server sets `with_list_page_size`, answering `nextCursor`; a host
 serving `resources/list` or `prompts/list` pages with `mcp::pagination::paginate` to issue the same
 cursors. A server given `with_protected_resource_metadata` has its RFC 9728 document served at
@@ -229,7 +233,8 @@ once, last. See [Request guard](#request-guard).
 | Module | Purpose |
 |--------|---------|
 | `mcp::protocol` | JSON-RPC 2.0 types — requests, responses, errors, MCP initialize/tools/call |
-| `mcp::schema` | MCP wire types; `Tool` (`Tool::new` + `with_output_schema`/`with_annotations`/`with_execution`) and `ToolResponse` (`text`, `error`, `structured`, … + `with_structured_content`, and `with_meta` for the result's `_meta`) are `#[non_exhaustive]`, built through those, never as literals |
+| `mcp::canonical` | `to_canonical_value`: JSON with every object's keys sorted at every depth, the rendering `Tool::def_hash` hashes and a host renders its schemas through |
+| `mcp::schema` | MCP wire types; `Tool` (`Tool::new` + `with_output_schema`/`with_annotations`/`with_execution`/`with_meta`, `def_hash`, `with_def_hash`) and `ToolResponse` (`text`, `error`, `structured`, … + `with_structured_content`, and `with_meta` for the result's `_meta`) are `#[non_exhaustive]`, built through those, never as literals |
 | `mcp::server` | Generic `McpServer<S>` — dispatches initialize, tools/list, tools/call, ping |
 | `mcp::tool` | `McpTool<S>` trait + `ToolRegistry<S>` — define and register tools; `execute` refuses `ADMIN_ONLY` to a non-admin, `REQUIRES_AUTH`/`REQUIRES_TENANT` to a context without a caller/tenant, and a tool's `required_scopes` to a grant missing one (one whose `outputSchema` root is not `type: "object"`, or has a property schema that is not an object, is refused, logged at ERROR); `ToolContext` hands each call its caller and its request's `_meta`, typed (`RequestMeta`: progress token, modern per-request keys, extension keys) |
 | `mcp::observe` | `Observer` — passive start/complete hook around every dispatched message, with a typed `OperationOutcome`; `PayloadCapturePolicy` — tool payload capture, off by default, redacted by a host `PayloadRedactor`, truncated on a UTF-8 boundary |

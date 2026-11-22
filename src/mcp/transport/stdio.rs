@@ -268,6 +268,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 
@@ -305,6 +306,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 
@@ -556,6 +558,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 

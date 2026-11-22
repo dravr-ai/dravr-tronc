@@ -36,7 +36,8 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::resource_metadata::{ProtectedResourceMetadata, ResourceMetadataSource};
 use crate::mcp::schema::{
-    InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, ToolCall, ToolResponse,
+    InitializeRequest, InitializeResponse, ServerCapabilities, ServerInfo, Tool, ToolCall,
+    ToolResponse,
 };
 use crate::mcp::session::{Session, SessionLimits, SessionStore};
 use crate::mcp::tasks::{
@@ -1151,6 +1152,9 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// tools installs a dispatcher; the trap was that any host adding its first
     /// admin-only tool without one would leak it silently.
     ///
+    /// Each definition carries its [`Tool::def_hash`] at
+    /// `_meta["ai.dravr.vault/tool"].def_hash`.
+    ///
     /// The tools are listed in name order and paged per
     /// [`Self::with_list_page_size`], resuming after `params.cursor`; a cursor
     /// this server never issued is `-32602`.
@@ -1164,6 +1168,9 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             Some(dispatcher) => dispatcher.list_tools(&self.state, ctx).await,
             None => self.tools.list_definitions_for(ctx.is_admin),
         };
+        // Every listed definition carries its hash, whoever built the list,
+        // so a client can pin what it approved (`Tool::def_hash`).
+        let definitions: Vec<Tool> = definitions.into_iter().map(Tool::with_def_hash).collect();
         let page = match cursor_param(params).and_then(|cursor| {
             paginate(definitions, cursor, self.list_page_size, |tool| {
                 tool.name.as_str()
@@ -1334,7 +1341,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
 mod tests {
     use super::*;
     use crate::error::PARSE_ERROR;
-    use crate::mcp::schema::{Tool, ToolResponse};
+    use crate::mcp::schema::{Tool, ToolResponse, DEF_HASH_FIELD, TOOL_META_KEY};
     use crate::mcp::tool::{McpTool, ToolCapabilities};
     use serde_json::json;
     use std::sync::{PoisonError, RwLock};
@@ -1353,6 +1360,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 
@@ -1378,6 +1386,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 
@@ -1556,6 +1565,23 @@ mod tests {
         let tools = result["tools"].as_array().expect("tools array"); // Safe: test assertion
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "ping_tool");
+    }
+
+    #[tokio::test]
+    async fn tools_list_carries_each_definitions_hash() {
+        let server = make_server();
+        let raw = r#"{"jsonrpc": "2.0", "id": 3, "method": "tools/list"}"#;
+        let resp = server.handle_raw(raw).await.expect("response"); // Safe: test assertion
+        let result = resp.result.expect("result"); // Safe: test assertion
+        let listed: Tool = serde_json::from_value(result["tools"][0].clone()).expect("a tool"); // Safe: test assertion
+        let published = result["tools"][0]["_meta"][TOOL_META_KEY][DEF_HASH_FIELD]
+            .as_str()
+            .expect("a def_hash") // Safe: test assertion
+            .to_owned();
+        // The published hash is the hash of what was published, `_meta` aside.
+        assert_eq!(published, listed.def_hash());
+        assert!(published.starts_with("sha256:"));
+        assert_eq!(published.len(), "sha256:".len() + 64);
     }
 
     #[tokio::test]
@@ -1873,6 +1899,7 @@ mod tests {
                 output_schema: None,
                 annotations: None,
                 execution: None,
+                meta: None,
             }
         }
 
@@ -2143,6 +2170,7 @@ mod tests {
                     output_schema: None,
                     annotations: None,
                     execution: None,
+                    meta: None,
                 }]
             } else {
                 Vec::new()

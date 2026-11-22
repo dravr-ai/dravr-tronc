@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
 
+use crate::mcp::canonical::to_canonical_value;
 use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION};
 
 /// `notifications/progress` method string.
@@ -155,9 +156,76 @@ pub struct Tool {
     /// never returns one — the safe reading for every pre-Tasks client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ToolExecution>,
+    /// The definition's `_meta` object. The server writes
+    /// `def_hash` under [`TOOL_META_KEY`] into it on every `tools/list` (see
+    /// [`Self::with_def_hash`]); a host may carry its own keys beside it.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// The `_meta` key under which a tool definition carries Dravr's own claims
+/// about it, as an object: `def_hash` today.
+pub const TOOL_META_KEY: &str = "ai.dravr.vault/tool";
+
+/// The field of the [`TOOL_META_KEY`] object that carries [`Tool::def_hash`].
+pub const DEF_HASH_FIELD: &str = "def_hash";
+
+/// The algorithm prefix of a [`Tool::def_hash`] value.
+const DEF_HASH_PREFIX: &str = "sha256:";
+
 impl Tool {
+    /// The definition's hash, `sha256:<64 hex digits>`: SHA-256 over the
+    /// canonical JSON ([`crate::mcp::canonical`]: keys sorted at every depth,
+    /// no whitespace) of everything a client is shown about the tool (name,
+    /// description, input and output schema, annotations, task support),
+    /// `_meta` excluded, since the hash itself lives there.
+    ///
+    /// A client that pins tool definitions keeps the hash it approved and
+    /// alerts when `tools/list` serves another one: any change to what the
+    /// tool says it does or accepts changes it, and nothing else does.
+    #[must_use]
+    pub fn def_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut shown = self.clone();
+        shown.meta = None;
+        let canonical = to_canonical_value(&shown).to_string();
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut hash = String::with_capacity(DEF_HASH_PREFIX.len() + digest.len() * 2);
+        hash.push_str(DEF_HASH_PREFIX);
+        for byte in digest {
+            use std::fmt::Write as _;
+            // Writing to a String never fails.
+            let _ = write!(hash, "{byte:02x}");
+        }
+        hash
+    }
+
+    /// This tool with its [`Self::def_hash`] written at
+    /// `_meta["ai.dravr.vault/tool"].def_hash` ([`TOOL_META_KEY`]), keeping every other `_meta` key
+    /// the host set, and every other field of that object.
+    #[must_use]
+    pub fn with_def_hash(mut self) -> Self {
+        let hash = self.def_hash();
+        let meta = self.meta.get_or_insert_with(serde_json::Map::new);
+        let entry = meta
+            .entry(TOOL_META_KEY.to_owned())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let serde_json::Value::Object(claims) = entry {
+            claims.insert(DEF_HASH_FIELD.to_owned(), serde_json::Value::String(hash));
+        }
+        self
+    }
+
+    /// This tool carrying `meta` as its `_meta` object.
+    #[must_use]
+    pub fn with_meta(mut self, meta: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
     /// A tool named `name`, described by `description`, whose arguments match
     /// the JSON Schema `input_schema`; it declares no output schema, no
     /// annotations and no task support.
@@ -174,6 +242,7 @@ impl Tool {
             output_schema: None,
             annotations: None,
             execution: None,
+            meta: None,
         }
     }
 
@@ -1721,6 +1790,72 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn def_hash_ignores_key_order_and_meta() {
+        let a = Tool::new(
+            "t",
+            "d",
+            json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}),
+        );
+        let b = Tool::new(
+            "t",
+            "d",
+            json!({"properties": {"b": {"type": "integer"}, "a": {"type": "string"}}, "type": "object"}),
+        );
+        assert_eq!(a.def_hash(), b.def_hash());
+        let stamped = a.clone().with_def_hash();
+        assert_eq!(
+            stamped.def_hash(),
+            a.def_hash(),
+            "_meta is outside the hash"
+        );
+    }
+
+    #[test]
+    fn def_hash_changes_with_what_the_tool_shows() {
+        let base = Tool::new("t", "reads activities", json!({"type": "object"}));
+        let reworded = Tool::new("t", "reads activities and notes", json!({"type": "object"}));
+        let annotated = base.clone().with_annotations(ToolAnnotations {
+            read_only_hint: Some(true),
+            ..ToolAnnotations::default()
+        });
+        assert_ne!(base.def_hash(), reworded.def_hash());
+        assert_ne!(base.def_hash(), annotated.def_hash());
+    }
+
+    #[test]
+    fn def_hash_is_sha256_of_the_canonical_definition() {
+        use sha2::{Digest, Sha256};
+        let tool = Tool::new("t", "d", json!({"type": "object"}));
+        let canonical = r#"{"description":"d","inputSchema":{"type":"object"},"name":"t"}"#;
+        let expected =
+            Sha256::digest(canonical.as_bytes())
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                });
+        assert_eq!(tool.def_hash(), format!("sha256:{expected}"));
+    }
+
+    #[test]
+    fn with_def_hash_keeps_the_hosts_meta() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("vendor/x".to_owned(), json!(1));
+        meta.insert(TOOL_META_KEY.to_owned(), json!({"max_tier": "T1"}));
+        let tool = Tool::new("t", "d", json!({"type": "object"}))
+            .with_meta(meta)
+            .with_def_hash();
+        let json = serde_json::to_value(&tool).expect("serialize"); // Safe: test assertion
+        assert_eq!(json["_meta"]["vendor/x"], 1);
+        assert_eq!(json["_meta"][TOOL_META_KEY]["max_tier"], "T1");
+        assert_eq!(
+            json["_meta"][TOOL_META_KEY][DEF_HASH_FIELD],
+            tool.def_hash()
+        );
+    }
+
+    #[test]
     fn tool_serializes_input_schema_as_camel_case() {
         let tool = Tool {
             name: "test_tool".to_owned(),
@@ -1729,6 +1864,7 @@ mod tests {
             output_schema: None,
             annotations: None,
             execution: None,
+            meta: None,
         };
         let json = serde_json::to_value(&tool).expect("serialize"); // Safe: test assertion
         assert_eq!(json["name"], "test_tool");
