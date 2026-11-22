@@ -536,7 +536,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dravr-tronc"
-version = "7.3.0"
+version = "7.4.0"
 dependencies = [
  "async-trait",
  "axum",

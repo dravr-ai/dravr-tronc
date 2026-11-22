@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.4.0] — 2026-11-22
+
+### Added
+
+- feat(dates): Timestamp::trunc_subsecs cuts a fraction like chrono
+
+
 ## [7.3.0] — 2026-11-22
 
 ### Added

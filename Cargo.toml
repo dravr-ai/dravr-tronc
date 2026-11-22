@@ -3,7 +3,7 @@
 
 [package]
 name = "dravr-tronc"
-version = "7.3.0"
+version = "7.4.0"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
