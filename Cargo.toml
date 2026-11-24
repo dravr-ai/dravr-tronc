@@ -114,7 +114,7 @@ bytes = { version = "1", optional = true }
 # line the platform verifies its own JWTs on, so a host enabling google-iam
 # resolves one jsonwebtoken. rust_crypto is the platform's backend too; the
 # verifier builds its key from RSA components, so it needs no PEM parsing.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"], optional = true }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"], optional = true }
 # The engine inside `dravr_tronc::dates`, and private to it: no jiff type is in
 # a public signature, so a jiff upgrade is a tronc patch release. No default
 # features: no system zone lookup, no platform zone files, no serde (the date
@@ -192,7 +192,7 @@ percent-encoding = { version = "2", optional = true }
 # The crate's own tests drive it through the testkit, as a consumer would.
 dravr-tronc = { path = ".", features = ["testkit"] }
 # The key-set tests sign with an openssl PEM key, which only use_pem can read.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto", "use_pem"] }
 # The otel tests export spans and metrics to memory, which only the testing
 # feature builds.
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
