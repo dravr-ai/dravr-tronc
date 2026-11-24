@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.0.0] — 2026-11-24
+
+### Added
+
+- feat(iam)!: jsonwebtoken 12, on p256/p384 0.14 and rsa 0.10
+
+
 ## [7.4.0] — 2026-11-22
 
 ### Added
