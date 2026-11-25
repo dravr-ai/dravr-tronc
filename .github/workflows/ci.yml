@@ -32,6 +32,8 @@ jobs:
       # The feature alone, as a host enables it: --all-features would supply
       # any item it reaches that only another feature brings in.
       - run: cargo check --all-targets --features schema-validation
+      # DPoP alone, as a resource server enables it without google-iam.
+      - run: cargo check --all-targets --features dpop
       # The emitter profile. Every other job passes --features notifications,
       # so without this nothing catches an item being moved back behind that
       # feature. NOTIFY_TARGET is the case that matters: a crate that only

@@ -24,6 +24,7 @@
 mod challenge;
 mod source;
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::iter;
@@ -31,6 +32,7 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::server::auth::is_loopback_host;
 
@@ -140,7 +142,41 @@ pub struct ProtectedResourceMetadata {
     /// A URL of human-readable documentation for the resource.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_documentation: Option<String>,
+    /// The JWS algorithms this resource accepts on `DPoP` proofs (RFC 9728 §2,
+    /// RFC 9449 §5.1). Empty, and left out of the document, when the resource
+    /// takes no DPoP-bound token.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dpop_signing_alg_values_supported: Vec<String>,
+    /// Whether every token this resource accepts must be DPoP-bound (RFC 9728
+    /// §2). Left out of the document when false, its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub dpop_bound_access_tokens_required: bool,
+    /// Members a profile defines beyond RFC 9728, written into the document
+    /// beside the standard ones. A member named like a standard one is
+    /// refused by [`Self::with_extension`], so the two never collide.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
+
+/// Whether a flag is unset, for `skip_serializing_if`.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes the field by reference
+const fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+/// The members RFC 9728 §2 and this struct name, which an extension may not
+/// take.
+const STANDARD_MEMBERS: [&str; 9] = [
+    "resource",
+    "authorization_servers",
+    "jwks_uri",
+    "scopes_supported",
+    "bearer_methods_supported",
+    "resource_name",
+    "resource_documentation",
+    "dpop_signing_alg_values_supported",
+    "dpop_bound_access_tokens_required",
+];
 
 impl ProtectedResourceMetadata {
     /// Metadata for the MCP endpoint at `resource`, whose tokens are issued by
@@ -183,7 +219,32 @@ impl ProtectedResourceMetadata {
             bearer_methods_supported: vec!["header".to_owned()],
             resource_name: None,
             resource_documentation: None,
+            dpop_signing_alg_values_supported: Vec::new(),
+            dpop_bound_access_tokens_required: false,
+            extensions: BTreeMap::new(),
         })
+    }
+
+    /// Declare `DPoP` support (RFC 9449): the JWS algorithms a proof may be
+    /// signed with, and whether a token that is not DPoP-bound is refused.
+    #[must_use]
+    pub fn with_dpop(mut self, algs: Vec<String>, bound_tokens_required: bool) -> Self {
+        self.dpop_signing_alg_values_supported = algs;
+        self.dpop_bound_access_tokens_required = bound_tokens_required;
+        self
+    }
+
+    /// Add a member a profile defines beyond RFC 9728, such as a health
+    /// profile's `pdpp_token_kinds_supported`. A name RFC 9728 or this struct
+    /// already uses is ignored, so an extension can never overwrite a
+    /// standard member.
+    #[must_use]
+    pub fn with_extension(mut self, name: impl Into<String>, value: Value) -> Self {
+        let name = name.into();
+        if !STANDARD_MEMBERS.contains(&name.as_str()) {
+            self.extensions.insert(name, value);
+        }
+        self
     }
 
     /// Set the scopes a request to this resource may need.
@@ -542,6 +603,27 @@ mod tests {
         );
         let bare = serde_json::to_value(metadata("https://api.example.com")).expect("serialize"); // Safe: test assertion
         assert!(bare.get("jwks_uri").is_none(), "{bare}");
+    }
+
+    #[test]
+    fn dpop_members_and_extensions_are_written_only_when_set() {
+        let meta = metadata("https://api.example.com/mcp")
+            .with_dpop(vec!["ES256".to_owned()], false)
+            .with_extension("pdpp_token_kinds_supported", json!(["owner", "client"]))
+            .with_extension("resource", json!("https://evil.example.com"));
+        assert_eq!(
+            serde_json::to_value(&meta).expect("serialize"), // Safe: test assertion
+            json!({
+                "resource": "https://api.example.com/mcp",
+                "authorization_servers": ["https://auth.example.com"],
+                "bearer_methods_supported": ["header"],
+                "dpop_signing_alg_values_supported": ["ES256"],
+                "pdpp_token_kinds_supported": ["owner", "client"]
+            })
+        );
+        let required = metadata("https://api.example.com/mcp").with_dpop(Vec::new(), true);
+        let value = serde_json::to_value(&required).expect("serialize"); // Safe: test assertion
+        assert_eq!(value["dpop_bound_access_tokens_required"], json!(true));
     }
 
     #[test]

@@ -141,6 +141,7 @@ pub struct McpServer<S: Send + Sync + ?Sized> {
     supported_versions: Vec<String>,
     auth_hook: Option<Arc<dyn AuthHook<S>>>,
     allowed_origins: Vec<String>,
+    accepts_dpop_scheme: bool,
     allowed_hosts: Option<Vec<String>>,
     max_request_bytes: usize,
     list_page_size: Option<NonZeroUsize>,
@@ -180,6 +181,7 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
             supported_versions: default_supported_versions(),
             auth_hook: None,
             allowed_origins: Vec::new(),
+            accepts_dpop_scheme: false,
             allowed_hosts: None,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             list_page_size: None,
@@ -278,6 +280,33 @@ impl<S: Send + Sync + ?Sized + 'static> McpServer<S> {
     /// The `Origin` allowlist the HTTP transport enforces.
     pub fn allowed_origins(&self) -> &[String] {
         &self.allowed_origins
+    }
+
+    /// Accept `Authorization: DPoP <token>` (RFC 9449 §7.1) beside `Bearer`.
+    ///
+    /// Off by default, so a host that never verifies `DPoP` proofs never sees a
+    /// DPoP-scheme token as a credential. With it on, the HTTP transport puts
+    /// a DPoP-scheme token in [`JsonRpcRequest::auth_token`] exactly as it
+    /// does a bearer one, and tells the hook which scheme carried it in
+    /// `metadata` ([`AUTHORIZATION_SCHEME_METADATA`]), with the request's
+    /// method ([`HTTP_METHOD_METADATA`]) and its count of `DPoP` headers
+    /// ([`DPOP_PROOFS_METADATA`]). The proof itself is a forwarded header
+    /// (`dpop`); the hook verifies it, for instance with `dravr_tronc::dpop`.
+    ///
+    /// [`JsonRpcRequest::auth_token`]: crate::mcp::protocol::JsonRpcRequest::auth_token
+    /// [`AUTHORIZATION_SCHEME_METADATA`]: crate::mcp::auth::AUTHORIZATION_SCHEME_METADATA
+    /// [`HTTP_METHOD_METADATA`]: crate::mcp::auth::HTTP_METHOD_METADATA
+    /// [`DPOP_PROOFS_METADATA`]: crate::mcp::auth::DPOP_PROOFS_METADATA
+    #[must_use]
+    pub const fn with_dpop_scheme(mut self) -> Self {
+        self.accepts_dpop_scheme = true;
+        self
+    }
+
+    /// Whether the HTTP transport accepts a DPoP-scheme token
+    /// ([`Self::with_dpop_scheme`]).
+    pub const fn accepts_dpop_scheme(&self) -> bool {
+        self.accepts_dpop_scheme
     }
 
     /// Set the `Host` authorities the HTTP transport accepts besides loopback.
