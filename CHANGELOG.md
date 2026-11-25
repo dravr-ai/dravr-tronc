@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.1.0] — 2026-11-25
+
+### Added
+
+- feat(dpop): DPoP proof verification, the DPoP scheme, PRM members
+
+
 ## [8.0.0] — 2026-11-24
 
 ### Added
