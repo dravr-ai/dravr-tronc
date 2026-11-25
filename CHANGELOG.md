@@ -1,5 +1,15 @@
 # Changelog
 
+## [7.5.0] — 2026-11-25
+
+Released from the `release/7.x` maintenance line (jsonwebtoken 10), for consumers not yet on 8.x.
+The same change is on main for 8.1.0.
+
+### Added
+
+- feat(dpop): DPoP proof verification, the DPoP scheme, PRM members
+
+
 ## [7.4.0] — 2026-11-22
 
 ### Added
