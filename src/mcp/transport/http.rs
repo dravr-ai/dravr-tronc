@@ -1413,7 +1413,12 @@ fn attach_credential(request: &mut JsonRpcRequest, headers: &HeaderMap, accepts_
 /// accepts that scheme ([`McpServer::with_dpop_scheme`]); then the metadata
 /// also carries the HTTP method and the number of `DPoP` headers, which a
 /// proof check needs and [`JsonRpcRequest::headers`] cannot tell.
-fn presented_credential(
+///
+/// Public so a host serving another route over the same catalog (a tool
+/// listing, an A2A binding) hands its [`AuthHook`](crate::mcp::auth::AuthHook)
+/// exactly the credential and metadata `POST /mcp` would.
+#[must_use]
+pub fn presented_credential(
     headers: &HeaderMap,
     http_method: &str,
     accepts_dpop: bool,
@@ -3395,5 +3400,40 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    }
+
+    /// A route outside `POST /mcp` reads a credential exactly as the
+    /// transport does: the scheme, method and proof count only when the
+    /// `DPoP` scheme is accepted, and a `DPoP` token only then.
+    #[test]
+    fn presented_credential_reads_the_scheme_only_when_dpop_is_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "DPoP tok".parse().unwrap());
+        headers.append(DPOP_PROOF_HEADER, "proof-a".parse().unwrap());
+        headers.append(DPOP_PROOF_HEADER, "proof-b".parse().unwrap());
+
+        let (token, metadata) = presented_credential(&headers, "GET", true);
+        assert_eq!(token.as_deref(), Some("tok"));
+        assert_eq!(
+            metadata
+                .get(AUTHORIZATION_SCHEME_METADATA)
+                .map(String::as_str),
+            Some("DPoP")
+        );
+        assert_eq!(
+            metadata.get(HTTP_METHOD_METADATA).map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(
+            metadata.get(DPOP_PROOFS_METADATA).map(String::as_str),
+            Some("2")
+        );
+
+        let (token, metadata) = presented_credential(&headers, "GET", false);
+        assert_eq!(
+            token, None,
+            "a DPoP token is not read when the scheme is off"
+        );
+        assert!(metadata.is_empty());
     }
 }
