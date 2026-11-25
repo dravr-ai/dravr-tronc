@@ -34,7 +34,9 @@ use crate::error::{
     MISSING_REQUIRED_CLIENT_CAPABILITY, PARSE_ERROR, RATE_LIMITED, UNAUTHORIZED,
     UNSUPPORTED_PROTOCOL_VERSION,
 };
-use crate::mcp::auth::AuthError;
+use crate::mcp::auth::{
+    AuthError, AUTHORIZATION_SCHEME_METADATA, DPOP_PROOFS_METADATA, HTTP_METHOD_METADATA,
+};
 use crate::mcp::client_channel::ClientChannel;
 use crate::mcp::modern::{
     is_modern_revision, ModernMeta, ModernRequestMeta, PROTOCOL_VERSION_HEADER,
@@ -50,7 +52,9 @@ use crate::mcp::transport::error::TransportError;
 use crate::mcp::transport::mirror::{
     check_response_headers, check_standard_headers, is_param_header,
 };
-use crate::server::auth::{bearer_credential, is_loopback_host, InsecureBindError};
+use crate::server::auth::{
+    bearer_credential, dpop_credential, is_loopback_host, InsecureBindError,
+};
 use crate::server::request_guard::guard_requests;
 
 /// `Mcp-Session-Id`: the session a request runs in, minted by `initialize` on
@@ -451,7 +455,7 @@ async fn serve_request<S: Send + Sync + ?Sized + 'static>(
     // 4. Populate transport-derived fields for the auth hook. The credential
     // comes from the `Authorization` header only; `parse` never reads one out
     // of the body.
-    request.auth_token = bearer_token(headers);
+    attach_credential(&mut request, headers, server.accepts_dpop_scheme());
     // Every other header reaches the hook too, so a host can tell which of its
     // public origins the client dialed — an RFC 9728 challenge must name that
     // one — without the transport knowing what a host reads.
@@ -846,7 +850,12 @@ async fn accept_client_response<S: Send + Sync + ?Sized + 'static>(
         Some(Err(refusal)) => return *refusal,
         None => None,
     };
-    let message = transport_message(headers, response.id.clone(), version);
+    let message = transport_message(
+        headers,
+        response.id.clone(),
+        version,
+        ("POST", server.accepts_dpop_scheme()),
+    );
     let ctx = match server.authenticate(&message).await {
         Ok(ctx) => ctx,
         Err(refusal) => return auth_refusal_response(refusal),
@@ -899,7 +908,12 @@ pub async fn handle_mcp_delete<S: Send + Sync + ?Sized + 'static>(
     };
     let version = protocol_version_header(&headers).ok().flatten();
     let ctx = match server
-        .authenticate(&transport_message(&headers, None, version))
+        .authenticate(&transport_message(
+            &headers,
+            None,
+            version,
+            ("DELETE", server.accepts_dpop_scheme()),
+        ))
         .await
     {
         Ok(ctx) => ctx,
@@ -920,15 +934,18 @@ fn transport_message(
     headers: &HeaderMap,
     id: Option<Value>,
     version: Option<&str>,
+    http: (&str, bool),
 ) -> JsonRpcRequest {
+    let (http_method, accepts_dpop) = http;
+    let (auth_token, metadata) = presented_credential(headers, http_method, accepts_dpop);
     let mut message = JsonRpcRequest {
         jsonrpc: JSONRPC_VERSION.to_owned(),
         method: String::new(),
         params: None,
         id,
-        auth_token: bearer_token(headers),
+        auth_token,
         headers: forwarded_headers(headers),
-        metadata: HashMap::new(),
+        metadata,
     };
     if let Some(version) = version {
         message = message.with_metadata(PROTOCOL_VERSION_HEADER, version);
@@ -1380,6 +1397,51 @@ async fn require_loopback_host(request: Request, next: Next) -> Response {
 fn is_port(port: &str) -> bool {
     port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
+
+/// Put the credential a `POST` presents, and how it presented it, on
+/// `request` ([`presented_credential`]).
+fn attach_credential(request: &mut JsonRpcRequest, headers: &HeaderMap, accepts_dpop: bool) {
+    let (auth_token, metadata) = presented_credential(headers, "POST", accepts_dpop);
+    request.auth_token = auth_token;
+    request.metadata.extend(metadata);
+}
+
+/// The token the `Authorization` header presents, and the `metadata` that
+/// says how it was presented.
+///
+/// A bearer token is always read. A DPoP-scheme one only when the server
+/// accepts that scheme ([`McpServer::with_dpop_scheme`]); then the metadata
+/// also carries the HTTP method and the number of `DPoP` headers, which a
+/// proof check needs and [`JsonRpcRequest::headers`] cannot tell.
+fn presented_credential(
+    headers: &HeaderMap,
+    http_method: &str,
+    accepts_dpop: bool,
+) -> (Option<String>, HashMap<String, String>) {
+    let mut metadata = HashMap::new();
+    if !accepts_dpop {
+        return (bearer_token(headers), metadata);
+    }
+    metadata.insert(HTTP_METHOD_METADATA.to_owned(), http_method.to_owned());
+    let proofs = headers.get_all(DPOP_PROOF_HEADER).iter().count();
+    metadata.insert(DPOP_PROOFS_METADATA.to_owned(), proofs.to_string());
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let presented = authorization
+        .and_then(|value| bearer_credential(value).map(|token| ("Bearer", token)))
+        .or_else(|| {
+            authorization.and_then(|value| dpop_credential(value).map(|token| ("DPoP", token)))
+        });
+    let token = presented.map(|(scheme, token)| {
+        metadata.insert(AUTHORIZATION_SCHEME_METADATA.to_owned(), scheme.to_owned());
+        token.to_owned()
+    });
+    (token, metadata)
+}
+
+/// The header a `DPoP` proof travels in (RFC 9449 §4.1).
+const DPOP_PROOF_HEADER: &str = "dpop";
 
 /// The bearer credential of the request's `Authorization` header, read with
 /// the crate's one scheme parser ([`bearer_credential`]).

@@ -121,6 +121,25 @@ pub trait AuthHook<S: Send + Sync + ?Sized>: Send + Sync {
     ) -> Result<ToolContext, AuthError>;
 }
 
+/// `metadata` key naming the `Authorization` scheme that carried
+/// [`JsonRpcRequest::auth_token`]: `Bearer`, or `DPoP` on a server built
+/// [`with_dpop_scheme`](crate::mcp::server::McpServer::with_dpop_scheme).
+/// Absent when the request presented no token.
+pub const AUTHORIZATION_SCHEME_METADATA: &str = "authorization-scheme";
+
+/// `metadata` key holding the HTTP method the message arrived with.
+///
+/// `POST`, or `DELETE` for a session end: what a `DPoP` proof's `htm` must
+/// name. Set on a server built `with_dpop_scheme`.
+pub const HTTP_METHOD_METADATA: &str = "http-method";
+
+/// `metadata` key holding how many `DPoP` headers the request carried.
+///
+/// Set on a server built `with_dpop_scheme`. RFC 9449 §4.3 refuses a request
+/// with more than one, and [`JsonRpcRequest::headers`] keeps only one of
+/// them, so this count is how a hook tells.
+pub const DPOP_PROOFS_METADATA: &str = "dpop-proofs";
+
 /// `auth_method` recorded on the [`ToolContext`] of a request [`ApiKeyAuthHook`]
 /// admitted.
 pub const API_KEY_AUTH_METHOD: &str = "api_key";

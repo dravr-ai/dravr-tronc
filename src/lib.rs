@@ -33,6 +33,8 @@
 )]
 
 pub mod dates;
+#[cfg(feature = "dpop")]
+pub mod dpop;
 pub mod error;
 #[cfg(feature = "http-client")]
 pub mod http_client;

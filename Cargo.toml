@@ -53,6 +53,11 @@ testkit = ["http-client", "dep:tower", "dep:http-body-util", "jsonwebtoken?/use_
 # Opt-in because it pulls a JWT stack, and a stdio-only MCP server has no use
 # for it — the platform also holds an 80MB binary budget.
 google-iam = ["http-client", "dep:jsonwebtoken"]
+# `dpop`: DPoP (RFC 9449) proof verification and RFC 7638 key thumbprints, for
+# an authorization or resource server that binds tokens to a client key. Opt-in
+# because it pulls the JWT stack, which a server that only takes bearer tokens
+# has no use for.
+dpop = ["dep:jsonwebtoken"]
 # The client half of `server::request_guard`: `ServiceClient` calls another
 # dravr service under a Google ID token and a fresh request id, and reads the
 # guard's own answers. Opt-in because it names hyper to tell a connection

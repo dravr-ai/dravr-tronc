@@ -86,8 +86,26 @@ pub async fn require_auth(env_var: &str, request: Request, next: Next) -> Respon
 /// authenticate.
 #[must_use]
 pub fn bearer_credential(header_value: &str) -> Option<&str> {
-    let (scheme, credential) = header_value.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("Bearer") {
+    scheme_credential(header_value, "Bearer")
+}
+
+/// The credential of an `Authorization: DPoP <token>` header value (RFC 9449
+/// §7.1), or `None` for any other scheme or an empty credential.
+///
+/// The sibling of [`bearer_credential`], read by the same rule: the scheme is
+/// matched case-insensitively and the separating spaces are consumed. A
+/// DPoP-scheme token is only half a credential — the request's `DPoP` proof
+/// must be verified against it (`dravr_tronc::dpop`, feature `dpop`) before
+/// it authenticates anything.
+#[must_use]
+pub fn dpop_credential(header_value: &str) -> Option<&str> {
+    scheme_credential(header_value, "DPoP")
+}
+
+/// The credential of `header_value` when its scheme is `scheme`.
+fn scheme_credential<'h>(header_value: &'h str, scheme: &str) -> Option<&'h str> {
+    let (presented, credential) = header_value.split_once(' ')?;
+    if !presented.eq_ignore_ascii_case(scheme) {
         return None;
     }
     let credential = credential.trim_start_matches(' ');
@@ -490,6 +508,15 @@ mod tests {
         let resp = app.oneshot(req).await.expect("response"); // Safe: test assertion
         assert_eq!(resp.status(), 200);
         env::remove_var(ENV);
+    }
+
+    #[test]
+    fn dpop_credential_reads_only_the_dpop_scheme() {
+        assert_eq!(dpop_credential("DPoP abc"), Some("abc"));
+        assert_eq!(dpop_credential("dpop  abc"), Some("abc"));
+        assert_eq!(dpop_credential("Bearer abc"), None);
+        assert_eq!(dpop_credential("DPoP "), None);
+        assert_eq!(bearer_credential("DPoP abc"), None);
     }
 
     #[test]
