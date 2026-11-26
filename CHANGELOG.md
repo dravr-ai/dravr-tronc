@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.2.0] — 2026-11-26
+
+### Added
+
+- feat(dates,text): civil clock and accent folding from the platform
+
+
 ## [8.1.0] — 2026-11-25
 
 ### Added
