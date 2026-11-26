@@ -95,6 +95,10 @@ otel-http-client = ["otel", "http-client", "dep:reqwest-middleware"]
 # sizeable thing the date types can link, and a service that only stamps
 # timestamps has no use for it.
 zones = ["jiff/tzdb-bundle-always", "dep:jiff-tzdb"]
+# `dravr_tronc::text::fold_for_match`: accents, case and spacing set aside
+# when matching typed text against a stored name. Opt-in for its Unicode
+# normalization tables.
+text = ["dep:unicode-normalization"]
 # sqlx 0.8 `Type`/`Encode`/`Decode` for the date types, one feature per
 # driver so a PostgreSQL-only service does not build SQLite's C library. Named
 # after the sqlx line they implement: sqlx 0.9 support is a new feature beside
@@ -165,6 +169,8 @@ serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.10", default-features = false }
 serde_json = "1"
 subtle = "2.6"
+# NFD decomposition for `text::fold_for_match`.
+unicode-normalization = { version = "0.1.26", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "signal", "time"] }
 # CancellationToken: the signal a task's operation and an in-flight request watch.
 tokio-util = { version = "0.7", default-features = false }

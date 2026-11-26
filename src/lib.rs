@@ -52,6 +52,8 @@ pub mod server;
 pub mod service_client;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+#[cfg(feature = "text")]
+pub mod text;
 
 // Convenience re-exports
 pub use mcp::auth::{AuthError, AuthHook};

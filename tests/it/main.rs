@@ -36,6 +36,12 @@ mod testkit_test;
 // (building a value from a literal). cfg(test) is what tells clippy those
 // helpers are test code; it is always true in this binary.
 #[cfg(test)]
+#[cfg(feature = "zones")]
+mod civil_clock_clock_date_test;
+#[cfg(test)]
+#[cfg(feature = "zones")]
+mod civil_clock_relative_day_test;
+#[cfg(test)]
 mod dates_arith_test;
 #[cfg(test)]
 mod dates_format_test;

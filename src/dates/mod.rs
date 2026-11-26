@@ -156,6 +156,8 @@
 //! case, a weekday must be the date's own, and a 12-hour `%I` needs its
 //! `%p`.
 
+#[cfg(feature = "zones")]
+pub mod civil_clock;
 mod civil_date;
 mod civil_datetime;
 mod civil_time;
