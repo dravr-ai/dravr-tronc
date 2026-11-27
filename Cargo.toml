@@ -99,6 +99,11 @@ zones = ["jiff/tzdb-bundle-always", "dep:jiff-tzdb"]
 # when matching typed text against a stored name. Opt-in for its Unicode
 # normalization tables.
 text = ["dep:unicode-normalization"]
+# `dravr_tronc::geo`: `meters_between`, the great-circle distance, and
+# `geo::polyline`, the encoded-polyline codec route overviews travel in (Strava's
+# `summary_polyline`). No dependencies; opt-in so a server that draws no route
+# compiles none of it.
+geo = []
 # sqlx 0.8 `Type`/`Encode`/`Decode` for the date types, one feature per
 # driver so a PostgreSQL-only service does not build SQLite's C library. Named
 # after the sqlx line they implement: sqlx 0.9 support is a new feature beside
@@ -210,6 +215,9 @@ opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 # `ws`: the WebSocket server the `connect_websocket` tests dial.
 axum = { version = "0.8", features = ["ws"] }
 serial_test = "3"
+# The geo polyline suite: arbitrary input never panics the decoder, and the
+# codec round-trips.
+proptest = "1.12"
 # The reference the date types are compared with, in tests only: every
 # formatter, parser and codec in `dravr_tronc::dates` is checked against what
 # chrono, chrono-tz and sqlx's chrono support do today.

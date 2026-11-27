@@ -11,6 +11,8 @@
 mod client_channel_test;
 #[cfg(feature = "computation")]
 mod computation_test;
+#[cfg(feature = "geo")]
+mod geo_polyline_test;
 #[cfg(feature = "google-iam")]
 mod google_key_set_test;
 mod graceful_shutdown_test;

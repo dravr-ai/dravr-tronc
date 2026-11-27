@@ -266,6 +266,7 @@ once, last. See [Request guard](#request-guard).
 | `server::tracing_init` | Tracing subscriber — stderr for stdio, stdout for HTTP; returns the `TelemetryGuard` that flushes OTLP export on drop; `init_with_ceilings` holds per-target level ceilings over `RUST_LOG` |
 | `server::log_ceiling` | `TargetCeiling` / `LevelCeilings` — a filter AND-ed with `EnvFilter` that drops a target's spans and events above its ceiling, for a dependency whose TRACE output carries secrets |
 | `error` | `ErrorResponse` for REST APIs + JSON-RPC error code constants |
+| `geo` *(feature `geo`)* | `meters_between` — the great-circle distance between two `(latitude, longitude)` points; `geo::polyline` — Google's encoded-polyline codec at precision 5 (Strava's `summary_polyline`): `decode_polyline` is strict (a truncated value, a latitude without its longitude, a character outside `?`..=`~`, an over-long value or a point off the globe decodes to `None`, never to the prefix that parsed), `encode_polyline` writes every point, `overview` reduces a recorded path to at most 500 points, both ends kept |
 | `dates` | Dravr-owned date types — `Timestamp`, `CivilDate`, `CivilTime`, `CivilDateTime`, `Weekday`, `Elapsed`, `Offset`, compile-time-checked `Pattern`s (`date_pattern!`), and `Zone` *(feature `zones`)* on a compiled-in IANA zone database; chrono's exact serde bytes and leniency; sqlx 0.8 codecs *(features `sqlx08-sqlite`, `sqlx08-postgres`)* and JSON schemas *(feature `schemars1`)*. See [Date types](#date-types) |
 
 ## Choosing an auth mechanism

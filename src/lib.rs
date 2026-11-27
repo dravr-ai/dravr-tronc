@@ -11,6 +11,10 @@
 //! stdio/HTTP transports, bearer auth middleware, health check traits,
 //! CLI argument parsing, and tracing initialization.
 //!
+//! Opt-in leaf helpers ride along behind their own features: `geo` (the
+//! great-circle distance and the encoded-polyline codec) and `text` (accent
+//! folding for matching typed names).
+//!
 //! ## Quick Start
 //!
 //! ```rust,ignore
@@ -36,6 +40,8 @@ pub mod dates;
 #[cfg(feature = "dpop")]
 pub mod dpop;
 pub mod error;
+#[cfg(feature = "geo")]
+pub mod geo;
 #[cfg(feature = "http-client")]
 pub mod http_client;
 #[cfg(feature = "google-iam")]
