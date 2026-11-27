@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.3.0] — 2026-11-27
+
+### Added
+
+- feat(geo): polyline codec and great-circle distance from barrage
+
+
 ## [8.2.0] — 2026-11-26
 
 ### Added
